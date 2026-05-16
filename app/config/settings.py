@@ -35,8 +35,9 @@ class Settings(BaseSettings):
     WHATSAPP_WEBHOOK_VERIFY_TOKEN: str = "cakeoclock2026"
     WHATSAPP_BUSINESS_PHONE: str = "919554444462"
 
-    # Gemini AI
-    GEMINI_API_KEY: str = ""
+    # AI Parser (Groq — free, fast)
+    GROQ_API_KEY: str = ""
+    GEMINI_API_KEY: str = ""  # kept for backward compat
     GEMINI_MODEL: str = "gemini-2.0-flash"
 
     # Twilio SMS OTP

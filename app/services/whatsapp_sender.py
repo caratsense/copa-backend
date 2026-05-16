@@ -13,23 +13,27 @@ settings = get_settings()
 
 logger = logging.getLogger(__name__)
 
-WA_API_URL = f"https://graph.facebook.com/v21.0/{settings.WHATSAPP_PHONE_ID}/messages"
-HEADERS = {
-    "Authorization": f"Bearer {settings.WHATSAPP_TOKEN}",
-    "Content-Type": "application/json",
-}
-
 
 def _send(payload: dict) -> dict | None:
     """Send a message via WhatsApp Cloud API."""
     if not settings.WHATSAPP_ENABLED:
-        logger.info(f"[WA DISABLED] Would send: {payload.get('to', '?')}")
+        logger.info(f"[WA DISABLED] Would send to {payload.get('to', '?')}: {str(payload)[:200]}")
+        return None
+    if not settings.WHATSAPP_PHONE_ID or not settings.WHATSAPP_TOKEN:
+        logger.error(f"[WA] Missing PHONE_ID or TOKEN. PHONE_ID={settings.WHATSAPP_PHONE_ID[:5] if settings.WHATSAPP_PHONE_ID else 'EMPTY'}")
         return None
     try:
-        resp = httpx.post(WA_API_URL, json=payload, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
+        url = f"https://graph.facebook.com/v21.0/{settings.WHATSAPP_PHONE_ID}/messages"
+        headers = {
+            "Authorization": f"Bearer {settings.WHATSAPP_TOKEN}",
+            "Content-Type": "application/json",
+        }
+        resp = httpx.post(url, json=payload, headers=headers, timeout=15)
         data = resp.json()
-        logger.info(f"[WA] Sent to {payload.get('to')}: {resp.status_code}")
+        if resp.status_code >= 400:
+            logger.error(f"[WA] API error {resp.status_code}: {data}")
+        else:
+            logger.info(f"[WA] Sent to {payload.get('to')}: {resp.status_code}")
         return data
     except Exception as e:
         logger.error(f"[WA] Failed to send to {payload.get('to')}: {e}")

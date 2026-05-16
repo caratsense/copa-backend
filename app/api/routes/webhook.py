@@ -6,6 +6,7 @@ Routes messages based on sender's role (admin/baker/rider/customer).
 Also handles webhook verification from Meta.
 """
 
+import json
 import logging
 from fastapi import APIRouter, Request, HTTPException, Depends, Query
 from fastapi.responses import PlainTextResponse
@@ -53,15 +54,33 @@ async def verify_webhook(
 @router.post("/whatsapp")
 async def receive_whatsapp(request: Request):
     """Receive incoming WhatsApp messages and route to correct handler."""
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception as e:
+        logger.error(f"[WA] Failed to parse body: {e}")
+        return {"status": "invalid body"}
+
+    logger.info(f"[WA WEBHOOK] Received: {json.dumps(body, default=str)[:500]}")
 
     # Extract message from webhook payload
-    entry = body.get("entry", [{}])[0]
-    changes = entry.get("changes", [{}])[0]
-    value = changes.get("value", {})
+    entry = body.get("entry", [])
+    if not entry:
+        return {"status": "no entry"}
+
+    changes = entry[0].get("changes", [])
+    if not changes:
+        return {"status": "no changes"}
+
+    value = changes[0].get("value", {})
     messages = value.get("messages", [])
 
+    # Status updates (delivery receipts) — acknowledge but ignore
+    statuses = value.get("statuses", [])
+    if statuses and not messages:
+        return {"status": "status update acknowledged"}
+
     if not messages:
+        logger.info(f"[WA] No messages in webhook payload")
         return {"status": "no messages"}
 
     msg = messages[0]
