@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = ""  # kept for backward compat
     GEMINI_MODEL: str = "gemini-2.0-flash"
 
+    # Cashfree Payment Gateway
+    CASHFREE_APP_ID: str = ""
+    CASHFREE_SECRET_KEY: str = ""
+    CASHFREE_ENV: str = "sandbox"
+
     # Twilio SMS OTP
     TWILIO_ENABLED: bool = False
     TWILIO_ACCOUNT_SID: str = ""

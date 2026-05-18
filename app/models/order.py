@@ -20,6 +20,8 @@ class OrderStatus(str, enum.Enum):
 class PaymentStatus(str, enum.Enum):
     PENDING = "PENDING"
     PAID = "PAID"
+    COD_PENDING = "COD_PENDING"
+    FAILED = "FAILED"
     REFUNDED = "REFUNDED"
 
 
@@ -50,6 +52,8 @@ class Order(Base):
     delivery_time = Column(DateTime(timezone=True), nullable=True)
     delivery_zone_id = Column(Integer, ForeignKey("delivery_zones.id"), nullable=True)
     payment_status = Column(Enum(PaymentStatus), default=PaymentStatus.PENDING)
+    payment_method = Column(String, default="ONLINE")  # ONLINE or COD
+    payment_id = Column(String, nullable=True)  # Cashfree transaction ID
     assigned_baker_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     assigned_rider_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     notes = Column(String, nullable=True)
