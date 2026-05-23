@@ -1,32 +1,38 @@
 """
-SMS OTP Service (Twilio)
-=========================
-- Generates 6-digit OTP
-- Stores in Redis with TTL (5 min default)
-- Sends via Twilio SMS
-- Verifies OTP
+SMS OTP Service (MSG91)
+========================
+- Sends OTP via MSG91 SendOTP API
+- MSG91 handles OTP generation, storage, and verification
+- No Redis needed for OTP storage — MSG91 manages it server-side
 
 SETUP:
-1. Create Twilio account: https://www.twilio.com
-2. Get Account SID, Auth Token, and a phone number
-3. Add to .env:
-   TWILIO_ENABLED=true
-   TWILIO_ACCOUNT_SID=ACxxxxx
-   TWILIO_AUTH_TOKEN=xxxxx
-   TWILIO_PHONE_NUMBER=+1234567890
+1. Create account: https://msg91.com/signup
+2. Get AuthKey from: Dashboard → API → Configure
+3. Create OTP template at: Dashboard → OTP → Templates
+4. Add to .env:
+   SMS_ENABLED=true
+   MSG91_AUTH_KEY=your-auth-key
+   MSG91_TEMPLATE_ID=your-otp-template-id
 
-In dev/test mode (TWILIO_ENABLED=false), OTP is logged to console
-and always accepts "000000" as valid — so you can test without Twilio.
+In dev/test mode (SMS_ENABLED=false), OTP is logged to console
+and always accepts "000000" as valid.
 """
 
 import random
-import json
+import logging
+import httpx
 import redis
 from app.config import get_settings
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 OTP_PREFIX = "otp:"
+OTP_EXPIRY = 300  # 5 minutes
+
+MSG91_SEND_URL = "https://control.msg91.com/api/v5/otp"
+MSG91_VERIFY_URL = "https://control.msg91.com/api/v5/otp/verify"
+MSG91_RESEND_URL = "https://control.msg91.com/api/v5/otp/retry"
 
 
 def _get_redis():
@@ -37,69 +43,142 @@ def _get_redis():
 
 
 def generate_otp() -> str:
-    """Generate a 6-digit OTP."""
+    """Generate a 6-digit OTP for dev mode."""
     return str(random.randint(100000, 999999))
+
+
+def _normalize_phone(phone: str) -> str:
+    """Normalize phone to 91XXXXXXXXXX format for MSG91."""
+    clean = phone.replace("+", "").replace(" ", "").replace("-", "")
+    if len(clean) == 10:
+        clean = "91" + clean
+    return clean
 
 
 def send_otp(phone: str, purpose: str = "login") -> dict:
     """
-    Generate OTP, store in Redis, send via Twilio.
-    Returns {"sent": True/False, "message": "...", "otp": "..." (only in dev mode)}
+    Send OTP via MSG91.
+    MSG91 generates and stores the OTP — we don't need to manage it.
     """
-    otp = generate_otp()
-    r = _get_redis()
+    normalized = _normalize_phone(phone)
 
-    # Store in Redis with expiry
-    if r:
-        key = f"{OTP_PREFIX}{phone}:{purpose}"
-        r.setex(key, settings.OTP_EXPIRY_SECONDS, otp)
-
-    # Send via Twilio
-    if settings.TWILIO_ENABLED:
+    if settings.SMS_ENABLED and settings.MSG91_AUTH_KEY:
         try:
-            from twilio.rest import Client
-            client = Client(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
-            message = client.messages.create(
-                body=f"Your Copa Bakery verification code is: {otp}. Valid for {settings.OTP_EXPIRY_SECONDS // 60} minutes.",
-                from_=settings.TWILIO_PHONE_NUMBER,
-                to=phone,
+            payload = {
+                "mobile": normalized,
+                "template_id": settings.MSG91_TEMPLATE_ID,
+                "otp_length": 6,
+                "otp_expiry": 5,  # 5 minutes
+            }
+
+            resp = httpx.post(
+                MSG91_SEND_URL,
+                headers={
+                    "authkey": settings.MSG91_AUTH_KEY,
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=15,
             )
-            print(f"[OTP] Sent to {phone} via Twilio: {message.sid}")
-            return {"sent": True, "message": "OTP sent to your phone"}
+            data = resp.json()
+
+            if data.get("type") == "success":
+                logger.info(f"[OTP] Sent to {normalized} via MSG91: {data.get('request_id')}")
+                return {"sent": True, "message": "OTP sent to your phone"}
+            else:
+                logger.error(f"[OTP] MSG91 failed: {data}")
+                return {"sent": False, "message": data.get("message", "Failed to send OTP")}
+
         except Exception as e:
-            print(f"[OTP] Twilio send failed: {e}")
-            return {"sent": False, "message": f"Failed to send OTP: {str(e)}"}
+            logger.error(f"[OTP] MSG91 error: {e}")
+            return {"sent": False, "message": "SMS service error. Please try again."}
     else:
-        # Dev mode — log OTP to console
-        print(f"[OTP] DEV MODE — OTP for {phone}: {otp}")
+        # Dev mode — generate OTP locally, store in Redis
+        otp = generate_otp()
+        r = _get_redis()
+        if r:
+            key = f"{OTP_PREFIX}{phone}:{purpose}"
+            r.setex(key, OTP_EXPIRY, otp)
+        logger.info(f"[OTP] DEV MODE — OTP for {phone}: {otp}")
         return {"sent": True, "message": "OTP sent (dev mode)", "otp": otp}
 
 
 def verify_otp(phone: str, otp: str, purpose: str = "login") -> bool:
     """
-    Verify OTP against Redis.
-    In dev mode with Twilio disabled, "000000" always passes.
+    Verify OTP.
+    In production: verify against MSG91 API.
+    In dev mode: check Redis or accept "000000".
     """
     # Dev bypass
-    if not settings.TWILIO_ENABLED and otp == "000000":
+    if not settings.SMS_ENABLED and otp == "000000":
         return True
 
-    r = _get_redis()
-    if not r:
+    if settings.SMS_ENABLED and settings.MSG91_AUTH_KEY:
+        try:
+            normalized = _normalize_phone(phone)
+            resp = httpx.get(
+                MSG91_VERIFY_URL,
+                params={"mobile": normalized, "otp": otp},
+                headers={"authkey": settings.MSG91_AUTH_KEY},
+                timeout=15,
+            )
+            data = resp.json()
+
+            if data.get("type") == "success":
+                logger.info(f"[OTP] Verified for {normalized}")
+                return True
+            else:
+                logger.warning(f"[OTP] Verification failed for {normalized}: {data}")
+                return False
+
+        except Exception as e:
+            logger.error(f"[OTP] MSG91 verify error: {e}")
+            return False
+    else:
+        # Dev mode — check Redis
+        if otp == "000000":
+            return True
+        r = _get_redis()
+        if not r:
+            return False
+        key = f"{OTP_PREFIX}{phone}:{purpose}"
+        stored_otp = r.get(key)
+        if stored_otp and stored_otp == otp:
+            r.delete(key)
+            return True
         return False
 
-    key = f"{OTP_PREFIX}{phone}:{purpose}"
-    stored_otp = r.get(key)
 
-    if stored_otp and stored_otp == otp:
-        r.delete(key)  # one-time use
-        return True
-
-    return False
+def resend_otp(phone: str, retry_type: str = "text") -> dict:
+    """
+    Resend OTP via MSG91.
+    retry_type: "text" for SMS, "voice" for voice call
+    """
+    if settings.SMS_ENABLED and settings.MSG91_AUTH_KEY:
+        try:
+            normalized = _normalize_phone(phone)
+            resp = httpx.post(
+                MSG91_RESEND_URL,
+                headers={
+                    "authkey": settings.MSG91_AUTH_KEY,
+                    "Content-Type": "application/json",
+                },
+                json={"mobile": normalized, "retrytype": retry_type},
+                timeout=15,
+            )
+            data = resp.json()
+            if data.get("type") == "success":
+                return {"sent": True, "message": "OTP resent"}
+            return {"sent": False, "message": data.get("message", "Resend failed")}
+        except Exception as e:
+            logger.error(f"[OTP] MSG91 resend error: {e}")
+            return {"sent": False, "message": "Resend failed"}
+    else:
+        return send_otp(phone)
 
 
 def invalidate_otp(phone: str, purpose: str = "login"):
-    """Delete OTP (e.g. after too many failed attempts)."""
+    """Delete OTP from Redis (dev mode only)."""
     r = _get_redis()
     if r:
         r.delete(f"{OTP_PREFIX}{phone}:{purpose}")

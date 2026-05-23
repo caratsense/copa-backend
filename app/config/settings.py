@@ -46,10 +46,10 @@ class Settings(BaseSettings):
     CASHFREE_ENV: str = "sandbox"
 
     # Twilio SMS OTP
-    TWILIO_ENABLED: bool = False
-    TWILIO_ACCOUNT_SID: str = ""
-    TWILIO_AUTH_TOKEN: str = ""
-    TWILIO_PHONE_NUMBER: str = ""    # your Twilio phone number e.g. "+1234567890"
+    # MSG91 SMS OTP
+    SMS_ENABLED: bool = False
+    MSG91_AUTH_KEY: str = ""
+    MSG91_TEMPLATE_ID: str = ""
     OTP_EXPIRY_SECONDS: int = 300    # 5 minutes
 
     @property

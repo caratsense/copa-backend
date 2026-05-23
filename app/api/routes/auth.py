@@ -16,7 +16,7 @@ LOGIN FLOW:
     → Saves device as trusted (for customers)
 
 DEV MODE:
-  When TWILIO_ENABLED=false, OTP is logged to console.
+  When SMS_ENABLED=false, OTP is logged to console.
   Use "000000" as OTP to bypass in dev mode.
 
 RATE LIMITS:
