@@ -28,6 +28,7 @@ RATE LIMITS:
 
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -244,3 +245,58 @@ def remove_all_devices(user: User = Depends(get_current_user), db: Session = Dep
     """Remove all trusted devices (forces OTP on all future logins)."""
     db.query(TrustedDevice).filter(TrustedDevice.user_id == user.id).delete()
     db.commit()
+
+# ─── FORGOT PASSWORD ──────────────────────────────
+
+class ForgotPasswordRequest(BaseModel):
+    phone: str
+
+class ResetPasswordRequest(BaseModel):
+    phone: str
+    otp: str
+    new_password: str
+
+
+@router.post("/forgot-password")
+@limiter.limit("3/minute")
+def forgot_password(request: Request, data: ForgotPasswordRequest, db: Session = Depends(get_db)):
+    """Send OTP to phone for password reset."""
+    phone = data.phone.replace(" ", "").replace("-", "")
+    if not phone.startswith("+"):
+        if phone.startswith("91") and len(phone) == 12:
+            phone = "+" + phone
+        elif len(phone) == 10:
+            phone = "+91" + phone
+
+    user = db.query(User).filter(User.phone == phone).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="No account found with this phone number")
+
+    result = send_otp(phone, purpose="reset")
+    return {"message": "OTP sent to your phone", "sent": result.get("sent", False)}
+
+
+@router.post("/reset-password")
+@limiter.limit("5/minute")
+def reset_password(request: Request, data: ResetPasswordRequest, db: Session = Depends(get_db)):
+    """Verify OTP and set new password."""
+    phone = data.phone.replace(" ", "").replace("-", "")
+    if not phone.startswith("+"):
+        if phone.startswith("91") and len(phone) == 12:
+            phone = "+" + phone
+        elif len(phone) == 10:
+            phone = "+91" + phone
+
+    if not verify_otp(phone, data.otp, purpose="reset"):
+        raise HTTPException(status_code=401, detail="Invalid or expired OTP")
+
+    user = db.query(User).filter(User.phone == phone).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if len(data.new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+    user.password_hash = hash_password(data.new_password)
+    db.commit()
+    return {"message": "Password reset successfully. You can now login."}
