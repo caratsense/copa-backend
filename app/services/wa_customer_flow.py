@@ -71,10 +71,11 @@ def handle_customer_message(phone: str, message: str, user: Optional[User]) -> s
             return (
                 f"Welcome to Cake O' Clock.\n\n"
                 f"We offer premium handcrafted cakes with 40+ flavors, delivered across Lucknow.\n\n"
-                f"How can I assist you?\n"
+                f"How can I assist you?\n\n"
                 f"1. Place an order\n"
                 f"2. Track an order\n"
                 f"3. View our menu\n\n"
+                f"You can also ask me anything about our cakes, pricing, or delivery.\n\n"
                 f"{SITE}"
             )
 
