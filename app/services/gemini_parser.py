@@ -86,6 +86,17 @@ def _quick_match(message: str, role: str, context: dict) -> dict | None:
             elif step in ("SELECT_PRODUCT", "SELECT_SIZE", "SELECT_FLAVOR", "SELECT_DATE", "SELECT_TIME"):
                 return {"action": "SELECT_OPTION", "value": num}
 
+    # Customer greetings → always use welcome template
+    if role == "customer" and step in (None, "IDLE"):
+        if msg in ("HI", "HELLO", "HEY", "START", "NAMASTE", "HOLA"):
+            return {"action": "WELCOME"}
+        if msg in ("MENU", "3"):
+            return {"action": "VIEW_MENU"}
+        if any(w in msg for w in ("ORDER", "CAKE", "BUY", "CHAHIYE", "KARNA")):
+            return {"action": "START_ORDER"}
+        if any(w in msg for w in ("STATUS", "TRACK", "KAHAN")):
+            return {"action": "CHECK_STATUS"}
+
     if role == "baker":
         words = msg.split()
         oid = next((int(w) for w in words if w.isdigit()), None)

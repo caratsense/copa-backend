@@ -60,11 +60,6 @@ def handle_customer_message(phone: str, message: str, user: Optional[User]) -> s
         action = parse_message(message, "customer", context)
         act = action.get("action", "UNKNOWN")
 
-        # ─── CONVERSATIONAL (AI answered directly) ───
-        if act == "CONVERSATIONAL":
-            reply = action.get("reply", "")
-            if reply: return reply
-
         # ─── WELCOME ─────────────────────────
         if act == "WELCOME" or (step == "IDLE" and act == "UNKNOWN"):
             _set_state(phone, {"step": "IDLE"})
@@ -78,6 +73,11 @@ def handle_customer_message(phone: str, message: str, user: Optional[User]) -> s
                 f"You can also ask me anything about our cakes, pricing, or delivery.\n\n"
                 f"{SITE}"
             )
+
+        # ─── CONVERSATIONAL (AI answered a question) ───
+        if act == "CONVERSATIONAL":
+            reply = action.get("reply", "")
+            if reply: return reply
 
         # ─── VIEW MENU ───────────────────────
         if act == "VIEW_MENU":
