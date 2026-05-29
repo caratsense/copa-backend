@@ -103,6 +103,7 @@ def create_payment_order(
             "payment_session_id": result.get("payment_session_id"),
             "cf_order_id": result.get("cf_order_id"),
             "order_id": order.id,
+            "environment": settings.CASHFREE_ENV or "sandbox",
         }
 
     except HTTPException:
