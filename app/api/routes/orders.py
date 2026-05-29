@@ -28,6 +28,7 @@ router = APIRouter(prefix="/orders", tags=["Orders"])
 @router.post("", response_model=OrderRead, status_code=201)
 def create(data: OrderCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Create a new order — prices calculated automatically, coupons applied."""
+    data.user_id = user.id
     return create_order(db, data)
 
 

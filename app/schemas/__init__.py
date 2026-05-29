@@ -289,7 +289,7 @@ class OrderItemCreate(BaseModel):
     customization: ItemCustomization = Field(default_factory=ItemCustomization)
 
 class OrderCreate(BaseModel):
-    user_id: int
+    user_id: Optional[int] = None
     items: list[OrderItemCreate]
     delivery_address: Optional[str] = None
     delivery_time: Optional[datetime] = None
