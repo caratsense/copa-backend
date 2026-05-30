@@ -321,6 +321,7 @@ class OrderRead(BaseModel):
     delivery_time: Optional[datetime]
     delivery_zone_id: Optional[int]
     payment_status: str
+    payment_method: Optional[str] = "ONLINE"
     assigned_baker_id: Optional[int]
     assigned_rider_id: Optional[int]
     baker_name: Optional[str] = None

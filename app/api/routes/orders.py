@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.models.user import User, UserRole
-from app.models.order import Order, OrderStatus
+from app.models.order import Order, OrderStatus, PaymentStatus
 from app.models.event import OrderEvent
 from app.core.auth import get_current_user, require_admin, require_role
 from app.schemas import (
@@ -139,3 +139,32 @@ def rider_delivered(order_id: int, user: User = Depends(require_role(UserRole.RI
     stop_delivery_tracking(order_id)
 
     return update_order_status(db, order_id, StatusUpdate(status="DELIVERED"))
+
+
+@router.post("/{order_id}/collect-cod", response_model=OrderRead)
+def rider_collect_cod(order_id: int, user: User = Depends(require_role(UserRole.RIDER, UserRole.ADMIN)), db: Session = Depends(get_db)):
+    """Rider marks a COD order as paid after collecting cash on delivery."""
+    from app.services.event_service import emit_event
+
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.assigned_rider_id != user.id and user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Not assigned to you")
+    if (order.payment_method or "ONLINE").upper() != "COD":
+        raise HTTPException(status_code=400, detail="Only COD orders can be marked paid here")
+    if order.payment_status == PaymentStatus.PAID:
+        raise HTTPException(status_code=400, detail="Order is already paid")
+
+    old_payment = order.payment_status.value if hasattr(order.payment_status, "value") else order.payment_status
+    order.payment_status = PaymentStatus.PAID
+    emit_event(db, order.id, "PAYMENT_UPDATED", {
+        "from": old_payment,
+        "to": PaymentStatus.PAID.value,
+        "method": "COD",
+        "collected_by_rider_id": user.id,
+    })
+    db.commit()
+    db.refresh(order)
+    _enrich_order(order)
+    return order
