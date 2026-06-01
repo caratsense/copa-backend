@@ -1,21 +1,21 @@
 """
-SMS OTP Service (MSG91)
-========================
-- Sends OTP via MSG91 SendOTP API
-- MSG91 handles OTP generation, storage, and verification
-- No Redis needed for OTP storage — MSG91 manages it server-side
+SMS OTP Service (2factor.in)
+============================
+- Sends OTP via 2factor.in AUTOGEN API (2factor generates the OTP + a session id)
+- We persist the returned session id in Redis (keyed by phone + purpose)
+- Verification calls 2factor's VERIFY endpoint with that session id
 
 SETUP:
-1. Create account: https://msg91.com/signup
-2. Get AuthKey from: Dashboard → API → Configure
-3. Create OTP template at: Dashboard → OTP → Templates
-4. Add to .env:
+1. Create account: https://2factor.in
+2. Copy the API key from the dashboard
+3. Add to .env:
    SMS_ENABLED=true
-   MSG91_AUTH_KEY=your-auth-key
-   MSG91_TEMPLATE_ID=your-otp-template-id
+   TWOFACTOR_API_KEY=your-api-key
+   # optional, only if you created a custom AUTOGEN template:
+   TWOFACTOR_TEMPLATE=YourTemplateName
 
-In dev/test mode (SMS_ENABLED=false), OTP is logged to console
-and always accepts "000000" as valid.
+In dev/test mode (SMS_ENABLED=false), OTP is generated locally, logged to
+the console, stored in Redis, and "000000" is always accepted.
 """
 
 import random
@@ -27,12 +27,11 @@ from app.config import get_settings
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
-OTP_PREFIX = "otp:"
-OTP_EXPIRY = 300  # 5 minutes
+OTP_PREFIX = "otp:"            # dev-mode OTP store
+SESSION_PREFIX = "2f:"         # 2factor session-id store
+OTP_EXPIRY = settings.OTP_EXPIRY_SECONDS or 300
 
-MSG91_SEND_URL = "https://control.msg91.com/api/v5/otp"
-MSG91_VERIFY_URL = "https://control.msg91.com/api/v5/otp/verify"
-MSG91_RESEND_URL = "https://control.msg91.com/api/v5/otp/retry"
+TWOFACTOR_BASE = "https://2factor.in/API/V1"
 
 
 def _get_redis():
@@ -48,96 +47,84 @@ def generate_otp() -> str:
 
 
 def _normalize_phone(phone: str) -> str:
-    """Normalize phone to 91XXXXXXXXXX format for MSG91."""
+    """Normalize to digits with the 91 country code for 2factor (e.g. 919876543210)."""
     clean = phone.replace("+", "").replace(" ", "").replace("-", "")
     if len(clean) == 10:
         clean = "91" + clean
     return clean
 
 
+def _enabled() -> bool:
+    return bool(settings.SMS_ENABLED and settings.TWOFACTOR_API_KEY)
+
+
 def send_otp(phone: str, purpose: str = "login") -> dict:
     """
-    Send OTP via MSG91.
-    MSG91 generates and stores the OTP — we don't need to manage it.
+    Send an OTP. With 2factor we use AUTOGEN — 2factor generates the OTP and
+    returns a session id, which we store in Redis to verify against later.
     """
-    normalized = _normalize_phone(phone)
-
-    if settings.SMS_ENABLED and settings.MSG91_AUTH_KEY:
+    if _enabled():
         try:
-            payload = {
-                "mobile": normalized,
-                "template_id": settings.MSG91_TEMPLATE_ID,
-                "otp_length": 6,
-                "otp_expiry": 5,  # 5 minutes
-            }
+            normalized = _normalize_phone(phone)
+            url = f"{TWOFACTOR_BASE}/{settings.TWOFACTOR_API_KEY}/SMS/{normalized}/AUTOGEN"
+            if settings.TWOFACTOR_TEMPLATE:
+                url = f"{url}/{settings.TWOFACTOR_TEMPLATE}"
 
-            resp = httpx.post(
-                MSG91_SEND_URL,
-                headers={
-                    "authkey": settings.MSG91_AUTH_KEY,
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=15,
-            )
+            resp = httpx.get(url, timeout=15)
             data = resp.json()
 
-            if data.get("type") == "success":
-                logger.info(f"[OTP] Sent to {normalized} via MSG91: {data.get('request_id')}")
+            if data.get("Status") == "Success":
+                session_id = data.get("Details")
+                r = _get_redis()
+                if r:
+                    r.setex(f"{SESSION_PREFIX}{phone}:{purpose}", OTP_EXPIRY, session_id)
+                logger.info(f"[OTP] Sent to {normalized} via 2factor (session {session_id})")
                 return {"sent": True, "message": "OTP sent to your phone"}
-            else:
-                logger.error(f"[OTP] MSG91 failed: {data}")
-                return {"sent": False, "message": data.get("message", "Failed to send OTP")}
+
+            logger.error(f"[OTP] 2factor send failed: {data}")
+            return {"sent": False, "message": data.get("Details", "Failed to send OTP")}
 
         except Exception as e:
-            logger.error(f"[OTP] MSG91 error: {e}")
+            logger.error(f"[OTP] 2factor error: {e}")
             return {"sent": False, "message": "SMS service error. Please try again."}
     else:
         # Dev mode — generate OTP locally, store in Redis
         otp = generate_otp()
         r = _get_redis()
         if r:
-            key = f"{OTP_PREFIX}{phone}:{purpose}"
-            r.setex(key, OTP_EXPIRY, otp)
+            r.setex(f"{OTP_PREFIX}{phone}:{purpose}", OTP_EXPIRY, otp)
         logger.info(f"[OTP] DEV MODE — OTP for {phone}: {otp}")
         return {"sent": True, "message": "OTP sent (dev mode)", "otp": otp}
 
 
 def verify_otp(phone: str, otp: str, purpose: str = "login") -> bool:
-    """
-    Verify OTP.
-    In production: verify against MSG91 API.
-    In dev mode: check Redis or accept "000000".
-    """
+    """Verify an OTP against 2factor (prod) or Redis/"000000" (dev)."""
     # Dev bypass
-    if not settings.SMS_ENABLED and otp == "000000":
+    if not _enabled() and otp == "000000":
         return True
 
-    if settings.SMS_ENABLED and settings.MSG91_AUTH_KEY:
+    if _enabled():
+        r = _get_redis()
+        session_id = r.get(f"{SESSION_PREFIX}{phone}:{purpose}") if r else None
+        if not session_id:
+            logger.warning(f"[OTP] No active session for {phone}:{purpose}")
+            return False
         try:
-            normalized = _normalize_phone(phone)
-            resp = httpx.get(
-                MSG91_VERIFY_URL,
-                params={"mobile": normalized, "otp": otp},
-                headers={"authkey": settings.MSG91_AUTH_KEY},
-                timeout=15,
-            )
+            url = f"{TWOFACTOR_BASE}/{settings.TWOFACTOR_API_KEY}/SMS/VERIFY/{session_id}/{otp}"
+            resp = httpx.get(url, timeout=15)
             data = resp.json()
-
-            if data.get("type") == "success":
-                logger.info(f"[OTP] Verified for {normalized}")
+            if data.get("Status") == "Success":
+                if r:
+                    r.delete(f"{SESSION_PREFIX}{phone}:{purpose}")
+                logger.info(f"[OTP] Verified for {phone}")
                 return True
-            else:
-                logger.warning(f"[OTP] Verification failed for {normalized}: {data}")
-                return False
-
+            logger.warning(f"[OTP] Verification failed for {phone}: {data}")
+            return False
         except Exception as e:
-            logger.error(f"[OTP] MSG91 verify error: {e}")
+            logger.error(f"[OTP] 2factor verify error: {e}")
             return False
     else:
         # Dev mode — check Redis
-        if otp == "000000":
-            return True
         r = _get_redis()
         if not r:
             return False
@@ -150,35 +137,13 @@ def verify_otp(phone: str, otp: str, purpose: str = "login") -> bool:
 
 
 def resend_otp(phone: str, retry_type: str = "text") -> dict:
-    """
-    Resend OTP via MSG91.
-    retry_type: "text" for SMS, "voice" for voice call
-    """
-    if settings.SMS_ENABLED and settings.MSG91_AUTH_KEY:
-        try:
-            normalized = _normalize_phone(phone)
-            resp = httpx.post(
-                MSG91_RESEND_URL,
-                headers={
-                    "authkey": settings.MSG91_AUTH_KEY,
-                    "Content-Type": "application/json",
-                },
-                json={"mobile": normalized, "retrytype": retry_type},
-                timeout=15,
-            )
-            data = resp.json()
-            if data.get("type") == "success":
-                return {"sent": True, "message": "OTP resent"}
-            return {"sent": False, "message": data.get("message", "Resend failed")}
-        except Exception as e:
-            logger.error(f"[OTP] MSG91 resend error: {e}")
-            return {"sent": False, "message": "Resend failed"}
-    else:
-        return send_otp(phone)
+    """Resend OTP — simply request a fresh AUTOGEN session."""
+    return send_otp(phone)
 
 
 def invalidate_otp(phone: str, purpose: str = "login"):
-    """Delete OTP from Redis (dev mode only)."""
+    """Clear any stored OTP/session for this phone+purpose."""
     r = _get_redis()
     if r:
         r.delete(f"{OTP_PREFIX}{phone}:{purpose}")
+        r.delete(f"{SESSION_PREFIX}{phone}:{purpose}")

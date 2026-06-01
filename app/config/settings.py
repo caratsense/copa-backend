@@ -45,12 +45,14 @@ class Settings(BaseSettings):
     CASHFREE_SECRET_KEY: str = ""
     CASHFREE_ENV: str = "sandbox"
 
-    # Twilio SMS OTP
-    # MSG91 SMS OTP
+    # SMS OTP — 2factor.in
     SMS_ENABLED: bool = False
+    TWOFACTOR_API_KEY: str = ""
+    TWOFACTOR_TEMPLATE: str = ""     # optional: AUTOGEN template name from 2factor dashboard
+    OTP_EXPIRY_SECONDS: int = 300    # 5 minutes
+    # MSG91 (legacy — no longer used, kept so old .env files don't error)
     MSG91_AUTH_KEY: str = ""
     MSG91_TEMPLATE_ID: str = ""
-    OTP_EXPIRY_SECONDS: int = 300    # 5 minutes
 
     @property
     def cors_origins_list(self) -> list[str]:
