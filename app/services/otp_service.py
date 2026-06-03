@@ -47,10 +47,10 @@ def generate_otp() -> str:
 
 
 def _normalize_phone(phone: str) -> str:
-    """Normalize to digits with the 91 country code for 2factor (e.g. 919876543210)."""
+    """2factor wants a bare 10-digit Indian number (no +91). Strip the country code."""
     clean = phone.replace("+", "").replace(" ", "").replace("-", "")
-    if len(clean) == 10:
-        clean = "91" + clean
+    if len(clean) == 12 and clean.startswith("91"):
+        clean = clean[2:]
     return clean
 
 
@@ -66,9 +66,10 @@ def send_otp(phone: str, purpose: str = "login") -> dict:
     if _enabled():
         try:
             normalized = _normalize_phone(phone)
-            url = f"{TWOFACTOR_BASE}/{settings.TWOFACTOR_API_KEY}/SMS/{normalized}/AUTOGEN"
-            if settings.TWOFACTOR_TEMPLATE:
-                url = f"{url}/{settings.TWOFACTOR_TEMPLATE}"
+            # 2factor: /SMS/{10-digit}/AUTOGEN/{template}. Template "OTP1" is the
+            # built-in default — without it 2factor falls back to a voice call.
+            template = settings.TWOFACTOR_TEMPLATE or "OTP1"
+            url = f"{TWOFACTOR_BASE}/{settings.TWOFACTOR_API_KEY}/SMS/{normalized}/AUTOGEN/{template}"
 
             resp = httpx.get(url, timeout=15)
             data = resp.json()
