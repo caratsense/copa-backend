@@ -42,6 +42,7 @@ class AddonRule(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, unique=True, nullable=False)       # "topper", "candles", "photo-print"
     cost = Column(Float, nullable=False, default=0.0)
+    stock = Column(Integer, nullable=True)                   # None = unlimited; 0 = out of stock
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 

@@ -7,6 +7,8 @@ List (GET) is open to everyone so the pricing engine and frontend can read rules
 """
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel as PydanticBaseModel
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -47,6 +49,9 @@ def _build_crud(prefix: str, model, create_schema, read_schema):
         q = db.query(model)
         if active_only:
             q = q.filter(model.is_active == True)
+            if hasattr(model, "stock"):
+                from sqlalchemy import or_
+                q = q.filter(or_(model.stock.is_(None), model.stock > 0))
         return q.all()
 
     @router.patch(
@@ -79,6 +84,29 @@ _build_crud("designs", DesignRule, DesignRuleCreate, DesignRuleRead)
 _build_crud("addons", AddonRule, AddonRuleCreate, AddonRuleRead)
 _build_crud("rush", RushRule, RushRuleCreate, RushRuleRead)
 _build_crud("delivery-zones", DeliveryZone, DeliveryZoneCreate, DeliveryZoneRead)
+
+
+# ─── ADDON STOCK UPDATE ──────────────────────────────
+
+class AddonStockUpdate(PydanticBaseModel):
+    stock: int | None
+
+
+@router.patch("/addons/{item_id}/stock", response_model=AddonRuleRead)
+def set_addon_stock(
+    item_id: int,
+    data: AddonStockUpdate,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Admin sets exact stock count for an addon. Pass null for unlimited."""
+    addon = db.query(AddonRule).filter(AddonRule.id == item_id).first()
+    if not addon:
+        raise HTTPException(status_code=404, detail="Addon not found")
+    addon.stock = data.stock
+    db.commit()
+    db.refresh(addon)
+    return addon
 
 
 # ─── MANUAL ASSIGNMENT ────────────────────────────────

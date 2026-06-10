@@ -57,7 +57,14 @@ limiter = Limiter(key_func=get_remote_address, default_limits=["100/minute"])
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Create tables + uploads directory on startup."""
+    from sqlalchemy import text
     Base.metadata.create_all(bind=engine)
+    # Safe migration: add stock column to addon_rules if it doesn't exist yet
+    with engine.connect() as conn:
+        conn.execute(text(
+            "ALTER TABLE addon_rules ADD COLUMN IF NOT EXISTS stock INTEGER"
+        ))
+        conn.commit()
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
     print(f"🚀 {settings.APP_NAME} v2 is starting...")
     yield

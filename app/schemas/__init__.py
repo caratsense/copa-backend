@@ -172,11 +172,13 @@ class DesignRuleRead(BaseModel):
 class AddonRuleCreate(BaseModel):
     name: str
     cost: float = 0.0
+    stock: Optional[int] = None
 
 class AddonRuleRead(BaseModel):
     id: int
     name: str
     cost: float
+    stock: Optional[int] = None
     is_active: bool
     class Config:
         from_attributes = True

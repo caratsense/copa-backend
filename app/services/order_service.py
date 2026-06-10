@@ -18,6 +18,7 @@ from app.models.order import Order, OrderStatus, PaymentStatus, VALID_TRANSITION
 from app.models.order_item import OrderItem
 from app.models.delivery import DeliveryZone
 from app.models.coupon import Coupon
+from app.models.pricing import AddonRule
 from app.schemas import OrderCreate, StatusUpdate, PaymentUpdate
 from app.services.pricing_engine import calculate_item_price
 from app.services.event_service import emit_event
@@ -122,6 +123,12 @@ def create_order(db: Session, data: OrderCreate) -> Order:
         )
         db.add(order_item)
         subtotal += breakdown.line_total
+
+        # Decrement stock for finite addons
+        for addon_name in item_data.customization.addons:
+            addon = db.query(AddonRule).filter(AddonRule.name == addon_name).first()
+            if addon and addon.stock is not None:
+                addon.stock = max(0, addon.stock - item_data.quantity)
 
     order.subtotal = round(subtotal, 2)
 
