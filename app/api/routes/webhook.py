@@ -237,23 +237,58 @@ def _handle_rider(db, user, text):
 
 def _handle_new_user(db, phone, text):
     from app.core.auth import hash_password
-    import random, string
+    import json, random, string
 
-    if len(text) > 1 and not text.isdigit() and len(text) < 50:
-        name = text.strip().title()
+    # Check if they are in the consent confirmation step (Redis/memory)
+    r = None
+    try:
+        import redis as redis_lib
+        r = redis_lib.from_url(settings.REDIS_URL, db=2, decode_responses=True)
+        r.ping()
+    except Exception:
+        r = None
+
+    pending_key = f"wa:pending_signup:{phone}"
+    pending_raw = r.get(pending_key) if r else None
+    pending = json.loads(pending_raw) if pending_raw else None
+
+    # Step 2: They replied YES to consent → create account
+    if pending and text.strip().upper() in ("YES", "Y", "AGREE", "OK", "HAAN", "HA"):
+        name = pending.get("name", "Customer")
         phone_with_plus = f"+{phone}" if not phone.startswith("+") else phone
         pwd = "".join(random.choices(string.ascii_letters + string.digits, k=12))
         new_user = User(name=name, phone=phone_with_plus, password_hash=hash_password(pwd), role=UserRole.CUSTOMER, is_active=True)
         db.add(new_user)
         db.commit()
-
+        if r:
+            r.delete(pending_key)
         return (
-            f"Welcome, {name}. Your account has been created.\n\n"
+            f"Welcome, {name}! Your account has been created.\n\n"
             f"How can I assist you?\n"
             f"1. Place an order\n"
             f"2. Track an order\n"
             f"3. View our menu\n\n"
             f"{SITE}"
+        )
+
+    # Step 2 alt: They replied NO → clear and exit
+    if pending and text.strip().upper() in ("NO", "N", "NAHI", "NAH"):
+        if r:
+            r.delete(pending_key)
+        return "No problem! You can visit us online anytime at " + SITE
+
+    # Step 1: They sent their name → ask for consent before creating account
+    if len(text) > 1 and not text.isdigit() and len(text) < 50:
+        name = text.strip().title()
+        if r:
+            r.setex(pending_key, 600, json.dumps({"name": name}))
+        return (
+            f"Hi {name}! Welcome to Cake O' Clock.\n\n"
+            f"To place orders and track deliveries, we'll create a free account for you using your WhatsApp number.\n\n"
+            f"By replying *YES* you agree to:\n"
+            f"• Receive order updates on WhatsApp\n"
+            f"• Your name and phone number being stored securely\n\n"
+            f"Reply *YES* to continue or *NO* to cancel."
         )
 
     return (

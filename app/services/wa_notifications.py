@@ -107,7 +107,7 @@ def dispatch_notifications(db: Session, order: Order, new_status: str):
                 )
             admins = db.query(User).filter(User.role == UserRole.ADMIN).all()
             for admin in admins:
-                wa.send_text(admin.phone, f"✅ Order #{order.id} delivered to {order.customer_name or 'Customer'}")
+                wa.send_template(admin.phone, "order_delivered_admin", [str(order.id), order.customer_name or "Customer"])
 
         # ─── CANCELLED → notify customer + assigned staff
         elif new_status == OrderStatus.CANCELLED.value:
@@ -117,16 +117,15 @@ def dispatch_notifications(db: Session, order: Order, new_status: str):
                     order.id,
                 )
             if order.baker and order.baker.phone:
-                wa.send_text(order.baker.phone, f"❌ Order #{order.id} has been cancelled.")
+                wa.send_template(order.baker.phone, "order_cancelled_staff", [str(order.id)])
             if order.rider and order.rider.phone:
-                wa.send_text(order.rider.phone, f"❌ Order #{order.id} has been cancelled. Delivery not needed.")
+                wa.send_template(order.rider.phone, "order_cancelled_staff", [str(order.id)])
 
         # ─── IN_PRODUCTION (rejected) → notify baker ─
         elif new_status == OrderStatus.IN_PRODUCTION.value:
             # This could be baker starting OR admin rejecting
-            # If order was AWAITING_APPROVAL before, it's a rejection
             if order.baker and order.baker.phone:
-                wa.send_text(order.baker.phone, f"⚠️ Order #{order.id} sent back for rework. Please check and reply START {order.id} when ready.")
+                wa.send_template(order.baker.phone, "order_rework", [str(order.id)])
 
     except Exception as e:
         logger.error(f"[WA DISPATCH] Error for order #{order.id}: {e}")
