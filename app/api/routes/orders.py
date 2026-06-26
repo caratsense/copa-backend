@@ -28,8 +28,14 @@ router = APIRouter(prefix="/orders", tags=["Orders"])
 @router.post("", response_model=OrderRead, status_code=201)
 def create(data: OrderCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Create a new order — prices calculated automatically, coupons applied."""
-    data.user_id = user.id
-    return create_order(db, data)
+    try:
+        data.user_id = user.id
+        return create_order(db, data)
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        raise HTTPException(status_code=500, detail=f"Order creation failed: {type(e).__name__}: {e}\n{traceback.format_exc()}")
 
 
 @router.get("/my-orders", response_model=list[OrderTrackingRead])
