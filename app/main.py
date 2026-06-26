@@ -59,11 +59,18 @@ async def lifespan(app: FastAPI):
     """Create tables + uploads directory on startup."""
     from sqlalchemy import text
     Base.metadata.create_all(bind=engine)
-    # Safe migration: add stock column to addon_rules if it doesn't exist yet
     with engine.connect() as conn:
-        conn.execute(text(
-            "ALTER TABLE addon_rules ADD COLUMN IF NOT EXISTS stock INTEGER"
-        ))
+        # addon_rules.stock
+        conn.execute(text("ALTER TABLE addon_rules ADD COLUMN IF NOT EXISTS stock INTEGER"))
+        # orders: payment columns added for COD support
+        conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method VARCHAR DEFAULT 'ONLINE'"))
+        conn.execute(text("""
+            DO $$ BEGIN
+                CREATE TYPE paymentstatus AS ENUM ('PENDING','PAID','COD_PENDING','FAILED','REFUNDED');
+            EXCEPTION WHEN duplicate_object THEN NULL; END $$
+        """))
+        conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_status paymentstatus DEFAULT 'PENDING'"))
+        conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_id VARCHAR"))
         conn.commit()
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
     print(f"🚀 {settings.APP_NAME} v2 is starting...")
