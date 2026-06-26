@@ -60,18 +60,19 @@ async def lifespan(app: FastAPI):
     from sqlalchemy import text
     Base.metadata.create_all(bind=engine)
     with engine.connect() as conn:
-        # addon_rules.stock
-        conn.execute(text("ALTER TABLE addon_rules ADD COLUMN IF NOT EXISTS stock INTEGER"))
-        # orders: payment columns added for COD support
-        conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method VARCHAR DEFAULT 'ONLINE'"))
-        conn.execute(text("""
-            DO $$ BEGIN
-                CREATE TYPE paymentstatus AS ENUM ('PENDING','PAID','COD_PENDING','FAILED','REFUNDED');
-            EXCEPTION WHEN duplicate_object THEN NULL; END $$
-        """))
-        conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_status paymentstatus DEFAULT 'PENDING'"))
-        conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_id VARCHAR"))
-        conn.commit()
+        # Each migration in its own try/except so one failure doesn't block the rest
+        for stmt in [
+            "ALTER TABLE addon_rules ADD COLUMN IF NOT EXISTS stock INTEGER",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method VARCHAR DEFAULT 'ONLINE'",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_status VARCHAR DEFAULT 'PENDING'",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_id VARCHAR",
+        ]:
+            try:
+                conn.execute(text(stmt))
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                print(f"[Migration] Skipped (already exists?): {e}")
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
     print(f"🚀 {settings.APP_NAME} v2 is starting...")
     yield
