@@ -134,6 +134,9 @@ def schedule_order_delivery(db: Session, requested_delivery_time: datetime | Non
 
     # Customer requested a specific future time
     if requested_delivery_time:
+        # Make timezone-aware if naive (assume IST)
+        if requested_delivery_time.tzinfo is None:
+            requested_delivery_time = requested_delivery_time.replace(tzinfo=IST)
         # If requested time is in the past, bump to next available
         if requested_delivery_time < now_ist:
             requested_delivery_time = get_next_available_time(db)
