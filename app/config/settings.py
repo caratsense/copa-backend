@@ -40,10 +40,11 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = ""  # kept for backward compat
     GEMINI_MODEL: str = "gemini-2.0-flash"
 
-    # Cashfree Payment Gateway
-    CASHFREE_APP_ID: str = ""
-    CASHFREE_SECRET_KEY: str = ""
-    CASHFREE_ENV: str = "sandbox"
+    # PayU Payment Gateway (India)
+    PAYU_KEY: str = ""
+    PAYU_SALT: str = ""
+    PAYU_ENV: str = "test"                 # "test" or "prod"
+    BACKEND_BASE_URL: str = "http://localhost:8000"   # this API's public URL (for PayU callbacks)
 
     # SMS OTP — 2factor.in
     SMS_ENABLED: bool = False
