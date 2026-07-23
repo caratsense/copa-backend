@@ -140,6 +140,39 @@ def login(request: Request, data: LoginRequest, db: Session = Depends(get_db)):
     )
 
 
+# ─── OTP LOGIN (passwordless, phone → OTP) ───────────
+
+class OTPLoginRequest(BaseModel):
+    phone: str
+    device_fingerprint: str | None = None
+
+
+@router.post("/login-otp", response_model=LoginResponse)
+@limiter.limit("5/minute")
+def login_otp(request: Request, data: OTPLoginRequest, db: Session = Depends(get_db)):
+    """Start OTP-based login: send an OTP to a registered phone. Complete via /verify-otp."""
+    phone = data.phone.replace(" ", "").replace("-", "")
+    if not phone.startswith("+"):
+        if phone.startswith("91") and len(phone) == 12:
+            phone = "+" + phone
+        elif len(phone) == 10:
+            phone = "+91" + phone
+
+    user = db.query(User).filter(User.phone == phone).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="No account found with this phone number")
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="Account is deactivated")
+
+    otp_result = send_otp(user.phone)
+    temp_token = create_access_token(user.id, "otp_pending", expires_minutes=10)
+    return LoginResponse(
+        requires_otp=True,
+        temp_token=temp_token,
+        message=otp_result.get("message", "OTP sent"),
+    )
+
+
 # ─── VERIFY OTP (STEP 2) ─────────────────────────────
 
 @router.post("/verify-otp", response_model=TokenResponse)
