@@ -69,6 +69,9 @@ def register(request: Request, data: RegisterRequest, db: Session = Depends(get_
         date_of_birth=data.date_of_birth if data.date_of_birth else None,
         password_hash=hash_password(data.password),
         role=UserRole.CUSTOMER,
+        whatsapp_opt_in=data.whatsapp_opt_in,
+        whatsapp_opt_in_at=datetime.now(timezone.utc) if data.whatsapp_opt_in else None,
+        whatsapp_opt_in_source="web_registration" if data.whatsapp_opt_in else None,
     )
     db.add(user)
     db.commit()

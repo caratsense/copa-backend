@@ -16,8 +16,14 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRY_MINUTES: int = 1440  # 24 hours
 
-    # CORS — add your frontend URL here
+    # CORS — comma-separated list of allowed frontend origins.
+    # MUST include your deployed frontend URL in production.
     CORS_ORIGINS: str = "http://localhost:3000,http://localhost:5173,http://localhost:8080"
+    # Extra origins matched by regex (e.g. Vercel preview deploys).
+    CORS_ORIGIN_REGEX: str = r"https://.*\.vercel\.app"
+
+    # Admin bootstrap — /users/promote-admin is DISABLED unless this is set.
+    PROMOTE_SECRET: str = ""
 
     # File uploads
     UPLOAD_DIR: str = "/code/uploads"
@@ -34,6 +40,14 @@ class Settings(BaseSettings):
     WHATSAPP_REVIEW_BASE_URL: str = "http://localhost:3000/menu"
     WHATSAPP_WEBHOOK_VERIFY_TOKEN: str = "cakeoclock2026"
     WHATSAPP_BUSINESS_PHONE: str = "919554444462"
+    # Meta App Secret — used to verify the X-Hub-Signature-256 header on incoming
+    # webhooks. Without it, anyone who knows the webhook URL can forge messages
+    # (including staff/admin commands). Find it in Meta App Dashboard → Settings → Basic.
+    WHATSAPP_APP_SECRET: str = ""
+    # Must match the language your templates were APPROVED under in WhatsApp
+    # Manager. A mismatch (e.g. "en" here vs "en_US" there) fails every send
+    # with error 132001.
+    WHATSAPP_TEMPLATE_LANG: str = "en"
 
     # AI Parser (Groq — free, fast)
     GROQ_API_KEY: str = ""

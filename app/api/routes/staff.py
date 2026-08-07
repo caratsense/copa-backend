@@ -40,6 +40,12 @@ def create_staff(
     if existing:
         raise HTTPException(status_code=409, detail="Phone number already registered")
 
+    # Staff receive job-related WhatsApp notifications (new assignment, pickup
+    # ready). The admin creating the account is asserting that consent as part
+    # of onboarding — it's still recorded with a distinct source so the basis
+    # for consent is auditable and staff can still reply STOP to opt out.
+    from datetime import datetime, timezone
+
     user = User(
         name=data.name,
         phone=data.phone,
@@ -47,6 +53,9 @@ def create_staff(
         password_hash=hash_password(data.password),
         role=UserRole(data.role),
         on_duty=True,
+        whatsapp_opt_in=True,
+        whatsapp_opt_in_at=datetime.now(timezone.utc),
+        whatsapp_opt_in_source="staff_onboarding",
     )
     db.add(user)
     db.commit()

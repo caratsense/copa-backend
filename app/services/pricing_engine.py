@@ -28,6 +28,17 @@ def _lookup_or_zero(db: Session, model, name_field: str, name: str, cost_field: 
     return getattr(row, cost_field)
 
 
+def lookup_delivery_charge(db: Session, delivery_zone_name: str | None) -> float:
+    """Charge for a delivery zone, or 0 for pickup / unknown zones."""
+    if not delivery_zone_name:
+        return 0.0
+    zone = db.query(DeliveryZone).filter(
+        DeliveryZone.area_name == delivery_zone_name,
+        DeliveryZone.is_active == True,
+    ).first()
+    return float(zone.charge) if zone else 0.0
+
+
 def calculate_item_price(
     db: Session,
     product: Product,
@@ -64,16 +75,13 @@ def calculate_item_price(
     rush_cost = _lookup_or_zero(db, RushRule, "name", customization.rush, "cost")
 
     # ── Delivery ──
-    delivery_charge = 0.0
-    if delivery_zone_name:
-        zone = db.query(DeliveryZone).filter(
-            DeliveryZone.area_name == delivery_zone_name, DeliveryZone.is_active == True
-        ).first()
-        if zone:
-            delivery_charge = zone.charge
+    # Reported here for display only. Delivery is charged ONCE per order (see
+    # lookup_delivery_charge + create_order) — folding it into item_total would
+    # bill it per line AND multiply it by quantity.
+    delivery_charge = lookup_delivery_charge(db, delivery_zone_name)
 
     # ── Totals ──
-    item_total = round(size_adjusted + flavor_cost + design_cost + addon_total + rush_cost + delivery_charge, 2)
+    item_total = round(size_adjusted + flavor_cost + design_cost + addon_total + rush_cost, 2)
     line_total = round(item_total * quantity, 2)
 
     return PriceBreakdown(

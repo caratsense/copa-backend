@@ -1,7 +1,18 @@
 """
 WhatsApp Webhook — Professional, handles text/voice/image.
+
+SECURITY: incoming POSTs are authenticated by the X-Hub-Signature-256 header
+(HMAC-SHA256 of the raw body, keyed with the Meta App Secret). Without that
+check, anyone who learns this URL can forge a message from any phone number —
+including a staff/admin number, which would let them approve or cancel orders.
+Set WHATSAPP_APP_SECRET to enable it.
+
+Meta retries webhooks it thinks failed, so every message id is recorded in
+Redis and replays are dropped. Otherwise a retry re-runs the command.
 """
 
+import hashlib
+import hmac
 import json
 import logging
 from fastapi import APIRouter, Request, HTTPException
@@ -17,6 +28,7 @@ from app.services.assignment_engine import auto_assign_baker, auto_assign_rider
 from app.services.whatsapp_sender import send_text
 from app.services.gemini_parser import parse_message, transcribe_voice, get_audio_url
 from app.services.wa_customer_flow import handle_customer_message
+from app.services.wa_consent import is_opt_out_request, record_opt_in, record_opt_out
 from app.config import get_settings
 settings = get_settings()
 
@@ -34,11 +46,48 @@ async def verify_webhook(request: Request):
     raise HTTPException(status_code=403, detail="Verification failed")
 
 
+def _verify_signature(raw_body: bytes, header: str | None) -> bool:
+    """Verify Meta's X-Hub-Signature-256 over the raw request body."""
+    if not settings.WHATSAPP_APP_SECRET:
+        # Not configured — allow through but make the gap loud in the logs.
+        logger.warning("[WA] WHATSAPP_APP_SECRET unset — webhook signature NOT verified")
+        return True
+    if not header or not header.startswith("sha256="):
+        return False
+    expected = hmac.new(
+        settings.WHATSAPP_APP_SECRET.encode(),
+        raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(header[len("sha256="):], expected)
+
+
+def _already_processed(message_id: str) -> bool:
+    """True if we've already handled this message id (Meta retry / duplicate)."""
+    if not message_id:
+        return False
+    try:
+        import redis as redis_lib
+        r = redis_lib.from_url(settings.REDIS_URL, db=2, decode_responses=True)
+        # SET NX returns None when the key already exists.
+        was_set = r.set(f"wa:msg:{message_id}", "1", nx=True, ex=86400)
+        return not was_set
+    except Exception:
+        # Redis down — better to process (and risk a rare duplicate) than to
+        # silently drop every real message.
+        return False
+
+
 @router.post("/whatsapp")
 async def receive_whatsapp(request: Request):
+    raw = await request.body()
+    if not _verify_signature(raw, request.headers.get("x-hub-signature-256")):
+        logger.warning("[WA] Rejected webhook with bad signature")
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
     try:
-        body = await request.json()
-    except:
+        body = json.loads(raw)
+    except Exception:
         return {"status": "invalid"}
 
     entry = body.get("entry", [])
@@ -47,13 +96,33 @@ async def receive_whatsapp(request: Request):
     if not changes: return {"status": "no changes"}
     value = changes[0].get("value", {})
     messages = value.get("messages", [])
-    if value.get("statuses") and not messages: return {"status": "status update"}
+
+    # Delivery receipts. Template FAILURES arrive here — log them loudly,
+    # otherwise a wrong template name or language code fails silently forever.
+    if value.get("statuses") and not messages:
+        for st in value["statuses"]:
+            state = st.get("status", "")
+            if state == "failed":
+                errors = st.get("errors", [])
+                logger.error(
+                    "[WA] Send FAILED to %s (msg %s): %s",
+                    st.get("recipient_id"), st.get("id"), errors,
+                )
+            else:
+                logger.info("[WA] Message %s -> %s", st.get("id"), state)
+        return {"status": "status update"}
+
     if not messages: return {"status": "no messages"}
 
     msg = messages[0]
     sender = msg.get("from", "")
     msg_type = msg.get("type", "")
     text = ""
+
+    # Drop Meta retries so a command never runs twice.
+    if _already_processed(msg.get("id", "")):
+        logger.info(f"[WA] Duplicate message {msg.get('id')} ignored")
+        return {"status": "duplicate"}
 
     if msg_type == "text":
         text = msg.get("text", {}).get("body", "").strip()
@@ -89,6 +158,29 @@ async def receive_whatsapp(request: Request):
         if not user:
             clean = sender[-10:] if len(sender) >= 10 else sender
             user = db.query(User).filter(User.phone.endswith(clean)).first()
+
+        # ─── OPT-OUT — checked first, for every role ───
+        # Must run before command routing: policy requires we honour "STOP"
+        # regardless of what the person was in the middle of doing.
+        if is_opt_out_request(text):
+            if user:
+                record_opt_out(db, user)
+                reply = (
+                    "You've been unsubscribed from Cake O' Clock order updates on WhatsApp.\n\n"
+                    "You can still order anytime at " + SITE + " — you just won't get "
+                    "WhatsApp notifications.\n\n"
+                    "Reply START to turn updates back on."
+                )
+            else:
+                reply = "You're not subscribed to any Cake O' Clock updates."
+            send_text(sender, reply)
+            return {"status": "opted_out"}
+
+        # ─── OPT-IN (re-subscribe) ───
+        if user and not user.whatsapp_opt_in and text.strip().upper() in ("START", "SUBSCRIBE", "RESUME"):
+            record_opt_in(db, user, source="whatsapp_reply")
+            send_text(sender, "You're subscribed to Cake O' Clock order updates. Reply STOP anytime to unsubscribe.")
+            return {"status": "opted_in"}
 
         if user and user.role == UserRole.ADMIN:
             reply = _handle_admin(db, user, text)
@@ -132,7 +224,8 @@ def _handle_admin(db, user, text):
 
     elif act == "ADMIN_PAID" and oid:
         from app.services.order_service import update_payment_status
-        update_payment_status(db, oid, "PAID")
+        from app.schemas import PaymentUpdate
+        update_payment_status(db, oid, PaymentUpdate(payment_status="PAID"))
         return f"Order #{oid} marked as paid."
 
     elif act == "ADMIN_CANCEL" and oid:
@@ -254,10 +347,23 @@ def _handle_new_user(db, phone, text):
 
     # Step 2: They replied YES to consent → create account
     if pending and text.strip().upper() in ("YES", "Y", "AGREE", "OK", "HAAN", "HA"):
+        from datetime import datetime, timezone as _tz
+
         name = pending.get("name", "Customer")
         phone_with_plus = f"+{phone}" if not phone.startswith("+") else phone
         pwd = "".join(random.choices(string.ascii_letters + string.digits, k=12))
-        new_user = User(name=name, phone=phone_with_plus, password_hash=hash_password(pwd), role=UserRole.CUSTOMER, is_active=True)
+        # This YES *is* the WhatsApp opt-in — record it so we can demonstrate
+        # consent later, and so dispatch_notifications is allowed to message them.
+        new_user = User(
+            name=name,
+            phone=phone_with_plus,
+            password_hash=hash_password(pwd),
+            role=UserRole.CUSTOMER,
+            is_active=True,
+            whatsapp_opt_in=True,
+            whatsapp_opt_in_at=datetime.now(_tz.utc),
+            whatsapp_opt_in_source="whatsapp_reply",
+        )
         db.add(new_user)
         db.commit()
         if r:

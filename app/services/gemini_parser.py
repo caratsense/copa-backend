@@ -67,7 +67,10 @@ def _quick_match(message: str, role: str, context: dict) -> dict | None:
     msg = message.strip().upper()
     step = context.get("step", "IDLE")
 
-    if msg in ("CANCEL", "STOP", "EXIT"):
+    # NOTE: "STOP" is deliberately absent — it means "unsubscribe", and is
+    # handled upstream in the webhook before any command routing. Treating it as
+    # order-cancel meant opt-out requests were silently ignored.
+    if msg in ("CANCEL", "EXIT"):
         return {"action": "CANCEL_ORDER"}
     if msg in ("CONFIRM", "YES"):
         return {"action": "CONFIRM_ORDER"}

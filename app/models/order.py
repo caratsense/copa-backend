@@ -1,5 +1,6 @@
 import enum
 from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Enum, func
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from app.db.base import Base
 
@@ -44,7 +45,13 @@ class Order(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     status = Column(Enum(OrderStatus), default=OrderStatus.RECEIVED, nullable=False)
+    # subtotal = items + extras + delivery. discount applies to items only.
+    # total_price = subtotal - discount.
     subtotal = Column(Float, nullable=False, default=0.0)
+    delivery_charge = Column(Float, nullable=False, default=0.0)
+    extras_total = Column(Float, nullable=False, default=0.0)
+    # Snapshot of chosen extras at order time: [{"id", "name", "price"}]
+    extras = Column(JSONB, default=list)
     discount = Column(Float, nullable=False, default=0.0)
     total_price = Column(Float, nullable=False, default=0.0)
     coupon_code = Column(String, nullable=True)

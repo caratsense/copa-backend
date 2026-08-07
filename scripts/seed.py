@@ -43,22 +43,34 @@ def seed():
         # ══════════════════════════════════════════════════
         # USERS
         # ══════════════════════════════════════════════════
+        # Staff opt in to WhatsApp job notifications as part of onboarding.
+        # The demo customer does NOT — that consent has to be given for real.
+        _now = datetime.now(timezone.utc)
+        _staff_consent = dict(
+            whatsapp_opt_in=True,
+            whatsapp_opt_in_at=_now,
+            whatsapp_opt_in_source="staff_onboarding",
+        )
         users = [
             User(name="Shriya Mahendru", phone="+919554444462",
                  email="admin@cakeoclock.in", role=UserRole.ADMIN,
-                 password_hash=hash_password("admin123"), on_duty=True),
+                 password_hash=hash_password("admin123"), on_duty=True,
+                 **_staff_consent),
             User(name="Test Customer", phone="+919999999999",
                  email="test@cakeoclock.in", role=UserRole.CUSTOMER,
                  password_hash=hash_password("customer123")),
             User(name="Baker One", phone="+918888888881",
                  email="baker1@cakeoclock.in", role=UserRole.BAKER,
-                 password_hash=hash_password("baker123"), on_duty=True),
+                 password_hash=hash_password("baker123"), on_duty=True,
+                 **_staff_consent),
             User(name="Baker Two", phone="+918888888882",
                  email="baker2@cakeoclock.in", role=UserRole.BAKER,
-                 password_hash=hash_password("baker123"), on_duty=True),
+                 password_hash=hash_password("baker123"), on_duty=True,
+                 **_staff_consent),
             User(name="Rider One", phone="+917777777771",
                  email="rider1@cakeoclock.in", role=UserRole.RIDER,
-                 password_hash=hash_password("rider123"), on_duty=True),
+                 password_hash=hash_password("rider123"), on_duty=True,
+                 **_staff_consent),
         ]
 
         # ══════════════════════════════════════════════════

@@ -18,6 +18,10 @@ class RegisterRequest(BaseModel):
     email: Optional[str] = None
     date_of_birth: Optional[str] = None  # "YYYY-MM-DD"
     role: str = "customer"
+    # WhatsApp order updates. Must be an explicit, unticked-by-default choice —
+    # WhatsApp policy does not accept implied consent, and we must be able to
+    # show when/how it was given.
+    whatsapp_opt_in: bool = False
 
 class LoginRequest(BaseModel):
     phone: str
@@ -296,6 +300,8 @@ class OrderCreate(BaseModel):
     delivery_address: Optional[str] = None
     delivery_time: Optional[datetime] = None
     delivery_zone: Optional[str] = None
+    # IDs from GET /extras — priced server-side, never trusted from the client.
+    extras: list[int] = Field(default_factory=list)
     coupon_code: Optional[str] = None
     notes: Optional[str] = None
 
@@ -316,6 +322,9 @@ class OrderRead(BaseModel):
     customer_phone: Optional[str] = None
     status: str
     subtotal: float
+    delivery_charge: float = 0.0
+    extras_total: float = 0.0
+    extras: list[dict] = Field(default_factory=list)
     discount: float
     total_price: float
     coupon_code: Optional[str]
@@ -360,10 +369,17 @@ class OrderTrackingRead(BaseModel):
     """Lightweight order view for customers — no internal fields."""
     id: int
     status: str
+    subtotal: float = 0.0
+    delivery_charge: float = 0.0
+    extras_total: float = 0.0
+    extras: list[dict] = Field(default_factory=list)
+    discount: float = 0.0
     total_price: float
     delivery_address: Optional[str]
     delivery_time: Optional[datetime]
     payment_status: str
+    payment_method: Optional[str] = "ONLINE"
+    rider_name: Optional[str] = None
     created_at: datetime
     items: list[OrderItemRead] = []
     class Config:

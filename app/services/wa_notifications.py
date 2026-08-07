@@ -1,8 +1,12 @@
 """
 WhatsApp Notification Dispatcher
 ==================================
-Called after every order status change.
-Sends WhatsApp notifications to relevant people.
+Called after every order status change. This is the SINGLE owner of outbound
+business-initiated WhatsApp messages — the event worker deliberately no longer
+sends any (two pipelines used to double-message customers).
+
+Every recipient is checked against their recorded opt-in first; see
+app/services/wa_consent.py.
 """
 
 import logging
@@ -11,10 +15,19 @@ from app.models.order import Order, OrderStatus
 from app.models.user import User, UserRole
 from app.services.order_service import _enrich_order
 from app.services import whatsapp_sender as wa
+from app.services.wa_consent import may_message
 from app.config import get_settings
 settings = get_settings()
 
 logger = logging.getLogger(__name__)
+
+
+def _consenting_admins(db: Session) -> list[User]:
+    """Admins we're allowed to message."""
+    return [
+        a for a in db.query(User).filter(User.role == UserRole.ADMIN).all()
+        if may_message(a)
+    ]
 
 
 def _items_str(order: Order) -> str:
@@ -52,27 +65,30 @@ def dispatch_notifications(db: Session, order: Order, new_status: str):
     items = _items_str(order)
     delivery = _delivery_str(order)
 
+    customer_ok = may_message(order.user) and bool(order.user and order.user.phone)
+    baker_ok = may_message(order.baker) and bool(order.baker and order.baker.phone)
+    rider_ok = may_message(order.rider) and bool(order.rider and order.rider.phone)
+    customer_phone = order.user.phone if order.user else ""
+
     try:
         # ─── CONFIRMED → notify customer + admin ──────
         if new_status == OrderStatus.CONFIRMED.value:
-            if order.user and order.user.phone:
+            if customer_ok:
                 wa.notify_customer_order_confirmed(
                     order.user.phone, order.customer_name or "Customer",
                     order.id, items, order.total_price, delivery,
                 )
-            # Notify all admins
-            admins = db.query(User).filter(User.role == UserRole.ADMIN).all()
-            for admin in admins:
+            for admin in _consenting_admins(db):
                 wa.notify_admin_new_order(
                     admin.phone, order.id,
                     order.customer_name or "Customer",
-                    order.user.phone if order.user else "",
+                    customer_phone,
                     items, order.total_price, delivery,
                 )
 
         # ─── ASSIGNED → notify baker ─────────────────
         elif new_status == OrderStatus.ASSIGNED.value:
-            if order.baker and order.baker.phone:
+            if baker_ok:
                 wa.notify_baker_new_order(
                     order.baker.phone, order.id, items,
                     order.notes or "None", delivery,
@@ -80,51 +96,49 @@ def dispatch_notifications(db: Session, order: Order, new_status: str):
 
         # ─── AWAITING_APPROVAL → notify admin ────────
         elif new_status == OrderStatus.AWAITING_APPROVAL.value:
-            admins = db.query(User).filter(User.role == UserRole.ADMIN).all()
-            for admin in admins:
+            for admin in _consenting_admins(db):
                 wa.notify_admin_approval_needed(
                     admin.phone, order.id, items, order.total_price,
                 )
 
         # ─── PACKAGED → if rider assigned, notify rider
         elif new_status == OrderStatus.PACKAGED.value:
-            if order.rider and order.rider.phone:
+            if rider_ok:
                 address = order.delivery_address or "Self Pickup"
                 wa.notify_rider_new_delivery(
                     order.rider.phone, order.id,
                     order.customer_name or "Customer",
-                    order.user.phone if order.user else "",
+                    customer_phone,
                     address, _maps_link(address),
                     order.total_price,
                 )
 
         # ─── DELIVERED → notify customer + admin ─────
         elif new_status == OrderStatus.DELIVERED.value:
-            if order.user and order.user.phone:
+            if customer_ok:
                 wa.notify_customer_delivered(
                     order.user.phone, order.customer_name or "Customer",
                     order.id,
                 )
-            admins = db.query(User).filter(User.role == UserRole.ADMIN).all()
-            for admin in admins:
+            for admin in _consenting_admins(db):
                 wa.send_template(admin.phone, "order_delivered_admin", [str(order.id), order.customer_name or "Customer"])
 
         # ─── CANCELLED → notify customer + assigned staff
         elif new_status == OrderStatus.CANCELLED.value:
-            if order.user and order.user.phone:
+            if customer_ok:
                 wa.notify_customer_cancelled(
                     order.user.phone, order.customer_name or "Customer",
                     order.id,
                 )
-            if order.baker and order.baker.phone:
+            if baker_ok:
                 wa.send_template(order.baker.phone, "order_cancelled_staff", [str(order.id)])
-            if order.rider and order.rider.phone:
+            if rider_ok:
                 wa.send_template(order.rider.phone, "order_cancelled_staff", [str(order.id)])
 
         # ─── IN_PRODUCTION (rejected) → notify baker ─
         elif new_status == OrderStatus.IN_PRODUCTION.value:
             # This could be baker starting OR admin rejecting
-            if order.baker and order.baker.phone:
+            if baker_ok:
                 wa.send_template(order.baker.phone, "order_rework", [str(order.id)])
 
     except Exception as e:

@@ -24,7 +24,7 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.models.order import Order, PaymentStatus
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.core.auth import get_current_user
 from app.config import get_settings
 
@@ -60,6 +60,20 @@ class PaymentOrderRequest(BaseModel):
     payment_method: str = "ONLINE"  # ONLINE or COD
 
 
+def _get_own_order(db: Session, order_id: int, user: User) -> Order:
+    """Fetch an order, 404 if missing, 403 if it isn't the caller's (admins exempt).
+
+    Returning 404 for someone else's order would also be defensible, but the
+    order id is already visible to its owner, so 403 is clearer here.
+    """
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.user_id != user.id and user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="This order does not belong to you")
+    return order
+
+
 @router.post("/create-order")
 def create_payment_order(
     data: PaymentOrderRequest,
@@ -67,9 +81,11 @@ def create_payment_order(
     db: Session = Depends(get_db),
 ):
     """Create a PayU payment (or register COD). Returns params for the frontend to POST to PayU."""
-    order = db.query(Order).filter(Order.id == data.order_id).first()
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
+    order = _get_own_order(db, data.order_id, user)
+
+    # Already-paid orders must not be re-opened for payment.
+    if order.payment_status == PaymentStatus.PAID:
+        raise HTTPException(status_code=400, detail="This order is already paid")
 
     # COD — just record it and return
     if data.payment_method == "COD":
@@ -158,10 +174,8 @@ def payment_status(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Check payment status of an order."""
-    order = db.query(Order).filter(Order.id == order_id).first()
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
+    """Check payment status of an order. Own orders only (admins can see any)."""
+    order = _get_own_order(db, order_id, user)
     return {
         "order_id": order.id,
         "payment_status": order.payment_status.value,

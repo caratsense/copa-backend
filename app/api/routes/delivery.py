@@ -51,17 +51,22 @@ class LocationResponse(BaseModel):
 def start_tracking(
     order_id: int,
     data: StartTrackingRequest,
-    admin: User = Depends(require_admin),
+    user: User = Depends(require_role(UserRole.RIDER, UserRole.ADMIN)),
     db: Session = Depends(get_db),
 ):
     """
-    Start GPS tracking for a delivery.
+    Start GPS tracking for a delivery — stores pickup/dropoff so ETA can be computed.
     Call this when the order status changes to OUT_FOR_DELIVERY.
-    Requires pickup and dropoff coordinates.
+
+    The assigned rider can call this for their own delivery (they're the one with
+    the coordinates); admins can call it for any order.
     """
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+
+    if user.role != UserRole.ADMIN and order.assigned_rider_id != user.id:
+        raise HTTPException(status_code=403, detail="This delivery is not assigned to you")
 
     if order.status != OrderStatus.OUT_FOR_DELIVERY:
         raise HTTPException(
@@ -69,15 +74,9 @@ def start_tracking(
             detail=f"Order must be OUT_FOR_DELIVERY to start tracking. Current: {order.status.value}"
         )
 
-    rider_id = 0
-    if order.assigned_rider:
-        # Try to extract rider ID from the assigned_rider string
-        # In a full system, this would be a foreign key
-        rider_id = hash(order.assigned_rider) % 10000
-
     result = start_delivery_tracking(
         order_id=order_id,
-        rider_id=rider_id,
+        rider_id=order.assigned_rider_id or 0,
         pickup_lat=data.pickup_lat,
         pickup_lng=data.pickup_lng,
         dropoff_lat=data.dropoff_lat,
@@ -87,8 +86,6 @@ def start_tracking(
     return {
         "message": "Tracking started",
         "order_id": order_id,
-        "websocket_rider": f"ws://localhost:8000/ws/rider/{order_id}?token=<rider_jwt>",
-        "websocket_customer": f"ws://localhost:8000/ws/track/{order_id}?token=<customer_jwt>",
         **result,
     }
 

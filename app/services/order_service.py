@@ -8,19 +8,20 @@ Enhanced with:
 - Customer order history & tracking
 """
 
-import asyncio
 from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
 
+from app.core.broadcast import broadcast_sync
 from app.models.product import Product
 from app.models.order import Order, OrderStatus, PaymentStatus, VALID_TRANSITIONS
 from app.models.order_item import OrderItem
 from app.models.delivery import DeliveryZone
 from app.models.coupon import Coupon
+from app.models.extra import Extra
 from app.models.pricing import AddonRule
 from app.schemas import OrderCreate, StatusUpdate, PaymentUpdate
-from app.services.pricing_engine import calculate_item_price
+from app.services.pricing_engine import calculate_item_price, lookup_delivery_charge
 from app.services.event_service import emit_event
 
 
@@ -50,17 +51,11 @@ def _apply_coupon(db: Session, coupon_code: str, subtotal: float) -> tuple[float
 
 def _try_broadcast(order_id: int, event_type: str, data: dict):
     """Best-effort WebSocket broadcast — doesn't fail the request."""
-    try:
-        from app.api.routes.websocket import manager
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.ensure_future(manager.broadcast({
-                "type": event_type,
-                "order_id": order_id,
-                **data,
-            }))
-    except Exception:
-        pass
+    broadcast_sync({
+        "type": event_type,
+        "order_id": order_id,
+        **data,
+    })
 
 
 def create_order(db: Session, data: OrderCreate) -> Order:
@@ -130,22 +125,56 @@ def create_order(db: Session, data: OrderCreate) -> Order:
             if addon and addon.stock is not None:
                 addon.stock = max(0, addon.stock - item_data.quantity)
 
-    order.subtotal = round(subtotal, 2)
+    items_subtotal = round(subtotal, 2)
+
+    # ── Price extras (balloons, candles, gift wrap…) ──
+    # Priced from the DB by id; the client never sends amounts.
+    extras_total = 0.0
+    extras_snapshot: list[dict] = []
+    if data.extras:
+        rows = db.query(Extra).filter(
+            Extra.id.in_(set(data.extras)),
+            Extra.is_active == True,
+        ).all()
+        found = {e.id for e in rows}
+        missing = set(data.extras) - found
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"These extras are unavailable: {sorted(missing)}",
+            )
+        for e in rows:
+            price = float(e.price or 0.0)
+            extras_total += price
+            extras_snapshot.append({"id": e.id, "name": e.name, "price": price})
+
+    # ── Delivery charge — once per order, not per line ──
+    delivery_charge = lookup_delivery_charge(db, data.delivery_zone)
+
+    order.extras = extras_snapshot
+    order.extras_total = round(extras_total, 2)
+    order.delivery_charge = round(delivery_charge, 2)
+    order.subtotal = round(items_subtotal + extras_total + delivery_charge, 2)
 
     # ── Apply coupon ──
+    # Discount is computed against the cake subtotal only — coupons don't
+    # discount delivery or party extras.
     discount = 0.0
     if data.coupon_code:
-        discount, error = _apply_coupon(db, data.coupon_code, subtotal)
+        discount, error = _apply_coupon(db, data.coupon_code, items_subtotal)
         if error:
             raise HTTPException(status_code=400, detail=f"Coupon error: {error}")
         order.coupon_code = data.coupon_code.upper().strip()
 
     order.discount = round(discount, 2)
-    order.total_price = round(subtotal - discount, 2)
+    order.total_price = round(order.subtotal - discount, 2)
 
     # ── Emit event ──
     emit_event(db, order.id, "ORDER_CREATED", {
         "user_id": data.user_id,
+        "items_subtotal": items_subtotal,
+        "extras_total": order.extras_total,
+        "delivery_charge": order.delivery_charge,
         "subtotal": order.subtotal,
         "discount": order.discount,
         "total_price": order.total_price,

@@ -11,16 +11,19 @@ New in v2:
 - Rate limiting on public endpoints
 """
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from slowapi import Limiter
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from slowapi.middleware import SlowAPIMiddleware
 
 from app.config import get_settings
+from app.core.broadcast import set_main_loop
 from app.db import Base, engine
 
 # Import all route modules
@@ -66,6 +69,15 @@ async def lifespan(app: FastAPI):
             "ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method VARCHAR DEFAULT 'ONLINE'",
             "ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_status VARCHAR DEFAULT 'PENDING'",
             "ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_id VARCHAR",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_charge DOUBLE PRECISION DEFAULT 0",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS extras_total DOUBLE PRECISION DEFAULT 0",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS extras JSONB DEFAULT '[]'::jsonb",
+            # WhatsApp consent. Defaults to FALSE so existing rows are treated as
+            # "no recorded opt-in" — we must not message them until they opt in.
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp_opt_in BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp_opt_in_at TIMESTAMPTZ",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp_opt_in_source VARCHAR",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp_opt_out_at TIMESTAMPTZ",
         ]:
             try:
                 conn.execute(text(stmt))
@@ -74,7 +86,17 @@ async def lifespan(app: FastAPI):
                 conn.rollback()
                 print(f"[Migration] Skipped (already exists?): {e}")
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-    print(f"🚀 {settings.APP_NAME} v2 is starting...")
+
+    # Capture the running loop so sync route handlers can push WebSocket messages.
+    set_main_loop(asyncio.get_running_loop())
+
+    if not settings.cors_origins_list:
+        print("[WARN] CORS_ORIGINS is empty - browser requests from your frontend will be blocked.")
+    if not settings.WHATSAPP_APP_SECRET and settings.WHATSAPP_ENABLED:
+        print("[WARN] WHATSAPP_APP_SECRET is not set - incoming webhooks are NOT signature-verified.")
+
+    print(f"{settings.APP_NAME} v2 is starting...")
+    print(f"   CORS allow-list: {settings.cors_origins_list}")
     yield
     print("👋 Shutting down...")
 
@@ -94,16 +116,23 @@ app = FastAPI(
 )
 
 # ─── CORS ─────────────────────────────────────────────
+# Explicit allow-list from CORS_ORIGINS, plus an optional regex for preview
+# deploys. allow_credentials is False because auth travels in the
+# Authorization header, not cookies — and "*" + credentials is rejected by
+# browsers anyway.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=settings.cors_origins_list,
+    allow_origin_regex=settings.CORS_ORIGIN_REGEX or None,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 # ─── RATE LIMITING ────────────────────────────────────
+# Without the exception handler, a tripped limit surfaces as a 500 instead of a 429.
 app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 
 # ─── STATIC FILES (uploaded images) ──────────────────

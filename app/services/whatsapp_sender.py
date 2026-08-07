@@ -66,7 +66,8 @@ def send_template(to: str, template_name: str, params: list[str]) -> dict | None
         "type": "template",
         "template": {
             "name": template_name,
-            "language": {"code": "en"},
+            # Must match the language the template was approved under.
+            "language": {"code": settings.WHATSAPP_TEMPLATE_LANG},
             "components": components,
         },
     })
