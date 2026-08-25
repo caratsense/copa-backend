@@ -29,6 +29,12 @@ class Settings(BaseSettings):
     UPLOAD_DIR: str = "/code/uploads"
     MAX_UPLOAD_MB: int = 10
 
+    # Bakery pickup point — the origin stamped on a delivery when it starts.
+    # Defaults to the Lucknow store coordinates the tracking UI already centres
+    # on; override per-deployment rather than editing code.
+    BAKERY_LAT: float = 26.8467
+    BAKERY_LNG: float = 80.9462
+
     # AI
     AI_PROVIDER: str = "stub"  # "stub" | "openai" | "custom"
 

@@ -13,13 +13,16 @@ from typing import Optional
 from app.db import get_db
 from app.models.user import User
 from app.models.order import Order, OrderStatus
-from app.core.auth import get_current_user, require_admin, require_role
+from app.core.auth import can_observe_delivery, get_current_user, require_admin, require_role
 from app.models.user import UserRole
+from app.schemas import FleetSnapshot
 from app.services.delivery_tracking import (
     start_delivery_tracking,
     get_rider_location,
     stop_delivery_tracking,
+    redis_available,
 )
+from app.services.fleet_tracking import build_snapshot
 
 router = APIRouter(prefix="/delivery", tags=["Delivery Tracking"])
 
@@ -43,9 +46,36 @@ class LocationResponse(BaseModel):
     pickup_lng: Optional[float] = None
     eta_minutes: Optional[float] = None
     status: str = "unknown"
+    # Age of the fix, so a caller can tell "live" from "last seen 4 minutes ago"
+    # without having to parse and compare timestamps itself.
+    seconds_since_update: Optional[float] = None
 
 
 # ─── ROUTES ───────────────────────────────────────────
+# NOTE: /admin/active is declared before the /{order_id}/... routes on purpose.
+# FastAPI matches in declaration order, and "admin" would otherwise be captured
+# by the int path parameter and rejected as a 422.
+
+@router.get("/admin/active", response_model=FleetSnapshot)
+def admin_active_deliveries(
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Initial state for the admin live-delivery view: every delivery currently in
+    a rider's hands, plus the rider roster.
+
+    Active orders come from PostgreSQL, live positions from a single pipelined
+    Redis read. Pair this with `WS /ws/delivery/admin` for updates — do not poll
+    it on a timer.
+
+    Redis being down degrades this rather than failing it: the orders still
+    list, `live_tracking_available` reports false, and no delivery is given a
+    fabricated position.
+    """
+    snapshot = build_snapshot(db)
+    return FleetSnapshot(**snapshot, live_tracking_available=redis_available())
+
 
 @router.post("/{order_id}/start-tracking", response_model=dict)
 def start_tracking(
@@ -98,15 +128,18 @@ def get_location(
 ):
     """
     Get current rider location for an order.
-    Customers can only check their own orders.
-    Works as a REST alternative to the WebSocket.
+
+    REST alternative to the WebSocket, answering to the same authorisation
+    rule: the customer who placed the order, the rider carrying it, or an admin.
     """
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    # Customers can only track their own orders
-    if user.role == UserRole.CUSTOMER and order.user_id != user.id:
+    # This used to reject only mismatched *customers*, so any baker and any
+    # rider could read any order's live position and the customer's drop-off
+    # coordinates just by walking the order id.
+    if not can_observe_delivery(user, order):
         raise HTTPException(status_code=403, detail="You can only track your own orders")
 
     location = get_rider_location(order_id)

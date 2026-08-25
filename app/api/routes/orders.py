@@ -135,9 +135,9 @@ def rider_delivered(order_id: int, user: User = Depends(require_role(UserRole.RI
     if order.status != OrderStatus.OUT_FOR_DELIVERY:
         raise HTTPException(status_code=400, detail=f"Must be OUT_FOR_DELIVERY. Current: {order.status.value}")
 
-    from app.services.delivery_tracking import stop_delivery_tracking
-    stop_delivery_tracking(order_id)
-
+    # Tracking teardown is part of the DELIVERED transition itself now, so every
+    # path that delivers an order (rider app, admin status update, WhatsApp)
+    # cleans up. Calling it here as well would just duplicate the work.
     return update_order_status(db, order_id, StatusUpdate(status="DELIVERED"))
 
 

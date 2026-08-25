@@ -165,9 +165,38 @@ def admin_assign_rider(
         rider = db.query(User).filter(User.id == data.staff_id, User.role == UserRole.RIDER, User.is_active == True).first()
         if not rider:
             raise HTTPException(status_code=400, detail="Rider not found or inactive")
+        previous_rider_id = order.assigned_rider_id
         order.assigned_rider_id = rider.id
         db.commit()
         db.refresh(order)
+
+        # Reassigning a delivery that is already on the road: repoint the live
+        # tracking state so the fleet view stops crediting the previous rider's
+        # position to this order.
+        if previous_rider_id != rider.id:
+            from app.core.broadcast import fleet_broadcast_sync
+
+            if order.status == OrderStatus.OUT_FOR_DELIVERY:
+                from app.core.broadcast import rider_reassigned_sync
+                from app.services.delivery_tracking import set_tracking_rider
+
+                set_tracking_rider(order.id, rider.id)
+                # Also disconnects the previous rider's GPS socket, so their
+                # next ping cannot rewrite the position just cleared.
+                rider_reassigned_sync(order.id, {
+                    "order_id": order.id,
+                    "rider_id": rider.id,
+                    "rider_name": rider.name,
+                    "previous_rider_id": previous_rider_id,
+                    # The new rider has not sent a fix yet — the old rider's last
+                    # position is not theirs to inherit.
+                    "tracking_state": "awaiting_gps",
+                })
+            elif order.status == OrderStatus.PACKAGED:
+                # Not on the road yet, so there is no tracking state to move —
+                # the fleet list just needs to re-read who is carrying it.
+                fleet_broadcast_sync({"type": "fleet_changed", "order_id": order.id})
+
         return {"message": f"Rider {rider.name} assigned to order #{order.id}", "order_id": order.id, "rider_id": rider.id}
     else:
         result = auto_assign_rider(db, order_id, force=True)

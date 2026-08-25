@@ -85,6 +85,12 @@ def get_current_user(
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
+    # Deactivation must take effect immediately, not whenever the token happens
+    # to expire — otherwise an offboarded staff member keeps full API access
+    # (including the admin delivery feed's customer names, phones and
+    # addresses) for the rest of the 24h token lifetime.
+    if not user.is_active:
+        raise HTTPException(status_code=401, detail="Account is deactivated")
     return user
 
 
@@ -99,6 +105,29 @@ def get_optional_user(
         return get_current_user(credentials, db)
     except HTTPException:
         return None
+
+
+def can_observe_delivery(user: User, order) -> bool:
+    """
+    May this user see where an order's rider physically is?
+
+    - admin    → any order
+    - customer → only orders they placed
+    - rider    → only orders assigned to them
+    - baker    → no; a baker has no reason to see a customer's live position
+                 or their home coordinates
+
+    Shared by the REST location endpoint and the tracking WebSocket so the two
+    cannot drift apart — they expose the same data and must answer this the
+    same way.
+    """
+    if user.role == UserRole.ADMIN:
+        return True
+    if user.role == UserRole.CUSTOMER:
+        return order.user_id == user.id
+    if user.role == UserRole.RIDER:
+        return order.assigned_rider_id == user.id
+    return False
 
 
 def require_admin(user: User = Depends(get_current_user)) -> User:

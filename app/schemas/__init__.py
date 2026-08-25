@@ -398,6 +398,65 @@ class EventRead(BaseModel):
         from_attributes = True
 
 
+# ─── LIVE DELIVERIES (ADMIN FLEET VIEW) ──────────────
+
+class ActiveDeliveryRead(BaseModel):
+    """
+    One in-flight delivery as the admin dashboard sees it: the order/rider facts
+    from PostgreSQL plus the rider's live position from Redis when there is one.
+
+    Every position field is optional on purpose — a rider who is assigned but has
+    not started transmitting has no coordinates, and `tracking_state` says so
+    rather than the row carrying a placeholder point.
+    """
+    order_id: int
+    order_status: str
+    # "live" | "stale" | "awaiting_gps" | "assigned" | "unassigned"
+    tracking_state: str
+
+    rider_id: Optional[int] = None
+    rider_name: Optional[str] = None
+    rider_phone: Optional[str] = None
+    rider_on_duty: Optional[bool] = None
+
+    customer_name: Optional[str] = None
+    customer_phone: Optional[str] = None
+    delivery_address: Optional[str] = None
+    delivery_time: Optional[datetime] = None
+    total_price: float = 0.0
+    payment_method: Optional[str] = None
+    payment_status: Optional[str] = None
+
+    rider_lat: Optional[float] = None
+    rider_lng: Optional[float] = None
+    dropoff_lat: Optional[float] = None
+    dropoff_lng: Optional[float] = None
+    eta_minutes: Optional[float] = None
+    updated_at: Optional[str] = None
+    seconds_since_update: Optional[float] = None
+    is_stale: Optional[bool] = None
+
+
+class FleetRiderRead(BaseModel):
+    """A rider and their current load — including riders carrying nothing."""
+    rider_id: int
+    rider_name: str
+    phone: Optional[str] = None
+    is_active: bool
+    on_duty: bool
+    active_delivery_count: int = 0
+
+
+class FleetSnapshot(BaseModel):
+    """Initial state for the admin live-delivery view."""
+    deliveries: list[ActiveDeliveryRead] = Field(default_factory=list)
+    riders: list[FleetRiderRead] = Field(default_factory=list)
+    # Serialised so the UI's "live vs stale" cutoff always matches the server's.
+    stale_after_seconds: int
+    # False when Redis is unreachable: orders still list, positions cannot.
+    live_tracking_available: bool = True
+
+
 # ─── DASHBOARD ────────────────────────────────────────
 
 class DashboardStats(BaseModel):

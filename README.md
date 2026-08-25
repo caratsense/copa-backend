@@ -82,8 +82,75 @@ python -m app.workers.event_worker
 | `POST/GET/PATCH/DELETE` | `/admin/addons` | Manage addon rules |
 | `POST/GET/PATCH/DELETE` | `/admin/rush` | Manage rush rules |
 | `POST/GET/PATCH/DELETE` | `/admin/delivery-zones` | Manage delivery zones |
+| **Delivery Tracking** | | |
+| `GET` | `/delivery/admin/active` | Admin — every in-flight delivery + rider roster + live positions |
+| `GET` | `/delivery/{id}/location` | Current rider position + ETA for one order |
+| `POST` | `/delivery/{id}/start-tracking` | Manually (re)initialise tracking — normally automatic |
+| `POST` | `/delivery/{id}/stop-tracking` | Manually stop tracking — normally automatic |
 | **AI** | | |
 | `POST` | `/ai/parse-order` | Parse natural language (stub) |
+
+---
+
+## Delivery Tracking
+
+GPS never touches PostgreSQL. Positions live in Redis under `delivery:{order_id}`
+(current fix), `:history` (last 10 points, for speed/ETA) and `:meta`
+(rider, pickup/dropoff, status), all on a 24h TTL.
+
+```
+Rider phone ─GPS─► WS /ws/rider/{order_id} ─► Redis
+                                               ├─► WS /ws/track/{order_id}   (customer)
+                                               └─► WS /ws/delivery/admin     (admin fleet)
+```
+
+**Lifecycle is owned by the backend.** `PACKAGED → OUT_FOR_DELIVERY` starts
+tracking (stamping the bakery origin and, where the customer's saved address has
+coordinates, the destination that ETA is computed against).
+`OUT_FOR_DELIVERY → DELIVERED` stops it, clears the Redis keys, notifies
+watchers and closes the rider's GPS socket. No client call is required for
+either.
+
+### WebSockets
+
+| Endpoint | Who may connect | Purpose |
+|----------|-----------------|---------|
+| `/ws/orders` | admin, baker, rider | Order status broadcasts (unscoped — all orders) |
+| `/ws/rider/{order_id}` | the order's assigned rider, or an admin | Rider pushes `{"lat", "lng"}` |
+| `/ws/track/{order_id}` | the order's customer, its rider, or an admin | Live position + ETA for one order |
+| `/ws/delivery/admin` | admin only | One subscription for the whole fleet |
+
+Authorisation is checked against the database on connect, not against the
+token's claims — a demoted or deactivated user is refused immediately rather
+than when their JWT expires. `/ws/track/{order_id}` and
+`GET /delivery/{order_id}/location` share one rule
+(`app.core.auth.can_observe_delivery`), so they cannot drift apart.
+
+Rejections close with `4001` (unauthenticated) or `4003` (forbidden). **Browsers
+do not see those codes**: uvicorn turns a close-before-accept into an HTTP 403
+handshake failure, so `CloseEvent.code` is `1006` and a rejection is
+indistinguishable from a network drop. Clients must not rely on the close code
+to detect an authorisation failure — check the REST endpoint's status instead,
+which is what the admin dashboard does before giving up on reconnecting.
+
+`/ws/delivery/admin` sends `{"type": "snapshot", …}` on connect and then
+`location_update`, `delivery_started`, `delivery_completed` and
+`rider_reassigned` events. Send `"resync"` to request a fresh snapshot (used on
+reconnect and tab refocus); send `"ping"` for a `"pong"`.
+
+**Do not poll `/delivery/{id}/location` per order to build a fleet view.** Use
+`GET /delivery/admin/active` once for the initial state and the admin socket for
+updates.
+
+### Tests
+
+```bash
+pip install pytest fakeredis
+python -m pytest tests/ -q
+```
+
+The suite runs the real app against SQLite and an in-process fake Redis, so no
+Postgres or Redis server is needed.
 
 ---
 

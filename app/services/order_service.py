@@ -260,6 +260,22 @@ def update_order_status(db: Session, order_id: int, data: StatusUpdate) -> Order
 
     _try_broadcast(order.id, "STATUS_CHANGED", {"from": old_status, "to": new_status.value})
 
+    # ── Delivery tracking lifecycle ──
+    # Owned by the backend rather than by whichever client happened to change the
+    # status. It previously depended on a `POST /delivery/{id}/start-tracking`
+    # call that nothing ever made, which is why ETA was always null: the metadata
+    # holding the destination was never written.
+    if new_status == OrderStatus.OUT_FOR_DELIVERY:
+        _begin_delivery_tracking(db, order)
+    elif new_status == OrderStatus.DELIVERED:
+        _end_delivery_tracking(order)
+    elif new_status == OrderStatus.PACKAGED:
+        # The order joins the fleet view as "assigned, not collected". It has no
+        # position by definition, so there is nothing to stream — the dashboard
+        # just needs to know its list is out of date.
+        from app.core.broadcast import fleet_broadcast_sync
+        fleet_broadcast_sync({"type": "fleet_changed", "order_id": order.id})
+
     # ── WhatsApp notifications ──
     try:
         from app.services.wa_notifications import dispatch_notifications
@@ -322,6 +338,66 @@ def get_user_orders(db: Session, user_id: int, skip: int = 0, limit: int = 20) -
     for o in orders:
         _enrich_order(o)
     return orders
+
+
+def _begin_delivery_tracking(db: Session, order: Order):
+    """
+    Stamp the delivery's origin/destination in Redis and put it on the admin
+    fleet stream. Best effort — the status change is already committed, and a
+    Redis outage must not roll it back or 500 the caller.
+    """
+    from app.core.broadcast import delivery_started_sync
+    from app.services.delivery_tracking import start_delivery_tracking
+    from app.services.fleet_tracking import resolve_order_coordinates
+
+    try:
+        pickup_lat, pickup_lng, dropoff_lat, dropoff_lng = resolve_order_coordinates(db, order)
+        start_delivery_tracking(
+            order_id=order.id,
+            rider_id=order.assigned_rider_id or 0,
+            pickup_lat=pickup_lat,
+            pickup_lng=pickup_lng,
+            dropoff_lat=dropoff_lat,
+            dropoff_lng=dropoff_lng,
+        )
+        delivery_started_sync(order.id, {
+            "order_id": order.id,
+            "rider_id": order.assigned_rider_id,
+            "rider_name": order.rider.name if order.rider else None,
+            "customer_name": order.user.name if order.user else None,
+            "delivery_address": order.delivery_address,
+            "order_status": order.status.value,
+            # No GPS has arrived yet — the dashboard shows the delivery without
+            # a map position rather than inventing one.
+            "tracking_state": "awaiting_gps",
+            "dropoff_lat": dropoff_lat,
+            "dropoff_lng": dropoff_lng,
+        })
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"[Tracking] start failed for order {order.id}: {e}")
+
+
+def _end_delivery_tracking(order: Order):
+    """
+    Clean up Redis and wind down every socket for a completed delivery.
+
+    Lives here rather than in the rider route so the admin's
+    `PATCH /orders/{id}/status` path cleans up too — it previously did not, and
+    left tracking keys alive for the full 24h TTL.
+    """
+    from app.core.broadcast import delivery_completed_sync
+    from app.services.delivery_tracking import stop_delivery_tracking
+
+    try:
+        stop_delivery_tracking(order.id)
+        delivery_completed_sync(order.id, {
+            "order_id": order.id,
+            "rider_id": order.assigned_rider_id,
+        })
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"[Tracking] stop failed for order {order.id}: {e}")
 
 
 def _enrich_order(order: Order):
