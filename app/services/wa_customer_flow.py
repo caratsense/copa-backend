@@ -6,12 +6,11 @@ import json
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
-from sqlalchemy.orm import Session
 
 from app.db import SessionLocal
 from app.models.product import Product
 from app.models.pricing import SizeRule, FlavorRule
-from app.models.user import User, UserRole
+from app.models.user import User
 from app.models.order import Order
 from app.services.gemini_parser import parse_message
 from app.config import get_settings
@@ -97,7 +96,15 @@ def handle_customer_message(phone: str, message: str, user: Optional[User]) -> s
             oid = action.get("order_id")
             _set_state(phone, {"step": "IDLE"})
             if oid:
-                order = db.query(Order).filter(Order.id == oid).first()
+                # Scoped to the sender. This used to look up by id alone, so any
+                # WhatsApp number could read any customer's items, amount and
+                # status just by guessing an order number.
+                order = (
+                    db.query(Order)
+                    .filter(Order.id == oid, Order.user_id == user.id)
+                    .first()
+                    if user else None
+                )
                 if order:
                     from app.services.order_service import _enrich_order
                     _enrich_order(order)
@@ -112,7 +119,10 @@ def handle_customer_message(phone: str, message: str, user: Optional[User]) -> s
                         f"Status: {status_map.get(order.status.value, order.status.value)}\n\n"
                         f"Track online: {SITE}/track?id={order.id}"
                     )
-                return f"Order #{oid} not found. Please verify the order number."
+                # Deliberately identical whether the order is missing or
+                # simply someone else's — otherwise this confirms which order
+                # numbers exist.
+                return f"We couldn't find order #{oid} on your account. Please check the number."
             return "Please enter a valid order number."
 
         # ─── START ORDER ─────────────────────
@@ -258,9 +268,17 @@ def handle_customer_message(phone: str, message: str, user: Optional[User]) -> s
                 from app.services.order_service import create_order
                 order_data = OrderCreate(
                     user_id=user.id,
+                    # Without this the pricing engine sees no zone and charges
+                    # nothing for delivery, so every WhatsApp order shipped free.
+                    delivery_zone=state.get("delivery_zone"),
                     items=[OrderItemCreate(product_id=product.get("id", 1), quantity=1,
                         customization={"size": size.get("name", "1kg"), "flavor": flavor.get("name", "Classic"),
-                            "design": "Basic Cream Finish", "addons": [], "rush": "Standard (24hr+)"})],
+                            # The WhatsApp conversation never asks about design
+                            # or rush, so it must not assert values for them.
+                            # Both were hardcoded to zero-cost rule names, which
+                            # priced the same as "not selected" but broke
+                            # outright on any deployment missing those rules.
+                            "design": "", "addons": [], "rush": ""})],
                     delivery_address=addr if addr != "Self Pickup" else None,
                     delivery_time=f"{ddate}T{time_hours:02d}:00:00",
                     notes=cake_msg or None,
@@ -268,19 +286,25 @@ def handle_customer_message(phone: str, message: str, user: Optional[User]) -> s
                 order = create_order(db, order_data)
                 _clear_state(phone)
 
-                from app.services.whatsapp_sender import notify_admin_new_order
-                admins = db.query(User).filter(User.role == UserRole.ADMIN).all()
-                items_str = f"{size.get('name', '1kg')} {flavor.get('name', '')} {product.get('name', 'Cake')}"
-                delivery_str = f"{state.get('delivery_date_display', ddate)} {state.get('time_label', '')}"
-                for admin in admins:
-                    notify_admin_new_order(admin.phone, order.id, user.name, phone, items_str, total, delivery_str)
+                # Quote what the pricing engine actually charged, not the running
+                # total from the chat state. Those could differ — the state total
+                # never included delivery, so the customer was told one number and
+                # the order carried another.
+                amount = float(order.total_price or 0)
 
+                # The order is NOT paid. It used to say "Confirmed" with an
+                # amount and no payment step at all, which read as settled while
+                # nothing had been collected and no payment link existed. Hand
+                # off to the existing web checkout instead of pretending
+                # WhatsApp can take money.
                 return (
-                    f"*Order #{order.id} — Confirmed*\n\n"
-                    f"Amount: ₹{total:,.0f}\n"
-                    f"You will receive updates on this number.\n\n"
-                    f"Track your order: {SITE}/track?id={order.id}\n\n"
-                    f"Thank you for choosing Cake O' Clock."
+                    f"*Order #{order.id} created*\n\n"
+                    f"Amount: Rs {amount:,.2f}\n"
+                    f"Payment: pending\n\n"
+                    f"Complete your payment to confirm the order:\n"
+                    f"{SITE}/orders?order_id={order.id}\n\n"
+                    f"We'll start baking once payment is received. "
+                    f"You'll get updates on this number."
                 )
             except Exception as e:
                 logger.error(f"[WA ORDER] Failed: {e}")

@@ -256,15 +256,20 @@ class CouponApplyResponse(BaseModel):
 # ─── PRICING CALCULATOR ──────────────────────────────
 
 class ItemCustomization(BaseModel):
-    size: str = "1kg"
-    flavor: str = "vanilla"
-    design: str = "basic"
+    # Defaults are blank, meaning "not selected", which the pricing engine
+    # charges nothing for. They used to read "vanilla"/"basic"/"standard" —
+    # names matching no seeded rule, so they already priced at zero while
+    # looking like real selections. Blank is the honest spelling of that, and it
+    # lets the engine reject genuinely unknown names without rejecting defaults.
+    size: str = ""
+    flavor: str = ""
+    design: str = ""
     addons: list[str] = Field(default_factory=list)
-    rush: str = "standard"
+    rush: str = ""
 
 class PricingRequest(BaseModel):
     product_id: int
-    quantity: int = 1
+    quantity: int = Field(default=1, ge=1, le=100)
     customization: ItemCustomization = Field(default_factory=ItemCustomization)
     delivery_zone: Optional[str] = None
 
@@ -291,12 +296,16 @@ class PricingResponse(BaseModel):
 
 class OrderItemCreate(BaseModel):
     product_id: int
-    quantity: int = 1
+    # Zero produced a free line; negative produced a negative total and pushed
+    # addon stock back up.
+    quantity: int = Field(default=1, ge=1, le=100)
     customization: ItemCustomization = Field(default_factory=ItemCustomization)
 
 class OrderCreate(BaseModel):
     user_id: Optional[int] = None
-    items: list[OrderItemCreate]
+    # An order with no lines was accepted, auto-assigned to a baker and burned
+    # a coupon redemption for nothing.
+    items: list[OrderItemCreate] = Field(min_length=1)
     delivery_address: Optional[str] = None
     delivery_time: Optional[datetime] = None
     delivery_zone: Optional[str] = None
@@ -308,6 +317,12 @@ class OrderCreate(BaseModel):
 class OrderItemRead(BaseModel):
     id: int
     product_id: int
+    # What the cake actually is. The product-detail page used to smuggle this
+    # into customization.flavor, which made every staff screen depend on a value
+    # the pricing engine reads as a flavour rule. Exposed properly here instead,
+    # so the flavour field can mean only "a FlavorRule the customer chose".
+    # Populated from OrderItem.product_name (see app/models/order_item.py).
+    product_name: Optional[str] = None
     quantity: int
     customization: dict
     price: float

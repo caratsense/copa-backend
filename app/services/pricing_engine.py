@@ -1,6 +1,21 @@
 """
 Pricing Engine — calculates the full price breakdown for any item + customization.
 
+This module is the single authority on what an order costs. The checkout
+preview, order creation and the WhatsApp flow all price through here, so a
+quote and a charge cannot disagree.
+
+Lookups are STRICT. A name that does not match an active rule is rejected
+rather than silently priced at zero: `_lookup_or_zero` used to return 0.0 for
+anything it could not find, so a client could drop a premium simply by
+mis-typing it —
+
+    exact:      size "5kg" + flavor "Belgian Chocolate"   -> Rs 7000
+    mangled:    size "5kg " + flavor "belgian chocolate"  -> Rs 1000
+
+Matching is case- and whitespace-insensitive so honest clients are unaffected;
+an empty string still means "not selected" and legitimately costs nothing.
+
 To add a new pricing dimension:
 1. Create a new rule model in app/models/pricing.py
 2. Add a lookup step in calculate_item_price() below
@@ -8,6 +23,7 @@ To add a new pricing dimension:
 4. Register the admin CRUD route in app/api/routes/admin.py
 """
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
 
@@ -17,26 +33,66 @@ from app.models.delivery import DeliveryZone
 from app.schemas import ItemCustomization, PriceBreakdown, PricingRequest, PricingResponse
 
 
-def _lookup_or_zero(db: Session, model, name_field: str, name: str, cost_field: str):
-    """Generic helper: look up a rule by name and return its cost, or 0 if not found."""
-    row = db.query(model).filter(
-        getattr(model, name_field) == name,
-        model.is_active == True,
-    ).first()
+def _normalise(name: str | None) -> str:
+    """Collapse whitespace and case so 'belgian  chocolate ' matches its rule."""
+    return " ".join((name or "").split()).strip().lower()
+
+
+def _find_rule(db: Session, model, name: str, label: str):
+    """
+    Look up an active rule by name, tolerating case and spacing.
+
+    Returns None when `name` is blank (the option was not chosen). Raises 400
+    when a non-blank name matches nothing — pricing must never quietly discount.
+    """
+    wanted = _normalise(name)
+    if not wanted:
+        return None
+
+    row = (
+        db.query(model)
+        .filter(
+            func.lower(func.trim(model.name)) == wanted,
+            model.is_active == True,
+        )
+        .first()
+    )
     if row is None:
-        return 0.0
-    return getattr(row, cost_field)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown {label}: '{name}'. Choose one of the available options.",
+        )
+    return row
+
+
+def _cost_of(db: Session, model, name: str, cost_field: str, label: str) -> float:
+    row = _find_rule(db, model, name, label)
+    return float(getattr(row, cost_field)) if row else 0.0
 
 
 def lookup_delivery_charge(db: Session, delivery_zone_name: str | None) -> float:
-    """Charge for a delivery zone, or 0 for pickup / unknown zones."""
-    if not delivery_zone_name:
+    """
+    Charge for a delivery zone. Blank means pickup (free); an unrecognised zone
+    is rejected rather than treated as free delivery.
+    """
+    wanted = _normalise(delivery_zone_name)
+    if not wanted:
         return 0.0
-    zone = db.query(DeliveryZone).filter(
-        DeliveryZone.area_name == delivery_zone_name,
-        DeliveryZone.is_active == True,
-    ).first()
-    return float(zone.charge) if zone else 0.0
+
+    zone = (
+        db.query(DeliveryZone)
+        .filter(
+            func.lower(func.trim(DeliveryZone.area_name)) == wanted,
+            DeliveryZone.is_active == True,
+        )
+        .first()
+    )
+    if zone is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"We don't deliver to '{delivery_zone_name}'. Please choose a listed delivery area.",
+        )
+    return float(zone.charge)
 
 
 def calculate_item_price(
@@ -48,31 +104,34 @@ def calculate_item_price(
 ) -> PriceBreakdown:
     """Calculate the full price breakdown for a single order line."""
 
+    if quantity < 1:
+        # Defence in depth; the schema also constrains this. A zero or negative
+        # quantity produced a free or negative line total.
+        raise HTTPException(status_code=400, detail="Quantity must be at least 1")
+
     base_price = product.base_price
 
     # ── Size ──
-    size_row = db.query(SizeRule).filter(
-        SizeRule.name == customization.size, SizeRule.is_active == True
-    ).first()
-    size_multiplier = size_row.multiplier if size_row else 1.0
+    size_row = _find_rule(db, SizeRule, customization.size, "size")
+    size_multiplier = float(size_row.multiplier) if size_row else 1.0
     size_adjusted = round(base_price * size_multiplier, 2)
 
     # ── Flavor ──
-    flavor_cost = _lookup_or_zero(db, FlavorRule, "name", customization.flavor, "extra_cost")
+    flavor_cost = _cost_of(db, FlavorRule, customization.flavor, "extra_cost", "flavour")
 
     # ── Design ──
-    design_cost = _lookup_or_zero(db, DesignRule, "name", customization.design, "cost")
+    design_cost = _cost_of(db, DesignRule, customization.design, "cost", "design")
 
     # ── Addons (multiple) ──
     addon_details: dict[str, float] = {}
     addon_total = 0.0
     for addon_name in customization.addons:
-        cost = _lookup_or_zero(db, AddonRule, "name", addon_name, "cost")
+        cost = _cost_of(db, AddonRule, addon_name, "cost", "addon")
         addon_details[addon_name] = cost
         addon_total += cost
 
     # ── Rush ──
-    rush_cost = _lookup_or_zero(db, RushRule, "name", customization.rush, "cost")
+    rush_cost = _cost_of(db, RushRule, customization.rush, "cost", "rush option")
 
     # ── Delivery ──
     # Reported here for display only. Delivery is charged ONCE per order (see

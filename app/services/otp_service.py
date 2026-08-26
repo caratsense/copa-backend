@@ -14,8 +14,17 @@ SETUP:
    # optional, only if you created a custom AUTOGEN template:
    TWOFACTOR_TEMPLATE=YourTemplateName
 
-In dev/test mode (SMS_ENABLED=false), OTP is generated locally, logged to
-the console, stored in Redis, and "000000" is always accepted.
+A locally-generated OTP (logged to the console, stored in Redis) and the fixed
+DEV_TEST_OTP are available ONLY when the deployment explicitly opts in:
+
+    ENVIRONMENT=development        # any non-production value
+    DEV_ALLOW_TEST_OTP=true
+
+Missing SMS credentials do NOT enable them. That used to be the rule, and it
+meant every deploy without a 2factor key accepted "000000" for every account —
+which, together with the passwordless /auth/login-otp endpoint, made a phone
+number sufficient to obtain an admin session. When SMS is unavailable and the
+deployment has not opted in, sending fails and login fails with it.
 """
 
 import random
@@ -55,7 +64,18 @@ def _normalize_phone(phone: str) -> str:
 
 
 def _enabled() -> bool:
+    """True when a real SMS provider is configured."""
     return bool(settings.SMS_ENABLED and settings.TWOFACTOR_API_KEY)
+
+
+def _test_mode() -> bool:
+    """
+    True only when this deployment deliberately allows a stand-in OTP.
+
+    Both switches are required (see Settings.test_otp_allowed). Never inferred
+    from an absent SMS provider.
+    """
+    return settings.test_otp_allowed
 
 
 def send_otp(phone: str, purpose: str = "login") -> dict:
@@ -88,20 +108,34 @@ def send_otp(phone: str, purpose: str = "login") -> dict:
         except Exception as e:
             logger.error(f"[OTP] 2factor error: {e}")
             return {"sent": False, "message": "SMS service error. Please try again."}
-    else:
-        # Dev mode — generate OTP locally, store in Redis
-        otp = generate_otp()
-        r = _get_redis()
-        if r:
-            r.setex(f"{OTP_PREFIX}{phone}:{purpose}", OTP_EXPIRY, otp)
-        logger.info(f"[OTP] DEV MODE — OTP for {phone}: {otp}")
-        return {"sent": True, "message": "OTP sent (dev mode)", "otp": otp}
+    if not _test_mode():
+        # No SMS provider and no explicit opt-in. Report the outage instead of
+        # pretending an OTP was delivered; the caller turns this into a 503 so
+        # login fails closed rather than waiting for a code that never arrives.
+        logger.error(
+            "[OTP] Cannot send: SMS_ENABLED=%s, TWOFACTOR_API_KEY %s, "
+            "ENVIRONMENT=%s, DEV_ALLOW_TEST_OTP=%s",
+            settings.SMS_ENABLED,
+            "set" if settings.TWOFACTOR_API_KEY else "MISSING",
+            settings.ENVIRONMENT, settings.DEV_ALLOW_TEST_OTP,
+        )
+        return {"sent": False, "message": "OTP service is unavailable. Please try again later."}
+
+    # Explicit development/test mode — generate locally, store in Redis, log it.
+    otp = generate_otp()
+    r = _get_redis()
+    if r:
+        r.setex(f"{OTP_PREFIX}{phone}:{purpose}", OTP_EXPIRY, otp)
+    logger.info(f"[OTP] TEST MODE — OTP for {phone}: {otp}")
+    return {"sent": True, "message": "OTP sent (test mode)", "otp": otp}
 
 
 def verify_otp(phone: str, otp: str, purpose: str = "login") -> bool:
-    """Verify an OTP against 2factor (prod) or Redis/"000000" (dev)."""
-    # Dev bypass
-    if not _enabled() and otp == "000000":
+    """Verify an OTP against 2factor, or against the test store when opted in."""
+    # The fixed test OTP. Gated on the deployment opting in — NOT on whether an
+    # SMS provider happens to be configured.
+    if _test_mode() and otp == settings.DEV_TEST_OTP:
+        logger.warning("[OTP] Accepted DEV_TEST_OTP for %s — test mode is enabled", phone)
         return True
 
     if _enabled():
@@ -124,17 +158,21 @@ def verify_otp(phone: str, otp: str, purpose: str = "login") -> bool:
         except Exception as e:
             logger.error(f"[OTP] 2factor verify error: {e}")
             return False
-    else:
-        # Dev mode — check Redis
-        r = _get_redis()
-        if not r:
-            return False
-        key = f"{OTP_PREFIX}{phone}:{purpose}"
-        stored_otp = r.get(key)
-        if stored_otp and stored_otp == otp:
-            r.delete(key)
-            return True
+    if not _test_mode():
+        # No provider, no opt-in: nothing can legitimately verify here.
+        logger.error("[OTP] Verification attempted with no SMS provider and test mode off")
         return False
+
+    # Explicit test mode — check the locally-generated code.
+    r = _get_redis()
+    if not r:
+        return False
+    key = f"{OTP_PREFIX}{phone}:{purpose}"
+    stored_otp = r.get(key)
+    if stored_otp and stored_otp == otp:
+        r.delete(key)
+        return True
+    return False
 
 
 def resend_otp(phone: str, retry_type: str = "text") -> dict:

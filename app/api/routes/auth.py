@@ -15,9 +15,11 @@ LOGIN FLOW:
     → Verifies OTP → returns real access_token
     → Saves device as trusted (for customers)
 
-DEV MODE:
-  When SMS_ENABLED=false, OTP is logged to console.
-  Use "000000" as OTP to bypass in dev mode.
+DEVELOPMENT/TEST MODE:
+  A fixed OTP (DEV_TEST_OTP, default "000000") is accepted only when the
+  deployment opts in explicitly — ENVIRONMENT is non-production AND
+  DEV_ALLOW_TEST_OTP=true. It is NOT enabled by an absent SMS provider.
+  When no OTP can be sent, these endpoints return 503 and login fails.
 
 RATE LIMITS:
   /auth/login       → 5 per minute (prevent brute force)
@@ -86,6 +88,23 @@ def register(request: Request, data: RegisterRequest, db: Session = Depends(get_
 
 # ─── LOGIN (STEP 1) ──────────────────────────────────
 
+def _require_otp_sent(result: dict) -> dict:
+    """
+    Turn a failed OTP send into a hard failure.
+
+    Handing back a temp_token when nothing was delivered leaves the caller
+    waiting for a code that will never arrive; worse, it used to be paired with
+    a static OTP that was accepted anyway. Failing closed here is the whole
+    point: no OTP, no login.
+    """
+    if not result.get("sent"):
+        raise HTTPException(
+            status_code=503,
+            detail=result.get("message", "OTP service is unavailable. Please try again later."),
+        )
+    return result
+
+
 @router.post("/login", response_model=LoginResponse)
 @limiter.limit("5/minute")
 def login(request: Request, data: LoginRequest, db: Session = Depends(get_db)):
@@ -130,8 +149,8 @@ def login(request: Request, data: LoginRequest, db: Session = Depends(get_db)):
                 message="Welcome back! Logged in from trusted device.",
             )
 
-    # OTP required — send it
-    otp_result = send_otp(user.phone)
+    # OTP required — send it. A failed send is a 503, not a temp_token.
+    otp_result = _require_otp_sent(send_otp(user.phone))
 
     # Create a short-lived temp token (10 min) for OTP verification only
     temp_token = create_access_token(user.id, "otp_pending", expires_minutes=10)
@@ -167,7 +186,7 @@ def login_otp(request: Request, data: OTPLoginRequest, db: Session = Depends(get
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account is deactivated")
 
-    otp_result = send_otp(user.phone)
+    otp_result = _require_otp_sent(send_otp(user.phone))
     temp_token = create_access_token(user.id, "otp_pending", expires_minutes=10)
     return LoginResponse(
         requires_otp=True,
@@ -236,7 +255,7 @@ def resend_otp_endpoint(request: Request, data: OTPVerifyRequest, db: Session = 
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
 
-    result = send_otp(user.phone)
+    result = _require_otp_sent(send_otp(user.phone))
     return {"message": result.get("message", "OTP resent")}
 
 
@@ -308,8 +327,8 @@ def forgot_password(request: Request, data: ForgotPasswordRequest, db: Session =
     if not user:
         raise HTTPException(status_code=404, detail="No account found with this phone number")
 
-    result = send_otp(phone, purpose="reset")
-    return {"message": "OTP sent to your phone", "sent": result.get("sent", False)}
+    result = _require_otp_sent(send_otp(phone, purpose="reset"))
+    return {"message": "OTP sent to your phone", "sent": True}
 
 
 @router.post("/reset-password")

@@ -58,6 +58,30 @@ def _try_broadcast(order_id: int, event_type: str, data: dict):
     })
 
 
+def _lock_order(db: Session, order_id: int) -> Order | None:
+    """SELECT ... FOR UPDATE where the database supports it."""
+    q = db.query(Order).filter(Order.id == order_id)
+    try:
+        return q.with_for_update().first()
+    except Exception:
+        return q.first()
+
+
+def is_payable(order: Order) -> bool:
+    """
+    Whether this order may consume ingredients and a baker's time.
+
+    COD is payable on delivery, so a COD order is allowed into production
+    unpaid. An ONLINE order is not: it used to be auto-assigned the moment it
+    was created, before the customer had even reached PayU, so an abandoned
+    checkout still got baked.
+    """
+    method = (order.payment_method or "ONLINE").upper()
+    if method == "COD":
+        return True
+    return order.payment_status == PaymentStatus.PAID
+
+
 def create_order(db: Session, data: OrderCreate) -> Order:
     """Full order creation with pricing, coupons, store hours scheduling, and events."""
 
@@ -192,9 +216,27 @@ def create_order(db: Session, data: OrderCreate) -> Order:
     db.commit()
     db.refresh(order)
 
-    # ── Auto-assign baker if store is currently open ──
-    # Off-hours orders stay in CONFIRMED queue — the scheduler assigns them at opening
-    if not schedule.get("is_off_hours", False):
+    # create_order writes CONFIRMED directly rather than transitioning into it,
+    # so dispatch_notifications never ran for a new order: no customer
+    # confirmation and no admin new-order alert for anything placed on the web.
+    #
+    # Sent BEFORE auto-assignment on purpose. Assignment now transitions the
+    # order to ASSIGNED through the service, which fires its own notification;
+    # dispatching afterwards would read the new status and send the baker a
+    # second copy.
+    try:
+        from app.services.wa_notifications import dispatch_notifications
+        dispatch_notifications(db, order, OrderStatus.CONFIRMED.value)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"[WA] Confirmation dispatch failed for order {order.id}: {e}")
+
+    # ── Auto-assign baker if store is open AND the order is payable ──
+    # Off-hours orders stay in CONFIRMED queue — the scheduler assigns them at
+    # opening. Unpaid ONLINE orders also stay put: assignment happens when the
+    # payment settles (see payments._release_for_production), so an abandoned
+    # checkout is never baked.
+    if not schedule.get("is_off_hours", False) and is_payable(order):
         try:
             from app.services.assignment_engine import auto_assign_baker
             order = auto_assign_baker(db, order.id)
@@ -210,9 +252,20 @@ def create_order(db: Session, data: OrderCreate) -> Order:
     return order
 
 
-def update_order_status(db: Session, order_id: int, data: StatusUpdate) -> Order:
-    """Update order status with lifecycle validation + auto-assignment + WebSocket broadcast."""
-    order = db.query(Order).filter(Order.id == order_id).first()
+def update_order_status(db: Session, order_id: int, data: StatusUpdate, rework: bool = False) -> Order:
+    """
+    Update order status with lifecycle validation + auto-assignment + WebSocket broadcast.
+
+    `rework=True` marks an IN_PRODUCTION transition as a quality-check
+    rejection rather than a baker starting work. Both reach the same status,
+    but only one of them should tell the baker to redo the cake.
+    """
+    # Lock the row for the duration of the transition. Without this two admins
+    # (or a dashboard click racing a WhatsApp reply) both read the same current
+    # status, both pass the transition check, and both commit — advancing the
+    # order twice and sending duplicate notifications. Postgres honours this;
+    # SQLite ignores it harmlessly.
+    order = _lock_order(db, order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
@@ -223,6 +276,17 @@ def update_order_status(db: Session, order_id: int, data: StatusUpdate) -> Order
         raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {valid}")
 
     current = order.status
+    # An unpaid ONLINE order must not enter production by any route — admin
+    # button, WhatsApp command or auto-assignment.
+    if new_status in (OrderStatus.ASSIGNED, OrderStatus.IN_PRODUCTION) and not is_payable(order):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Order #{order.id} is not paid ({order.payment_status.value}). "
+                "It cannot enter production until payment is received or it is switched to COD."
+            ),
+        )
+
     allowed = VALID_TRANSITIONS.get(current, [])
     if new_status not in allowed:
         raise HTTPException(
@@ -279,7 +343,7 @@ def update_order_status(db: Session, order_id: int, data: StatusUpdate) -> Order
     # ── WhatsApp notifications ──
     try:
         from app.services.wa_notifications import dispatch_notifications
-        dispatch_notifications(db, order, new_status.value)
+        dispatch_notifications(db, order, new_status.value, rework=rework)
     except Exception as e:
         import logging
         logging.getLogger(__name__).error(f"[WA] Notification dispatch failed: {e}")

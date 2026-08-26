@@ -21,3 +21,16 @@ class OrderItem(Base):
     # Relationships
     order = relationship("Order", back_populates="items")
     product = relationship("Product", lazy="selectin")
+
+    @property
+    def product_name(self) -> str | None:
+        """
+        The cake's name, for staff and customer screens.
+
+        Read through the relationship rather than denormalised onto the row, so
+        a renamed product reads correctly everywhere. Returns None when the
+        relationship is not loaded (queries that use noload) instead of
+        triggering a lazy fetch the caller did not ask for.
+        """
+        product = self.__dict__.get("product")
+        return getattr(product, "name", None) if product is not None else None

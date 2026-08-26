@@ -21,12 +21,13 @@ from sqlalchemy.orm import Session
 
 from app.db import SessionLocal
 from app.models.user import User, UserRole
-from app.models.order import Order, OrderStatus
+from app.models.order import Order, OrderStatus, VALID_TRANSITIONS
 from app.schemas import StatusUpdate
 from app.services.order_service import update_order_status, _enrich_order
-from app.services.assignment_engine import auto_assign_baker, auto_assign_rider
+from app.services.assignment_engine import auto_assign_rider
 from app.services.whatsapp_sender import send_text
-from app.services.gemini_parser import parse_message, transcribe_voice, get_audio_url
+from app.services.gemini_parser import transcribe_voice, get_audio_url
+from app.services import wa_commands
 from app.services.wa_customer_flow import handle_customer_message
 from app.services.wa_consent import is_opt_out_request, record_opt_in, record_opt_out
 from app.config import get_settings
@@ -40,18 +41,37 @@ SITE = settings.WHATSAPP_TRACKING_BASE_URL.replace("/track", "") if settings.WHA
 @router.get("/whatsapp")
 async def verify_webhook(request: Request):
     params = request.query_params
-    if params.get("hub.mode") == "subscribe" and params.get("hub.verify_token") == settings.WHATSAPP_WEBHOOK_VERIFY_TOKEN:
+    token = params.get("hub.verify_token") or ""
+    expected = settings.WHATSAPP_WEBHOOK_VERIFY_TOKEN or ""
+    challenge = params.get("hub.challenge")
+    # compare_digest, matching the POST path — a plain == leaks the token length
+    # and prefix through timing.
+    if (
+        params.get("hub.mode") == "subscribe"
+        and expected
+        and hmac.compare_digest(token, expected)
+        and challenge
+    ):
         logger.info("[WA] Webhook verified")
-        return PlainTextResponse(content=params.get("hub.challenge"), status_code=200)
+        return PlainTextResponse(content=challenge, status_code=200)
     raise HTTPException(status_code=403, detail="Verification failed")
 
 
 def _verify_signature(raw_body: bytes, header: str | None) -> bool:
     """Verify Meta's X-Hub-Signature-256 over the raw request body."""
     if not settings.WHATSAPP_APP_SECRET:
-        # Not configured — allow through but make the gap loud in the logs.
-        logger.warning("[WA] WHATSAPP_APP_SECRET unset — webhook signature NOT verified")
-        return True
+        # Fail CLOSED. This used to return True with only a log line, which made
+        # the endpoint a world-writable order-management API: anyone who knew the
+        # URL could forge a message from any number — including the business
+        # number published on the website — and approve, cancel or mark orders
+        # paid. Refusing everything until the secret is configured is the only
+        # safe default; an inbound outage is recoverable, a forged admin command
+        # is not.
+        logger.error(
+            "[WA] WHATSAPP_APP_SECRET is not set — rejecting webhook. "
+            "Set it from Meta App Dashboard > Settings > Basic > App Secret."
+        )
+        return False
     if not header or not header.startswith("sha256="):
         return False
     expected = hmac.new(
@@ -78,8 +98,55 @@ def _already_processed(message_id: str) -> bool:
         return False
 
 
+def _find_user_by_phone(db: Session, sender: str) -> User | None:
+    """
+    Resolve a WhatsApp sender to a user.
+
+    The suffix fallback previously passed the raw sender straight into
+    SQLAlchemy's `endswith`, which builds a LIKE pattern WITHOUT escaping. A
+    sender of ten underscores therefore matched the first user in the table —
+    an admin — handing full admin command rights to anyone who could reach the
+    webhook. Digits are now the only thing that can reach the query at all.
+    """
+    digits = "".join(ch for ch in (sender or "") if ch.isdigit())
+    if not digits:
+        return None
+
+    user = db.query(User).filter(User.phone == f"+{digits}").first()
+    if user:
+        return user
+    user = db.query(User).filter(User.phone == digits).first()
+    if user:
+        return user
+
+    if len(digits) >= 10:
+        suffix = digits[-10:]
+        # autoescape=True so any wildcard in the pattern is treated literally.
+        # `suffix` is digits-only by construction; this is belt and braces.
+        matches = (
+            db.query(User)
+            .filter(User.phone.endswith(suffix, autoescape=True))
+            .limit(2)
+            .all()
+        )
+        # Two users sharing the last 10 digits (different country codes) is
+        # ambiguous — refuse rather than act as the wrong person.
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            logger.warning("[WA] Ambiguous phone suffix %s — refusing to guess", suffix)
+    return None
+
+
 @router.post("/whatsapp")
 async def receive_whatsapp(request: Request):
+    """
+    Meta inbound webhook.
+
+    Always answers 200 once the signature checks out. Meta treats any non-2xx as
+    a delivery failure and retries the whole batch, so a single unparseable
+    event must not become a retry loop that re-runs the events beside it.
+    """
     raw = await request.body()
     if not _verify_signature(raw, request.headers.get("x-hub-signature-256")):
         logger.warning("[WA] Rejected webhook with bad signature")
@@ -89,243 +156,397 @@ async def receive_whatsapp(request: Request):
         body = json.loads(raw)
     except Exception:
         return {"status": "invalid"}
+    if not isinstance(body, dict):
+        return {"status": "invalid"}
 
-    entry = body.get("entry", [])
-    if not entry: return {"status": "no entry"}
-    changes = entry[0].get("changes", [])
-    if not changes: return {"status": "no changes"}
-    value = changes[0].get("value", {})
-    messages = value.get("messages", [])
+    handled = 0
+    # Meta batches: several entries, each with several changes, each with
+    # several messages. Only entry[0]/changes[0]/messages[0] used to be read and
+    # the rest were dropped with a 200, so Meta never retried them - staff
+    # commands simply vanished under load.
+    for entry in _as_list(body.get("entry")):
+        for change in _as_list(_as_dict(entry).get("changes")):
+            value = _as_dict(_as_dict(change).get("value"))
 
-    # Delivery receipts. Template FAILURES arrive here — log them loudly,
-    # otherwise a wrong template name or language code fails silently forever.
-    if value.get("statuses") and not messages:
-        for st in value["statuses"]:
-            state = st.get("status", "")
-            if state == "failed":
-                errors = st.get("errors", [])
-                logger.error(
-                    "[WA] Send FAILED to %s (msg %s): %s",
-                    st.get("recipient_id"), st.get("id"), errors,
-                )
-            else:
-                logger.info("[WA] Message %s -> %s", st.get("id"), state)
-        return {"status": "status update"}
+            for st in _as_list(value.get("statuses")):
+                _log_status_callback(_as_dict(st))
 
-    if not messages: return {"status": "no messages"}
+            for msg in _as_list(value.get("messages")):
+                try:
+                    _process_message(_as_dict(msg))
+                    handled += 1
+                except Exception as e:
+                    # One bad message must not abort its siblings or the batch.
+                    logger.error("[WA] Failed to process message: %s", e, exc_info=True)
 
-    msg = messages[0]
-    sender = msg.get("from", "")
+    return {"status": "ok", "handled": handled}
+
+
+def _as_list(value) -> list:
+    return value if isinstance(value, list) else []
+
+
+def _as_dict(value) -> dict:
+    """`x.get(k, {})` returns None when the key exists with a null value."""
+    return value if isinstance(value, dict) else {}
+
+
+def _log_status_callback(st: dict) -> None:
+    """
+    Delivery receipts. Template FAILURES arrive here - a wrong template name or
+    language code otherwise fails silently forever.
+    """
+    state = st.get("status", "")
+    if state == "failed":
+        logger.error(
+            "[WA] Send FAILED to %s (msg %s): %s",
+            st.get("recipient_id"), st.get("id"), st.get("errors", []),
+        )
+    else:
+        logger.info("[WA] Message %s -> %s", st.get("id"), state)
+
+
+def _extract_text(msg: dict, sender: str) -> tuple:
+    """Returns (text, early_status). A non-None early_status means stop here."""
     msg_type = msg.get("type", "")
-    text = ""
-
-    # Drop Meta retries so a command never runs twice.
-    if _already_processed(msg.get("id", "")):
-        logger.info(f"[WA] Duplicate message {msg.get('id')} ignored")
-        return {"status": "duplicate"}
 
     if msg_type == "text":
-        text = msg.get("text", {}).get("body", "").strip()
-    elif msg_type == "interactive":
-        interactive = msg.get("interactive", {})
-        text = interactive.get("button_reply", {}).get("title", "") or interactive.get("list_reply", {}).get("title", "")
-    elif msg_type == "audio":
-        media_id = msg.get("audio", {}).get("id", "")
+        return _as_dict(msg.get("text")).get("body", "").strip(), None
+
+    if msg_type == "interactive":
+        interactive = _as_dict(msg.get("interactive"))
+        button = _as_dict(interactive.get("button_reply"))
+        listed = _as_dict(interactive.get("list_reply"))
+        # Prefer the payload id over the display title: ids are ours and stable,
+        # titles are whatever the template renders and can be localised.
+        return (button.get("id") or button.get("title")
+                or listed.get("id") or listed.get("title") or ""), None
+
+    if msg_type == "audio":
+        media_id = _as_dict(msg.get("audio")).get("id", "")
+        text = ""
         if media_id:
             url = get_audio_url(media_id)
-            if url: text = transcribe_voice(url)
+            if url:
+                text = transcribe_voice(url) or ""
         if not text:
             send_text(sender, "Could not process the voice message. Please type your message.")
-            return {"status": "voice failed"}
-    elif msg_type == "image":
-        send_text(sender, "We cannot process images at the moment. Please describe what you need.")
-        return {"status": "image"}
-    elif msg_type == "reaction":
-        return {"status": "reaction ignored"}
-    else:
-        send_text(sender, "Please send a text or voice message.")
-        return {"status": "unsupported"}
+            return "", "voice failed"
+        return text, None
 
-    if not text: return {"status": "empty"}
-    logger.info(f"[WA] {sender}: {text}")
+    if msg_type == "image":
+        send_text(sender, "We cannot process images at the moment. Please describe what you need.")
+        return "", "image"
+
+    if msg_type == "reaction":
+        return "", "reaction ignored"
+
+    send_text(sender, "Please send a text or voice message.")
+    return "", "unsupported"
+
+
+def _process_message(msg: dict) -> str:
+    """Handle exactly one inbound message."""
+    sender = msg.get("from", "")
+    if not sender:
+        return "no sender"
+
+    # Drop Meta retries so a command never runs twice. Checked before any side
+    # effect, including the outbound replies inside _extract_text.
+    if _already_processed(msg.get("id", "")):
+        logger.info("[WA] Duplicate message %s ignored", msg.get("id"))
+        return "duplicate"
+
+    text, early = _extract_text(msg, sender)
+    if early:
+        return early
+    if not text:
+        return "empty"
+
+    logger.info("[WA] inbound from %s (%d chars)", _mask(sender), len(text))
 
     db = SessionLocal()
     try:
-        # Find user by phone
-        user = db.query(User).filter(User.phone == f"+{sender}").first()
-        if not user:
-            user = db.query(User).filter(User.phone == sender).first()
-        if not user:
-            clean = sender[-10:] if len(sender) >= 10 else sender
-            user = db.query(User).filter(User.phone.endswith(clean)).first()
+        user = _find_user_by_phone(db, sender)
 
-        # ─── OPT-OUT — checked first, for every role ───
-        # Must run before command routing: policy requires we honour "STOP"
-        # regardless of what the person was in the middle of doing.
+        # OPT-OUT - checked first, for every role. Policy requires we honour
+        # "STOP" regardless of what the person was in the middle of doing.
         if is_opt_out_request(text):
             if user:
                 record_opt_out(db, user)
                 reply = (
                     "You've been unsubscribed from Cake O' Clock order updates on WhatsApp.\n\n"
-                    "You can still order anytime at " + SITE + " — you just won't get "
+                    "You can still order anytime at " + SITE + " - you just won't get "
                     "WhatsApp notifications.\n\n"
                     "Reply START to turn updates back on."
                 )
             else:
                 reply = "You're not subscribed to any Cake O' Clock updates."
             send_text(sender, reply)
-            return {"status": "opted_out"}
+            return "opted_out"
 
-        # ─── OPT-IN (re-subscribe) ───
+        # OPT-IN (re-subscribe)
         if user and not user.whatsapp_opt_in and text.strip().upper() in ("START", "SUBSCRIBE", "RESUME"):
             record_opt_in(db, user, source="whatsapp_reply")
             send_text(sender, "You're subscribed to Cake O' Clock order updates. Reply STOP anytime to unsubscribe.")
-            return {"status": "opted_in"}
+            return "opted_in"
 
-        if user and user.role == UserRole.ADMIN:
-            reply = _handle_admin(db, user, text)
-        elif user and user.role == UserRole.BAKER:
-            reply = _handle_baker(db, user, text)
-        elif user and user.role == UserRole.RIDER:
-            reply = _handle_rider(db, user, text)
+        if not settings.WHATSAPP_ENABLED:
+            # Outbound sending was already gated on this flag, but inbound was
+            # not: commands still mutated real orders while WhatsApp was
+            # nominally "disabled". Turning the integration off must mean off in
+            # both directions.
+            logger.warning(
+                "[WA] Ignoring inbound message from %s — WHATSAPP_ENABLED is false",
+                _mask(sender),
+            )
+            return "disabled"
+
+        if user and user.role in (UserRole.ADMIN, UserRole.BAKER, UserRole.RIDER):
+            # Staff commands are parsed deterministically - never by the language
+            # model. An inferred "APPROVE 145" is indistinguishable from a typed
+            # one by the time it reaches the order service.
+            reply = _handle_staff(db, user, text)
         elif user:
             reply = handle_customer_message(sender, text, user)
         else:
             reply = _handle_new_user(db, sender, text)
 
         send_text(sender, reply)
+        return "ok"
     except Exception as e:
-        logger.error(f"[WA] Error: {e}")
+        logger.error("[WA] Error handling message from %s: %s", _mask(sender), e, exc_info=True)
         send_text(sender, "We're experiencing a temporary issue. Please try again shortly.")
+        return "error"
     finally:
         db.close()
 
-    return {"status": "ok"}
+
+def _mask(phone: str) -> str:
+    """Phone numbers are personal data; keep only enough to correlate a log."""
+    digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+    return f"***{digits[-4:]}" if len(digits) >= 4 else "***"
 
 
-def _handle_admin(db, user, text):
-    context = {"step": "ADMIN"}
-    action = parse_message(text, "admin", context)
-    act = action.get("action", "UNKNOWN")
-    oid = action.get("order_id")
+def _handle_staff(db, user, text: str) -> str:
+    """Route a deterministic staff command to the matching handler."""
+    command = wa_commands.parse(text, user.role)
+    if command is None:
+        return wa_commands.help_text(user.role)
 
-    if act == "ADMIN_APPROVE" and oid:
-        order = db.query(Order).filter(Order.id == oid).first()
-        if not order: return f"Order #{oid} not found."
-        if order.status != OrderStatus.AWAITING_APPROVAL: return f"Order #{oid} — status is {order.status.value}. Cannot approve."
-        update_order_status(db, oid, StatusUpdate(status="PACKAGED"))
-        try: auto_assign_rider(db, oid, force=True)
-        except: pass
-        return f"Order #{oid} approved and packaged."
+    if user.role == UserRole.ADMIN:
+        return _handle_admin(db, user, command)
+    if user.role == UserRole.BAKER:
+        return _handle_baker(db, user, command)
+    return _handle_rider(db, user, command)
 
-    elif act == "ADMIN_REJECT" and oid:
-        update_order_status(db, oid, StatusUpdate(status="IN_PRODUCTION"))
-        return f"Order #{oid} sent back to baker."
 
-    elif act == "ADMIN_PAID" and oid:
-        from app.services.order_service import update_payment_status
-        from app.schemas import PaymentUpdate
-        update_payment_status(db, oid, PaymentUpdate(payment_status="PAID"))
-        return f"Order #{oid} marked as paid."
+def _resolve_target(db, user, command, valid_statuses, order_field):
+    """
+    Work out which order a command without an explicit number refers to.
 
-    elif act == "ADMIN_CANCEL" and oid:
-        update_order_status(db, oid, StatusUpdate(status="CANCELLED"))
-        return f"Order #{oid} cancelled."
+    A baker replying just "Completed" is the flow the business actually wants,
+    but guessing wrong finishes someone else's cake. So we only act when there
+    is exactly one candidate:
 
-    elif act == "ADMIN_ORDERS":
+      exactly one  -> that order
+      none         -> say there is nothing to complete
+      two or more  -> refuse and list the numbers
+
+    Returns (order, error_reply). Exactly one is non-None.
+    """
+    if command.order_id is not None:
+        order = (
+            db.query(Order)
+            .filter(Order.id == command.order_id, order_field == user.id)
+            .first()
+        )
+        if not order:
+            return None, f"Order #{command.order_id} is not assigned to you."
+        if order.status not in valid_statuses:
+            allowed = ", ".join(st.value for st in valid_statuses)
+            return None, (f"Order #{order.id} is {order.status.value}. "
+                          f"This command applies to: {allowed}.")
+        return order, None
+
+    candidates = (
+        db.query(Order)
+        .filter(order_field == user.id, Order.status.in_(valid_statuses))
+        .order_by(Order.id.asc())
+        .all()
+    )
+    if not candidates:
+        return None, "You have no order at that stage right now. Reply QUEUE to see your list."
+    if len(candidates) > 1:
+        numbers = ", ".join(f"#{o.id}" for o in candidates)
+        return None, (f"You have {len(candidates)} orders at that stage: {numbers}.\n"
+                      f"Reply with the order number, e.g. \"DONE {candidates[0].id}\".")
+    return candidates[0], None
+
+
+def _handle_admin(db, user, command):
+    act = command.action
+
+    if act == "ADMIN_ORDERS":
         from datetime import datetime, timezone
         from sqlalchemy import func
         today = datetime.now(timezone.utc).date()
-        total = db.query(func.count(Order.id)).filter(func.date(Order.created_at) == today).scalar() or 0
-        revenue = db.query(func.sum(Order.total_price)).filter(func.date(Order.created_at) == today).scalar() or 0
-        pending = db.query(func.count(Order.id)).filter(func.date(Order.created_at) == today,
-            Order.status.in_([OrderStatus.CONFIRMED, OrderStatus.ASSIGNED, OrderStatus.IN_PRODUCTION, OrderStatus.AWAITING_APPROVAL])).scalar() or 0
-        return f"Today's Summary\n\nOrders: {total}\nRevenue: ₹{revenue:,.0f}\nPending: {pending}\n\nDashboard: {SITE}/admin"
+        base = db.query(Order).filter(func.date(Order.created_at) == today)
+        total = base.count()
+        revenue = (
+            db.query(func.sum(Order.total_price))
+            .filter(func.date(Order.created_at) == today,
+                    Order.status != OrderStatus.CANCELLED)
+            .scalar() or 0
+        )
+        pending = base.filter(Order.status.in_([
+            OrderStatus.CONFIRMED, OrderStatus.ASSIGNED,
+            OrderStatus.IN_PRODUCTION, OrderStatus.AWAITING_APPROVAL,
+        ])).count()
+        return (f"Today's Summary\n\nOrders: {total}\nRevenue: Rs {revenue:,.0f}\n"
+                f"Pending: {pending}\n\nDashboard: {SITE}/admin")
 
-    elif act == "CONVERSATIONAL":
-        return action.get("reply", "How can I help?")
+    # Every remaining admin command targets one order.
+    if act == "ADMIN_APPROVE":
+        order, err = _resolve_target(db, user, command,
+                                     [OrderStatus.AWAITING_APPROVAL], Order.assigned_baker_id)
+        # Admins do not own orders, so re-resolve without the assignment filter.
+        if err and command.order_id is not None:
+            order = db.query(Order).filter(Order.id == command.order_id).first()
+            if not order:
+                return f"Order #{command.order_id} not found."
+            if order.status != OrderStatus.AWAITING_APPROVAL:
+                return f"Order #{order.id} is {order.status.value}. Only orders awaiting approval can be passed."
+            err = None
+        if err:
+            return err
+        update_order_status(db, order.id, StatusUpdate(status="PACKAGED"))
+        try:
+            auto_assign_rider(db, order.id, force=True)
+        except Exception as e:
+            logger.warning("[WA] rider auto-assign failed for order %s: %s", order.id, e)
+        return f"Order #{order.id} approved and packaged."
 
-    return "Commands: APPROVE {id} · REJECT {id} · PAID {id} · CANCEL {id} · ORDERS"
+    if command.order_id is None:
+        return "Include the order number, e.g. \"APPROVE 145\"."
+
+    order = db.query(Order).filter(Order.id == command.order_id).first()
+    if not order:
+        return f"Order #{command.order_id} not found."
+
+    if act == "ADMIN_REJECT":
+        if order.status != OrderStatus.AWAITING_APPROVAL:
+            return f"Order #{order.id} is {order.status.value}. Only orders awaiting approval can be sent back."
+        update_order_status(db, order.id, StatusUpdate(status="IN_PRODUCTION"), rework=True)
+        return f"Order #{order.id} sent back to the baker."
+
+    if act == "ADMIN_PAID":
+        from app.services.order_service import update_payment_status
+        from app.schemas import PaymentUpdate
+        update_payment_status(db, order.id, PaymentUpdate(payment_status="PAID"))
+        return f"Order #{order.id} marked as paid."
+
+    if act == "ADMIN_CANCEL":
+        allowed = VALID_TRANSITIONS.get(order.status, [])
+        if OrderStatus.CANCELLED not in allowed:
+            return f"Order #{order.id} is {order.status.value} and can no longer be cancelled."
+        update_order_status(db, order.id, StatusUpdate(status="CANCELLED"))
+        return f"Order #{order.id} cancelled."
+
+    return wa_commands.help_text(user.role)
 
 
-def _handle_baker(db, user, text):
-    context = {"step": "BAKER"}
-    action = parse_message(text, "baker", context)
-    act = action.get("action", "UNKNOWN")
-    oid = action.get("order_id")
+def _handle_baker(db, user, command):
+    act = command.action
 
-    if act == "BAKER_START" and oid:
-        order = db.query(Order).filter(Order.id == oid, Order.assigned_baker_id == user.id).first()
-        if not order: return f"Order #{oid} not found or not assigned to you."
-        if order.status != OrderStatus.ASSIGNED: return f"Order #{oid} — cannot start. Status: {order.status.value}."
-        update_order_status(db, oid, StatusUpdate(status="IN_PRODUCTION"))
-        return f"Order #{oid} — production started."
-
-    elif act == "BAKER_DONE" and oid:
-        order = db.query(Order).filter(Order.id == oid, Order.assigned_baker_id == user.id).first()
-        if not order: return f"Order #{oid} not found or not assigned to you."
-        if order.status != OrderStatus.IN_PRODUCTION: return f"Order #{oid} — cannot mark done. Status: {order.status.value}."
-        update_order_status(db, oid, StatusUpdate(status="AWAITING_APPROVAL"))
-        return f"Order #{oid} — marked complete. Awaiting approval."
-
-    elif act == "BAKER_QUEUE":
-        orders = db.query(Order).filter(Order.assigned_baker_id == user.id,
-            Order.status.in_([OrderStatus.ASSIGNED, OrderStatus.IN_PRODUCTION])).order_by(Order.delivery_time.asc().nullslast()).all()
-        if not orders: return "No orders in your queue."
-        lines = ["*Your Queue*\n"]
+    if act == "BAKER_QUEUE":
+        orders = (
+            db.query(Order)
+            .filter(Order.assigned_baker_id == user.id,
+                    Order.status.in_([OrderStatus.ASSIGNED, OrderStatus.IN_PRODUCTION]))
+            .order_by(Order.delivery_time.asc().nullslast())
+            .all()
+        )
+        if not orders:
+            return "No orders in your queue."
+        lines = ["*Your Queue*" + "\n"]
         for o in orders:
             _enrich_order(o)
-            items = ", ".join([f"{i.customization.get('size', '')} {i.customization.get('flavor', '')}" for i in o.items]) if o.items else "Cake"
-            status = "Waiting" if o.status == OrderStatus.ASSIGNED else "In production"
+            items = ", ".join(
+                f"{i.customization.get('size', '')} {i.customization.get('flavor', '')}"
+                for i in o.items
+            ) if o.items else "Cake"
+            state = "Waiting" if o.status == OrderStatus.ASSIGNED else "In production"
             dt = o.delivery_time.strftime("%I:%M %p") if o.delivery_time else "ASAP"
-            lines.append(f"#{o.id} — {items}\nStatus: {status} | By {dt}\n")
+            lines.append(f"#{o.id} - {items}\nStatus: {state} | By {dt}\n")
         return "\n".join(lines)
 
-    elif act == "CONVERSATIONAL":
-        return action.get("reply", "Commands: START {id} · DONE {id} · QUEUE")
+    if act == "BAKER_START":
+        order, err = _resolve_target(db, user, command,
+                                     [OrderStatus.ASSIGNED], Order.assigned_baker_id)
+        if err:
+            return err
+        update_order_status(db, order.id, StatusUpdate(status="IN_PRODUCTION"))
+        return f"Order #{order.id} - production started."
 
-    return "Commands: START {id} · DONE {id} · QUEUE"
+    if act == "BAKER_DONE":
+        order, err = _resolve_target(db, user, command,
+                                     [OrderStatus.IN_PRODUCTION], Order.assigned_baker_id)
+        if err:
+            return err
+        update_order_status(db, order.id, StatusUpdate(status="AWAITING_APPROVAL"))
+        return f"Order #{order.id} - marked complete. Awaiting approval."
+
+    return wa_commands.help_text(user.role)
 
 
-def _handle_rider(db, user, text):
-    context = {"step": "RIDER"}
-    action = parse_message(text, "rider", context)
-    act = action.get("action", "UNKNOWN")
-    oid = action.get("order_id")
+def _handle_rider(db, user, command):
+    act = command.action
 
-    if act == "RIDER_PICKED" and oid:
-        order = db.query(Order).filter(Order.id == oid, Order.assigned_rider_id == user.id).first()
-        if not order: return f"Order #{oid} not found or not assigned to you."
-        if order.status != OrderStatus.PACKAGED: return f"Order #{oid} — cannot pick up. Status: {order.status.value}."
-        update_order_status(db, oid, StatusUpdate(status="OUT_FOR_DELIVERY"))
-        return f"Order #{oid} — picked up. Deliver safely."
-
-    elif act == "RIDER_DELIVERED" and oid:
-        order = db.query(Order).filter(Order.id == oid, Order.assigned_rider_id == user.id).first()
-        if not order: return f"Order #{oid} not found or not assigned to you."
-        if order.status != OrderStatus.OUT_FOR_DELIVERY: return f"Order #{oid} — cannot mark delivered. Status: {order.status.value}."
-        update_order_status(db, oid, StatusUpdate(status="DELIVERED"))
-        return f"Order #{oid} — delivered successfully."
-
-    elif act == "RIDER_QUEUE":
-        orders = db.query(Order).filter(Order.assigned_rider_id == user.id,
-            Order.status.in_([OrderStatus.PACKAGED, OrderStatus.OUT_FOR_DELIVERY])).all()
-        if not orders: return "No deliveries assigned."
-        lines = ["*Your Deliveries*\n"]
+    if act == "RIDER_QUEUE":
+        orders = (
+            db.query(Order)
+            .filter(Order.assigned_rider_id == user.id,
+                    Order.status.in_([OrderStatus.PACKAGED, OrderStatus.OUT_FOR_DELIVERY]))
+            .all()
+        )
+        if not orders:
+            return "No deliveries assigned."
+        lines = ["*Your Deliveries*" + "\n"]
         for o in orders:
             _enrich_order(o)
-            status = "Ready for pickup" if o.status == OrderStatus.PACKAGED else "Out for delivery"
+            state = "Ready for pickup" if o.status == OrderStatus.PACKAGED else "Out for delivery"
             addr = o.delivery_address or "Self Pickup"
-            maps = f"https://www.google.com/maps/search/?api=1&query={addr.replace(' ', '+')}" if addr != "Self Pickup" else ""
-            lines.append(f"#{o.id} — {status}\nCustomer: {o.customer_name or 'Customer'}\nPhone: {o.user.phone if o.user else 'N/A'}\nAddress: {addr}")
-            if maps: lines.append(f"Map: {maps}")
+            lines.append(f"#{o.id} - {state}\nCustomer: {o.customer_name or 'Customer'}\n"
+                         f"Phone: {o.user.phone if o.user else 'N/A'}\nAddress: {addr}")
+            if addr != "Self Pickup":
+                lines.append("Map: " + _maps_url(addr))
             lines.append("")
         return "\n".join(lines)
 
-    elif act == "CONVERSATIONAL":
-        return action.get("reply", "Commands: PICKED {id} · DELIVERED {id} · QUEUE")
+    if act == "RIDER_PICKED":
+        order, err = _resolve_target(db, user, command,
+                                     [OrderStatus.PACKAGED], Order.assigned_rider_id)
+        if err:
+            return err
+        update_order_status(db, order.id, StatusUpdate(status="OUT_FOR_DELIVERY"))
+        return f"Order #{order.id} - picked up. Deliver safely."
 
-    return "Commands: PICKED {id} · DELIVERED {id} · QUEUE"
+    if act == "RIDER_DELIVERED":
+        order, err = _resolve_target(db, user, command,
+                                     [OrderStatus.OUT_FOR_DELIVERY], Order.assigned_rider_id)
+        if err:
+            return err
+        update_order_status(db, order.id, StatusUpdate(status="DELIVERED"))
+        return f"Order #{order.id} - delivered successfully."
+
+    return wa_commands.help_text(user.role)
+
+
+def _maps_url(address: str) -> str:
+    """URL-encode the address; a raw replace(" ", "+") breaks on & and #."""
+    from urllib.parse import quote_plus
+    return f"https://www.google.com/maps/search/?api=1&query={quote_plus(address)}"
 
 
 def _handle_new_user(db, phone, text):

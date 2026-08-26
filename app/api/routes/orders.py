@@ -73,7 +73,12 @@ def update_payment(order_id: int, data: PaymentUpdate, admin: User = Depends(req
 @router.post("/{order_id}/assign-rider", response_model=OrderRead)
 def do_assign_rider(order_id: int, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     """Auto-assign least-loaded rider."""
-    return auto_assign_rider(db, order_id)
+    order = auto_assign_rider(db, order_id)
+    # Same reason as the manual path: no PACKAGED transition is coming for an
+    # order that is already packaged, so notify here or the rider hears nothing.
+    from app.services.assignment_engine import notify_rider_if_already_packaged
+    notify_rider_if_already_packaged(db, order)
+    return order
 
 
 @router.get("/{order_id}/events", response_model=list[EventRead])

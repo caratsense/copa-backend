@@ -22,6 +22,11 @@ settings = get_settings()
 
 REDIS_QUEUE = "order_events"
 
+# Backlog bounds for the event queue. Generous enough that a worker restarting
+# loses nothing in practice, small enough that no consumer at all is harmless.
+EVENT_QUEUE_MAX = 5000
+EVENT_QUEUE_TTL = 7 * 24 * 3600  # a week
+
 
 def _get_redis():
     """Lazy Redis connection."""
@@ -51,6 +56,13 @@ def emit_event(
     db.flush()  # get the id without committing (caller controls the transaction)
 
     # 2. Push to Redis (best-effort — don't fail the request if Redis is down)
+    #
+    # Nothing consumes this queue in the deployed configuration: Railway runs
+    # only uvicorn (see start.sh), and app/workers/event_worker.py is wired up
+    # in docker-compose for local use. An unbounded LPUSH therefore grew this
+    # list forever, in the same Redis instance live delivery tracking depends
+    # on. The list is capped and expired so a consumer that never arrives cannot
+    # exhaust memory. The OrderEvent row above remains the durable audit trail.
     try:
         r = _get_redis()
         if r:
@@ -61,7 +73,11 @@ def emit_event(
                 "payload": payload,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
-            r.lpush(REDIS_QUEUE, message)
+            pipe = r.pipeline()
+            pipe.lpush(REDIS_QUEUE, message)
+            pipe.ltrim(REDIS_QUEUE, 0, EVENT_QUEUE_MAX - 1)
+            pipe.expire(REDIS_QUEUE, EVENT_QUEUE_TTL)
+            pipe.execute()
     except Exception as e:
         # Log but don't crash — the DB record is the source of truth
         print(f"[EventService] Redis push failed: {e}")

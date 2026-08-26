@@ -20,6 +20,11 @@ os.environ["UPLOAD_DIR"] = os.path.join(_TMP, "uploads")
 os.environ["JWT_SECRET"] = "test-secret-not-a-real-key"
 os.environ["WHATSAPP_ENABLED"] = "false"
 os.environ["SMS_ENABLED"] = "false"
+# Non-production, but WITHOUT the test-OTP opt-in: the default suite must see
+# the same fail-closed authentication production does. Individual tests turn
+# DEV_ALLOW_TEST_OTP on where they mean to exercise it.
+os.environ["ENVIRONMENT"] = "test"
+os.environ.pop("DEV_ALLOW_TEST_OTP", None)
 
 import fakeredis  # noqa: E402
 import pytest  # noqa: E402
@@ -112,6 +117,55 @@ def reset_socket_managers():
 
 
 @pytest.fixture
+def wa_secret(monkeypatch):
+    """
+    Turn WhatsApp on with a known app secret so tests can sign payloads.
+
+    `settings` is an lru_cached singleton shared by every module, so patching
+    the attribute reaches all of them.
+    """
+    from app.config import get_settings
+
+    s = get_settings()
+    monkeypatch.setattr(s, "WHATSAPP_APP_SECRET", "test-app-secret")
+    monkeypatch.setattr(s, "WHATSAPP_ENABLED", True)
+    monkeypatch.setattr(s, "WHATSAPP_PHONE_ID", "test-phone-id")
+    monkeypatch.setattr(s, "WHATSAPP_TOKEN", "test-token")
+    monkeypatch.setattr(s, "WHATSAPP_WEBHOOK_VERIFY_TOKEN", "test-verify-token")
+    yield s
+
+
+@pytest.fixture(autouse=True)
+def sent_messages(monkeypatch):
+    """
+    Capture outbound WhatsApp payloads at the HTTP boundary.
+
+    Autouse so no test can ever reach the real Meta API, whether or not it
+    asked for this fixture.
+    """
+    captured: list[dict] = []
+
+    def fake_send(payload: dict):
+        captured.append(payload)
+        return {"messages": [{"id": f"wamid.SENT{len(captured)}"}]}
+
+    from app.services import whatsapp_sender
+
+    monkeypatch.setattr(whatsapp_sender, "_send", fake_send)
+    return captured
+
+
+@pytest.fixture(autouse=True)
+def reset_template_cache():
+    """Template name overrides are memoised; tests may change settings."""
+    from app.services import wa_templates
+
+    wa_templates._reset_cache_for_tests()
+    yield
+    wa_templates._reset_cache_for_tests()
+
+
+@pytest.fixture
 def db():
     session = SessionLocal()
     try:
@@ -150,7 +204,8 @@ def make_user(db, name, role, phone=None, on_duty=True, is_active=True):
     return user
 
 
-def make_order(db, customer, status=OrderStatus.OUT_FOR_DELIVERY, rider=None, address="12 Hazratganj, Lucknow"):
+def make_order(db, customer, status=OrderStatus.OUT_FOR_DELIVERY, rider=None,
+               address="12 Hazratganj, Lucknow", baker=None):
     order = Order(
         user_id=customer.id,
         status=status,
@@ -158,6 +213,7 @@ def make_order(db, customer, status=OrderStatus.OUT_FOR_DELIVERY, rider=None, ad
         total_price=1000.0,
         delivery_address=address,
         assigned_rider_id=rider.id if rider else None,
+        assigned_baker_id=baker.id if baker else None,
         payment_method="COD",
     )
     db.add(order)

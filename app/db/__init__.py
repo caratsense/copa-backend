@@ -18,5 +18,6 @@ from app.models.site_settings import SiteSettings  # noqa
 from app.models.trusted_device import TrustedDevice  # noqa
 from app.models.address import Address  # noqa
 from app.models.extra import Extra  # noqa
+from app.models.whatsapp_message import WhatsAppMessage  # noqa
 
 __all__ = ["Base", "get_db", "engine", "SessionLocal"]

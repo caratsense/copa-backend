@@ -178,6 +178,71 @@ def process_queued_orders(admin: User = Depends(require_admin), db: Session = De
     }
 
 
+@router.get("/whatsapp-outbox")
+def whatsapp_outbox(
+    status: str | None = None,
+    limit: int = Query(50, ge=1, le=200),
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Recent outbound WhatsApp notifications and what happened to them.
+
+    Makes "the baker was never told" visible. A send that fails used to be a log
+    line nobody reads; each attempt is now a row with its error and attempt count.
+    """
+    from app.models.whatsapp_message import WhatsAppMessage
+
+    q = db.query(WhatsAppMessage)
+    if status:
+        q = q.filter(WhatsAppMessage.status == status.upper())
+    rows = q.order_by(WhatsAppMessage.id.desc()).limit(limit).all()
+
+    return {
+        "messages": [
+            {
+                "id": m.id,
+                "order_id": m.order_id,
+                "template_key": m.template_key,
+                "template_name": m.template_name,
+                "recipient_role": m.recipient_role,
+                "event_type": m.event_type,
+                "status": m.status.value if hasattr(m.status, "value") else m.status,
+                "attempts": m.attempts,
+                "last_error": m.last_error,
+                "created_at": m.created_at,
+                "sent_at": m.sent_at,
+            }
+            for m in rows
+        ]
+    }
+
+
+@router.post("/whatsapp-outbox/retry")
+def retry_whatsapp_outbox(
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Re-attempt notifications that failed but have attempts remaining."""
+    from app.services.wa_outbox import retry_pending
+
+    return retry_pending(db)
+
+
+@router.get("/whatsapp-templates")
+def whatsapp_templates(admin: User = Depends(require_admin)):
+    """
+    The Meta templates this deployment expects to exist.
+
+    Handover aid: whoever builds the templates in WhatsApp Manager can read the
+    exact names, languages, recipients and placeholder counts straight from the
+    running service rather than from a document that drifts.
+    """
+    from app.services.wa_templates import describe_all
+
+    return {"templates": describe_all()}
+
+
 @router.get("/queued-count")
 def get_queued_count(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     """Get count of orders waiting in queue (CONFIRMED but no baker assigned)."""

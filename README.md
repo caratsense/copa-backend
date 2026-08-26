@@ -32,9 +32,12 @@ python -m venv .venv && source .venv/bin/activate
 # 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. Configure .env (update DATABASE_URL and REDIS_URL for local)
+# 3. Configure .env (see .env.example — every variable is documented there)
+#    ENVIRONMENT=development          <- required, or the safety rules below apply
 #    DATABASE_URL=postgresql://copa:copa_secret@localhost:5432/copa_db
 #    REDIS_URL=redis://localhost:6379/0
+#    JWT_SECRET=<anything, in development>
+#    DEV_ALLOW_TEST_OTP=true          <- lets you log in with OTP 000000 locally
 
 # 4. Run migrations / create tables
 python -c "from app.db import Base, engine; Base.metadata.create_all(bind=engine)"
@@ -48,6 +51,28 @@ uvicorn app.main:app --reload
 # 7. (Optional) Start the event worker in a separate terminal
 python -m app.workers.event_worker
 ```
+
+---
+
+## Production Safety Rules
+
+Three things fail CLOSED rather than falling back to a convenient default. Each
+one used to be a silent bypass, so none of them can be re-enabled by accident —
+every one needs `ENVIRONMENT` to be non-production **and** its own explicit flag.
+
+| Missing configuration | What happens now | What used to happen |
+|---|---|---|
+| `JWT_SECRET` blank, a known placeholder, or under 16 chars | **The app refuses to start** in production | Signed sessions with a key published in this repository — anyone could mint an admin token |
+| No SMS provider (`SMS_ENABLED=false` or no `TWOFACTOR_API_KEY`) | `send_otp` reports failure; `/auth/login`, `/auth/login-otp`, `/auth/resend-otp` and `/auth/forgot-password` return **503** | OTP `000000` was accepted for **every** account. With `/auth/login-otp` needing no password, a phone number alone was a full account takeover |
+| `PAYU_KEY`/`PAYU_SALT` blank | `POST /payments/create-order` returns **503**; the callback refuses to settle | Every ONLINE order was marked `PAID` without collecting anything |
+
+`ENVIRONMENT` defaults to `production`, and anything it does not recognise
+(`development`, `dev`, `local`, `test`, `testing`, `ci`, `staging`) counts as
+production — so a typo fails safe rather than unlocking the bypasses.
+
+For local development set `ENVIRONMENT=development` plus `DEV_ALLOW_TEST_OTP=true`
+(OTP `000000`) and `PAYU_ALLOW_DEMO_PAYMENTS=true` (simulated payments). Startup
+refuses to boot if `DEV_ALLOW_TEST_OTP` is on while `ENVIRONMENT=production`.
 
 ---
 
@@ -89,6 +114,72 @@ python -m app.workers.event_worker
 | `POST` | `/delivery/{id}/stop-tracking` | Manually stop tracking — normally automatic |
 | **AI** | | |
 | `POST` | `/ai/parse-order` | Parse natural language (stub) |
+
+---
+
+## WhatsApp Integration
+
+Inbound and outbound both run on the same order state machine the website uses.
+There is no second order system: every WhatsApp command calls
+`order_service.update_order_status`, so a baker replying on WhatsApp and a baker
+clicking the button produce identical events, broadcasts, notifications and
+delivery-tracking side effects.
+
+### Inbound — `POST /webhook/whatsapp`
+
+| Step | Behaviour |
+|---|---|
+| Authenticity | `X-Hub-Signature-256` HMAC over the raw body. **Fails closed** — every request is rejected while `WHATSAPP_APP_SECRET` is unset |
+| Verification | `GET /webhook/whatsapp` with `hub.verify_token`, compared constant-time. Requires `WHATSAPP_WEBHOOK_VERIFY_TOKEN` |
+| Idempotency | Meta message id in Redis (`wa:msg:{id}`, 24h, SET NX). Replays are dropped before any side effect |
+| Batching | Every entry / change / message is processed, not just the first |
+| Robustness | Always returns 200 after the signature check; one malformed event cannot abort its siblings or trigger a Meta retry loop |
+| Sender lookup | Digits-only, exact match first, then a single unambiguous 10-digit suffix. Never a raw LIKE pattern |
+
+**Staff commands are parsed deterministically** (`app/services/wa_commands.py`) —
+never by a language model. The command must be the first word and the order id
+is read after it, so prose like *"not done with 145 yet"* is not a transition.
+
+```
+admin  APPROVE <id> · REJECT <id> · PAID <id> · CANCEL <id> · ORDERS
+baker  START <id>   · DONE <id>   · QUEUE
+rider  PICKED <id>  · DELIVERED <id> · QUEUE
+```
+
+A verb without an order number (e.g. a bare `Completed`) is honoured only when
+the sender has **exactly one** order at the matching stage. With none it says so;
+with several it lists the numbers and refuses to guess.
+
+### Outbound — templates
+
+Template names are **not** written in route code. `app/services/wa_templates.py`
+maps an internal key to a Meta template name, overridable per deployment via
+`WHATSAPP_TEMPLATE_NAMES` without a code change.
+
+`GET /dashboard/whatsapp-templates` (admin) returns the live list — names,
+languages, recipients, triggers and placeholder counts — for whoever builds the
+templates in WhatsApp Manager.
+
+Every send is recorded in the `whatsapp_messages` outbox: intent first, then the
+attempt, then the outcome. A Meta outage becomes a retryable backlog instead of
+silence. Inspect with `GET /dashboard/whatsapp-outbox`, drain with
+`POST /dashboard/whatsapp-outbox/retry`.
+
+**A notification failure never affects order state.** Sends happen after the
+transaction commits and cannot roll a transition back.
+
+### Order events queue
+
+`emit_event` writes an `OrderEvent` row (the durable audit trail) and also
+pushes to the Redis `order_events` list. Nothing consumes that list in the
+deployed configuration — Railway runs only uvicorn; `app/workers/event_worker.py`
+is wired up in `docker-compose.yml` for local use. The list is therefore capped
+and expired so it cannot grow without bound.
+
+One consequence: the worker's morning queue processor does not run in
+production, so orders placed off-hours are not auto-assigned at opening. The
+admin dashboard surfaces them with an **Assign Now** button
+(`POST /dashboard/process-queue`).
 
 ---
 

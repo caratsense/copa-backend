@@ -117,7 +117,10 @@ from pydantic import BaseModel as PydanticBaseModel
 
 
 class ManualAssign(PydanticBaseModel):
-    staff_id: int
+    # Optional: the admin UI posts `{}` to mean "pick someone automatically".
+    # This was `staff_id: int`, so an empty body failed validation with 422 and
+    # the Assign Baker / Assign Rider buttons never worked at all.
+    staff_id: int | None = None
 
 
 @router.post("/orders/{order_id}/assign-baker")
@@ -137,11 +140,11 @@ def admin_assign_baker(
         baker = db.query(User).filter(User.id == data.staff_id, User.role == UserRole.BAKER, User.is_active == True).first()
         if not baker:
             raise HTTPException(status_code=400, detail="Baker not found or inactive")
-        order.assigned_baker_id = baker.id
-        if order.status == OrderStatus.CONFIRMED:
-            order.status = OrderStatus.ASSIGNED
-        db.commit()
-        db.refresh(order)
+        from app.services.assignment_engine import admin_assign_baker as _assign_baker
+        # Routes through the order service so the transition emits its event,
+        # broadcasts, and actually notifies the baker. This used to write
+        # order.status inline, which skipped all three.
+        _assign_baker(db, order.id, baker.id)
         return {"message": f"Baker {baker.name} assigned to order #{order.id}", "order_id": order.id, "baker_id": baker.id}
     else:
         result = auto_assign_baker(db, order_id, force=True)
@@ -169,6 +172,11 @@ def admin_assign_rider(
         order.assigned_rider_id = rider.id
         db.commit()
         db.refresh(order)
+
+        # A rider assigned to an already-packaged order gets no PACKAGED
+        # transition, so without this they are never told about the delivery.
+        from app.services.assignment_engine import notify_rider_if_already_packaged
+        notify_rider_if_already_packaged(db, order)
 
         # Reassigning a delivery that is already on the road: repoint the live
         # tracking state so the fleet view stops crediting the previous rider's

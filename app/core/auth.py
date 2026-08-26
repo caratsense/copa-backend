@@ -28,6 +28,11 @@ from app.models.user import User, UserRole
 
 settings = get_settings()
 
+# Role claim on the short-lived token handed out between password/phone entry
+# and OTP verification. It is not a real role and must never authorise anything
+# except /auth/verify-otp.
+OTP_PENDING_ROLE = "otp_pending"
+
 # ─── PASSWORD HASHING ─────────────────────────────────
 
 
@@ -80,7 +85,23 @@ def get_current_user(
         )
 
     payload = decode_token(credentials.credentials)
-    user_id = int(payload["sub"])
+
+    # The half-authenticated token issued by /auth/login and /auth/login-otp
+    # carries role="otp_pending" and is ONLY valid at /auth/verify-otp. It used
+    # to authenticate every endpoint, which made /auth/login-otp — a passwordless
+    # endpoint that takes nothing but a phone number — a complete account
+    # takeover: request a temp_token for any phone, use it as a bearer token,
+    # never supply the OTP.
+    if payload.get("role") == OTP_PENDING_ROLE:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="OTP verification required — complete login at /auth/verify-otp",
+        )
+
+    try:
+        user_id = int(payload["sub"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Malformed token")
 
     user = db.query(User).filter(User.id == user_id).first()
     if not user:

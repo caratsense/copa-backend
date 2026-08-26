@@ -10,10 +10,16 @@ Flow:
 
 Config (.env):
   PAYU_KEY, PAYU_SALT, PAYU_ENV=test|prod, BACKEND_BASE_URL (this API's public URL)
-  When PAYU_KEY/SALT are empty → demo mode (payment auto-marked paid).
+
+  When PAYU_KEY/SALT are empty, online payment FAILS CLOSED (503) and the
+  callback refuses to settle anything. Simulated payments require an explicit
+  PAYU_ALLOW_DEMO_PAYMENTS=true and are for local development only — they used
+  to be the automatic fallback, which meant an unconfigured production deploy
+  marked every ONLINE order PAID without collecting a rupee.
 """
 
 import hashlib
+import hmac
 import logging
 import secrets
 
@@ -41,8 +47,8 @@ def _sha512(*parts) -> str:
 
 
 def _frontend_base() -> str:
-    # Reuse the existing frontend URL config (WHATSAPP_TRACKING_BASE_URL ends in /track)
-    return settings.WHATSAPP_TRACKING_BASE_URL.replace("/track", "").rstrip("/")
+    """Where PayU sends the customer back to. See Settings.frontend_base_url."""
+    return settings.frontend_base_url
 
 
 def _order_id_from_txnid(txnid: str):
@@ -74,6 +80,41 @@ def _get_own_order(db: Session, order_id: int, user: User) -> Order:
     return order
 
 
+def _lock_order(db: Session, order_id: int) -> Order | None:
+    """
+    Select the order FOR UPDATE so concurrent callbacks serialise.
+
+    SQLite has no row locks and ignores the clause, which is fine for tests;
+    Postgres — where the money actually moves — honours it.
+    """
+    q = db.query(Order).filter(Order.id == order_id)
+    try:
+        return q.with_for_update().first()
+    except Exception:
+        return q.first()
+
+
+def _release_for_production(db: Session, order_id: int) -> None:
+    """
+    Hand a now-payable order to a baker.
+
+    Orders no longer auto-assign at creation, because that put unpaid ONLINE
+    orders straight into the kitchen. Assignment happens here instead, once the
+    order is genuinely payable, and goes through the normal engine so the baker
+    is notified exactly as they would be from the dashboard.
+    """
+    from app.services.assignment_engine import auto_assign_baker
+
+    try:
+        auto_assign_baker(db, order_id)
+    except HTTPException as e:
+        # No baker free is an operations problem, not a payment failure — the
+        # money is taken and the admin queue will surface it.
+        logger.info("[PAYU] Order %s paid but not assigned yet: %s", order_id, e.detail)
+    except Exception as e:
+        logger.error("[PAYU] Assignment after payment failed for order %s: %s", order_id, e)
+
+
 @router.post("/create-order")
 def create_payment_order(
     data: PaymentOrderRequest,
@@ -87,19 +128,35 @@ def create_payment_order(
     if order.payment_status == PaymentStatus.PAID:
         raise HTTPException(status_code=400, detail="This order is already paid")
 
-    # COD — just record it and return
+    # COD — record it and release the order for production.
     if data.payment_method == "COD":
         order.payment_method = "COD"
         order.payment_status = PaymentStatus.COD_PENDING
         db.commit()
+        _release_for_production(db, order.id)
         return {"status": "cod", "message": "Order placed with Cash on Delivery"}
 
-    # ONLINE — demo mode when PayU isn't configured
+    # ONLINE without PayU configured.
     if not settings.PAYU_KEY or not settings.PAYU_SALT:
+        if not settings.PAYU_ALLOW_DEMO_PAYMENTS:
+            # FAIL CLOSED. This branch used to mark the order PAID and return
+            # "demo_paid" — so an unconfigured production deploy handed out
+            # every cake for free, silently, with no payment ever taken.
+            logger.error(
+                "[PAYU] Payment requested for order %s but PAYU_KEY/PAYU_SALT are unset "
+                "and PAYU_ALLOW_DEMO_PAYMENTS is off. Refusing to simulate payment.",
+                order.id,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Online payment is temporarily unavailable. Please choose Cash on Delivery or try again shortly.",
+            )
+        logger.warning("[PAYU] DEMO MODE: simulating payment for order %s", order.id)
         order.payment_method = "ONLINE"
         order.payment_status = PaymentStatus.PAID
         order.payment_id = f"DEMO_{order.id}"
         db.commit()
+        _release_for_production(db, order.id)
         return {"status": "demo_paid", "message": "Demo mode — payment simulated as paid"}
 
     txnid = f"CO{order.id}-{secrets.token_hex(4)}"
@@ -141,7 +198,18 @@ def create_payment_order(
 
 @router.post("/payu-callback")
 async def payu_callback(request: Request, db: Session = Depends(get_db)):
-    """PayU posts the payment result here (browser navigation). Verify + redirect to the app."""
+    """
+    PayU posts the payment result here (browser navigation).
+
+    Everything about this request is attacker-controlled, so each of these is
+    checked before a rupee is considered received:
+      * PayU must be configured at all (an empty salt makes the hash forgeable
+        by anyone, since they would know every input);
+      * the reverse hash must match, compared constant-time;
+      * the transaction id must be the one WE issued for this order;
+      * the amount must equal what the order actually costs;
+      * an order already settled is left alone, so repeated callbacks are safe.
+    """
     form = await request.form()
     d = {k: str(v) for k, v in form.items()}
     status = d.get("status", "")
@@ -149,23 +217,65 @@ async def payu_callback(request: Request, db: Session = Depends(get_db)):
     order_id = _order_id_from_txnid(txnid)
     front = _frontend_base()
 
-    # Reverse hash: salt|status|udf10..1|email|firstname|productinfo|amount|txnid|key (udf empty)
+    def _fail(reason: str, **extra):
+        logger.warning("[PAYU] Callback rejected (%s) txnid=%s %s", reason, txnid, extra or "")
+        return RedirectResponse(url=f"{front}/checkout?payment=failed", status_code=303)
+
+    # Without a salt the reverse hash proves nothing: an attacker knows every
+    # input and can compute it themselves.
+    if not settings.PAYU_KEY or not settings.PAYU_SALT:
+        logger.error("[PAYU] Callback received while PayU is unconfigured — refusing to settle")
+        return _fail("payu not configured")
+
+    if not order_id:
+        return _fail("unparseable txnid")
+
     expected = _sha512(
         settings.PAYU_SALT, status,
         "", "", "", "", "", "", "", "", "", "",
         d.get("email", ""), d.get("firstname", ""), d.get("productinfo", ""),
         d.get("amount", ""), txnid, settings.PAYU_KEY,
     )
+    if not hmac.compare_digest(d.get("hash", ""), expected):
+        return _fail("bad hash", order_id=order_id)
 
-    if order_id and status == "success" and d.get("hash", "") == expected:
-        order = db.query(Order).filter(Order.id == order_id).first()
-        if order:
-            order.payment_status = PaymentStatus.PAID
-            db.commit()
+    if status != "success":
+        return _fail(f"status={status}", order_id=order_id)
+
+    # Lock the row: PayU can deliver the same callback more than once, and the
+    # customer may also be refreshing the return page.
+    order = _lock_order(db, order_id)
+    if not order:
+        return _fail("unknown order", order_id=order_id)
+
+    # Already settled — treat a repeat as success without touching anything.
+    if order.payment_status == PaymentStatus.PAID:
+        logger.info("[PAYU] Duplicate callback for already-paid order %s ignored", order_id)
         return RedirectResponse(url=f"{front}/orders?success={order_id}", status_code=303)
 
-    logger.warning(f"[PAYU] Payment not confirmed (status={status}, txnid={txnid})")
-    return RedirectResponse(url=f"{front}/checkout?payment=failed", status_code=303)
+    # The txnid must be the one this service issued for this order.
+    if not order.payment_id or not hmac.compare_digest(order.payment_id, txnid):
+        db.rollback()
+        return _fail("txnid does not match the order", order_id=order_id,
+                     expected=order.payment_id)
+
+    # And the amount must be what the order actually costs.
+    try:
+        paid = round(float(d.get("amount", "0")), 2)
+    except ValueError:
+        db.rollback()
+        return _fail("unparseable amount", order_id=order_id)
+    owed = round(float(order.total_price or 0), 2)
+    if paid != owed:
+        db.rollback()
+        return _fail("amount mismatch", order_id=order_id, paid=paid, owed=owed)
+
+    order.payment_status = PaymentStatus.PAID
+    db.commit()
+    logger.info("[PAYU] Order %s settled for %.2f (txnid %s)", order_id, paid, txnid)
+
+    _release_for_production(db, order_id)
+    return RedirectResponse(url=f"{front}/orders?success={order_id}", status_code=303)
 
 
 @router.get("/status/{order_id}")

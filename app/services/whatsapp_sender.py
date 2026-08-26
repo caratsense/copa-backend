@@ -20,10 +20,17 @@ def _send(payload: dict) -> dict | None:
         logger.info(f"[WA DISABLED] Would send to {payload.get('to', '?')}: {str(payload)[:200]}")
         return None
     if not settings.WHATSAPP_PHONE_ID or not settings.WHATSAPP_TOKEN:
-        logger.error(f"[WA] Missing PHONE_ID or TOKEN. PHONE_ID={settings.WHATSAPP_PHONE_ID[:5] if settings.WHATSAPP_PHONE_ID else 'EMPTY'}")
+        # Log the exact environment variable names. Abbreviating these to
+        # "PHONE_ID"/"TOKEN" once sent someone hunting for variables that do
+        # not exist; what the app reads is WHATSAPP_PHONE_ID / WHATSAPP_TOKEN.
+        logger.error(
+            "[WA] Not configured: WHATSAPP_PHONE_ID %s, WHATSAPP_TOKEN %s",
+            "set" if settings.WHATSAPP_PHONE_ID else "MISSING",
+            "set" if settings.WHATSAPP_TOKEN else "MISSING",
+        )
         return None
     try:
-        url = f"https://graph.facebook.com/v21.0/{settings.WHATSAPP_PHONE_ID}/messages"
+        url = f"https://graph.facebook.com/{settings.WHATSAPP_API_VERSION}/{settings.WHATSAPP_PHONE_ID}/messages"
         headers = {
             "Authorization": f"Bearer {settings.WHATSAPP_TOKEN}",
             "Content-Type": "application/json",
@@ -40,9 +47,14 @@ def _send(payload: dict) -> dict | None:
         return None
 
 
+def _normalise(to: str) -> str:
+    """Meta wants digits only, no plus, no separators."""
+    return (to or "").replace("+", "").replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+
+
 def send_text(to: str, text: str) -> dict | None:
     """Send a free-form text message (only works within 24hr reply window)."""
-    to = to.replace("+", "").replace(" ", "").replace("-", "")
+    to = _normalise(to)
     return _send({
         "messaging_product": "whatsapp",
         "to": to,
@@ -53,7 +65,7 @@ def send_text(to: str, text: str) -> dict | None:
 
 def send_template(to: str, template_name: str, params: list[str]) -> dict | None:
     """Send a pre-approved template message (works anytime, no 24hr restriction)."""
-    to = to.replace("+", "").replace(" ", "").replace("-", "")
+    to = _normalise(to)
     components = []
     if params:
         components.append({
@@ -68,6 +80,32 @@ def send_template(to: str, template_name: str, params: list[str]) -> dict | None
             "name": template_name,
             # Must match the language the template was approved under.
             "language": {"code": settings.WHATSAPP_TEMPLATE_LANG},
+            "components": components,
+        },
+    })
+
+
+def send_template_raw(to: str, template_name: str, language: str, params: list) -> dict | None:
+    """
+    Send a template by its exact Meta name and language.
+
+    Used by the outbox so a retry replays precisely what was recorded, rather
+    than re-resolving the registry (which may have been reconfigured since).
+    """
+    to = _normalise(to)
+    components = []
+    if params:
+        components.append({
+            "type": "body",
+            "parameters": [{"type": "text", "text": str(p)} for p in params],
+        })
+    return _send({
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {"code": language},
             "components": components,
         },
     })
