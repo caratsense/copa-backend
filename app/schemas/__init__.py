@@ -77,6 +77,12 @@ class StaffCreate(BaseModel):
     email: Optional[str] = None
     role: str     # "baker" | "rider"
 
+class StaffUpdate(BaseModel):
+    """Correct a staff member's details. Every field optional — send only what changes."""
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+
 class StaffRead(BaseModel):
     id: int
     name: str
@@ -228,6 +234,19 @@ class CouponCreate(BaseModel):
     max_uses: Optional[int] = None
     expires_at: Optional[datetime] = None
 
+class CouponUpdate(BaseModel):
+    """Correct a coupon in place. Every field optional - send only what changes.
+
+    `code` and `used_count` are deliberately absent: the code is what customers
+    have already been given, and the redemption count is a fact, not a setting.
+    """
+    discount_type: Optional[str] = None
+    discount_value: Optional[float] = None
+    min_order_value: Optional[float] = None
+    max_discount: Optional[float] = None
+    max_uses: Optional[int] = None
+    expires_at: Optional[datetime] = None
+
 class CouponRead(BaseModel):
     id: int
     code: str
@@ -373,6 +392,11 @@ class OrderRead(BaseModel):
 
 class StatusUpdate(BaseModel):
     status: str
+    # Sending a cake back to the baker at quality check. Drives the
+    # order_rework WhatsApp template, which distinguishes "redo this" from the
+    # baker simply starting work. Only the WhatsApp REJECT command could reach
+    # this flag, so rejecting from the web admin told the baker nothing at all.
+    rework: bool = False
 
 class PaymentUpdate(BaseModel):
     payment_status: str   # "PAID" | "REFUNDED"
@@ -476,9 +500,21 @@ class FleetSnapshot(BaseModel):
 
 class DashboardStats(BaseModel):
     today_orders: int
+    # Money actually collected: COD counts on delivery, ONLINE only once PAID.
     today_revenue: float
+    # Placed but not yet collected - abandoned checkouts live here. Kept
+    # separate because folding it into revenue made every abandoned PayU
+    # session look like a sale.
+    today_unpaid: float = 0.0
     pending_orders: int
     in_production_orders: int
+    # Cakes the baker has finished that are waiting for the admin to approve
+    # and pack. This is the owner's own action queue and it belonged to no
+    # bucket at all, so the one thing needing her attention was invisible.
+    awaiting_approval_orders: int = 0
+    # Addons whose finite stock is nearly gone. When stock hits 0 the item
+    # silently vanishes from the customer builder with no warning to anyone.
+    low_stock_addons: int = 0
     out_for_delivery_orders: int
     delivered_today: int
     cancelled_today: int

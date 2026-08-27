@@ -17,7 +17,8 @@ from app.db import get_db
 from app.models.user import User, UserRole
 from app.models.order import Order, OrderStatus
 from app.core.auth import require_admin, hash_password
-from app.schemas import StaffCreate, StaffRead, DutyToggle, OrderRead
+from app.core.phone import normalize_phone
+from app.schemas import StaffCreate, StaffRead, StaffUpdate, DutyToggle, OrderRead
 from app.services.assignment_engine import admin_assign_baker
 
 router = APIRouter(prefix="/admin/staff", tags=["Admin — Staff Management"])
@@ -36,7 +37,12 @@ def create_staff(
     if data.role not in ("baker", "rider"):
         raise HTTPException(status_code=400, detail="Role must be 'baker' or 'rider'")
 
-    existing = db.query(User).filter(User.phone == data.phone).first()
+    # The phone is the login identifier and the WhatsApp address. Validating it
+    # here stops an unusable account being created — a browser autofilling an
+    # email into the phone box produced staff who could never sign in.
+    phone = normalize_phone(data.phone)
+
+    existing = db.query(User).filter(User.phone == phone).first()
     if existing:
         raise HTTPException(status_code=409, detail="Phone number already registered")
 
@@ -48,7 +54,7 @@ def create_staff(
 
     user = User(
         name=data.name,
-        phone=data.phone,
+        phone=phone,
         email=data.email,
         password_hash=hash_password(data.password),
         role=UserRole(data.role),
@@ -87,6 +93,49 @@ def get_staff(staff_id: int, admin: User = Depends(require_admin), db: Session =
     ).first()
     if not user:
         raise HTTPException(status_code=404, detail="Staff member not found")
+    return _staff_with_count(db, user)
+
+
+@router.patch("/{staff_id}", response_model=StaffRead)
+def update_staff(
+    staff_id: int,
+    data: StaffUpdate,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Correct a staff member's name, phone or email.
+
+    Needed because the phone number is the login identifier: before this there
+    was no endpoint that could change one, so a single typo (or an autofilled
+    email) created an account nobody could ever sign into and no admin could
+    repair without direct database access.
+    """
+    user = db.query(User).filter(
+        User.id == staff_id,
+        User.role.in_([UserRole.BAKER, UserRole.RIDER]),
+    ).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Staff member not found")
+
+    if data.phone is not None:
+        phone = normalize_phone(data.phone)
+        clash = db.query(User).filter(User.phone == phone, User.id != staff_id).first()
+        if clash:
+            raise HTTPException(status_code=409, detail="Phone number already registered")
+        user.phone = phone
+
+    if data.name is not None:
+        name = data.name.strip()
+        if not name:
+            raise HTTPException(status_code=422, detail="Name cannot be blank")
+        user.name = name
+
+    if data.email is not None:
+        user.email = data.email.strip() or None
+
+    db.commit()
+    db.refresh(user)
     return _staff_with_count(db, user)
 
 

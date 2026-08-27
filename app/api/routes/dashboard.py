@@ -10,7 +10,7 @@ Admin Dashboard Routes
 from datetime import datetime, timedelta, timezone, date
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import func, cast, Date
+from sqlalchemy import func, cast, Date, or_
 
 from app.db import get_db
 from app.models.user import User
@@ -30,9 +30,24 @@ def get_stats(admin: User = Depends(require_admin), db: Session = Depends(get_db
 
     today_orders = db.query(func.count(Order.id)).filter(Order.created_at >= today_start).scalar() or 0
 
+    # Revenue means money we can actually count on. An ONLINE order sitting at
+    # PENDING is an abandoned checkout, not a sale; including it inflated the
+    # figure every time someone bailed at the payment page.
+    _collected = or_(
+        Order.payment_status == PaymentStatus.PAID,
+        func.upper(func.coalesce(Order.payment_method, "ONLINE")) == "COD",
+    )
+
     today_revenue = db.query(func.coalesce(func.sum(Order.total_price), 0.0)).filter(
         Order.created_at >= today_start,
         Order.status != OrderStatus.CANCELLED,
+        _collected,
+    ).scalar()
+
+    today_unpaid = db.query(func.coalesce(func.sum(Order.total_price), 0.0)).filter(
+        Order.created_at >= today_start,
+        Order.status != OrderStatus.CANCELLED,
+        ~_collected,
     ).scalar()
 
     pending = db.query(func.count(Order.id)).filter(
@@ -41,6 +56,18 @@ def get_stats(admin: User = Depends(require_admin), db: Session = Depends(get_db
 
     in_production = db.query(func.count(Order.id)).filter(
         Order.status.in_([OrderStatus.ASSIGNED, OrderStatus.IN_PRODUCTION, OrderStatus.QC, OrderStatus.PACKAGED])
+    ).scalar() or 0
+
+    awaiting_approval = db.query(func.count(Order.id)).filter(
+        Order.status == OrderStatus.AWAITING_APPROVAL
+    ).scalar() or 0
+
+    # stock is nullable: NULL means "unlimited", so only finite rows count.
+    from app.models.pricing import AddonRule
+    low_stock = db.query(func.count(AddonRule.id)).filter(
+        AddonRule.is_active == True,
+        AddonRule.stock.isnot(None),
+        AddonRule.stock <= 3,
     ).scalar() or 0
 
     out_for_delivery = db.query(func.count(Order.id)).filter(
@@ -62,8 +89,11 @@ def get_stats(admin: User = Depends(require_admin), db: Session = Depends(get_db
     return DashboardStats(
         today_orders=today_orders,
         today_revenue=round(today_revenue, 2),
+        today_unpaid=round(today_unpaid, 2),
         pending_orders=pending,
         in_production_orders=in_production,
+        awaiting_approval_orders=awaiting_approval,
+        low_stock_addons=low_stock,
         out_for_delivery_orders=out_for_delivery,
         delivered_today=delivered_today,
         cancelled_today=cancelled_today,
@@ -91,6 +121,11 @@ def get_revenue_report(
         .filter(
             Order.created_at >= since,
             Order.status != OrderStatus.CANCELLED,
+            # Same rule as the dashboard tile: only money we actually collected.
+            or_(
+                Order.payment_status == PaymentStatus.PAID,
+                func.upper(func.coalesce(Order.payment_method, "ONLINE")) == "COD",
+            ),
         )
         .group_by(cast(Order.created_at, Date))
         .order_by(cast(Order.created_at, Date))

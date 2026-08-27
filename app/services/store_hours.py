@@ -37,13 +37,44 @@ IST_OFFSET = timedelta(hours=5, minutes=30)
 IST = timezone(IST_OFFSET)
 
 
+def to_ist(dt):
+    """
+    Render a stored timestamp in the timezone the bakery actually works in.
+
+    delivery_time is a timezone-aware column, so Postgres returns it in UTC.
+    Formatting that directly shows the wrong clock time to everyone reading it
+    - a 4:00 PM slot appears as 10:30 AM. Naive values are assumed to already
+    be IST, which is what the API accepts from the checkout form.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=IST)
+    return dt.astimezone(IST)
+
+
+# The admin settings page wrote store_open_time / store_close_time while this
+# module only ever read store_hours_open / store_hours_close, so changing the
+# opening hours in the admin panel silently did nothing at all. The canonical
+# keys are the store_hours_* pair; the older names are still read as a fallback
+# so a deployment that had set them does not lose the value.
+OPEN_KEYS = ("store_hours_open", "store_open_time")
+CLOSE_KEYS = ("store_hours_close", "store_close_time")
+
+
+def _setting(db: Session, keys: tuple[str, ...]) -> str | None:
+    """First non-empty value among `keys`, in priority order."""
+    for key in keys:
+        row = db.query(SiteSettings).filter(SiteSettings.key == key).first()
+        if row and (row.value or "").strip():
+            return row.value.strip()
+    return None
+
+
 def _get_hours(db: Session) -> tuple[time, time]:
     """Get store open/close times from site settings or defaults."""
-    open_setting = db.query(SiteSettings).filter(SiteSettings.key == "store_hours_open").first()
-    close_setting = db.query(SiteSettings).filter(SiteSettings.key == "store_hours_close").first()
-
-    open_str = open_setting.value if open_setting else DEFAULT_OPEN
-    close_str = close_setting.value if close_setting else DEFAULT_CLOSE
+    open_str = _setting(db, OPEN_KEYS) or DEFAULT_OPEN
+    close_str = _setting(db, CLOSE_KEYS) or DEFAULT_CLOSE
 
     try:
         open_time = time.fromisoformat(open_str)
@@ -56,6 +87,23 @@ def _get_hours(db: Session) -> tuple[time, time]:
         close_time = time(22, 0)
 
     return open_time, close_time
+
+
+def _within_hours(current, open_time, close_time) -> bool:
+    """
+    Is `current` inside the trading window?
+
+    Handles a window that wraps past midnight. A plain
+    `open <= t <= close` is FALSE at every hour of the day when the closing
+    time sorts before the opening time - entering 08:00 to 05:00 (meaning
+    5 PM, or a genuine overnight shift) silently marked the store closed
+    around the clock, which stopped every order from being auto-assigned to
+    a baker.
+    """
+    if open_time <= close_time:
+        return open_time <= current <= close_time
+    # Wraps midnight: open until close the following morning.
+    return current >= open_time or current <= close_time
 
 
 def is_store_open(db: Session) -> dict:
@@ -78,7 +126,7 @@ def is_store_open(db: Session) -> dict:
             "message": "Store is currently closed by admin.",
         }
 
-    is_open = open_time <= current_time <= close_time
+    is_open = _within_hours(current_time, open_time, close_time)
 
     if is_open:
         message = f"We're open! Orders are being processed. Closes at {close_time.strftime('%I:%M %p')}."
@@ -104,7 +152,7 @@ def get_next_available_time(db: Session) -> datetime:
     current_time = now_ist.time()
     open_time, close_time = _get_hours(db)
 
-    if open_time <= current_time <= close_time:
+    if _within_hours(current_time, open_time, close_time):
         return now_ist
     elif current_time < open_time:
         # Before opening today — schedule for today's opening
@@ -130,7 +178,7 @@ def schedule_order_delivery(db: Session, requested_delivery_time: datetime | Non
     now_ist = datetime.now(IST)
     open_time, close_time = _get_hours(db)
     current_time = now_ist.time()
-    is_open = open_time <= current_time <= close_time
+    is_open = _within_hours(current_time, open_time, close_time)
 
     # Customer requested a specific future time
     if requested_delivery_time:

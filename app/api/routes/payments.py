@@ -94,6 +94,28 @@ def _lock_order(db: Session, order_id: int) -> Order | None:
         return q.first()
 
 
+def _confirm_to_customer_and_admin(db: Session, order_id: int) -> None:
+    """
+    Announce the order now that it is genuinely paid.
+
+    create_order deliberately stays silent for an unpaid ONLINE order, so this
+    is the point at which "Order received" becomes true. Previously the message
+    went out the moment the order row was written — before the customer had even
+    reached PayU — so abandoning checkout still told the customer their order
+    was placed and told the bakery it had a new sale.
+    """
+    from app.models.order import OrderStatus
+    from app.services.wa_notifications import dispatch_notifications
+
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        return
+    try:
+        dispatch_notifications(db, order, OrderStatus.CONFIRMED.value)
+    except Exception as e:                       # noqa: BLE001 — never break settlement
+        logger.error("[PAYU] Confirmation dispatch failed for order %s: %s", order_id, e)
+
+
 def _release_for_production(db: Session, order_id: int) -> None:
     """
     Hand a now-payable order to a baker.
@@ -219,7 +241,13 @@ async def payu_callback(request: Request, db: Session = Depends(get_db)):
 
     def _fail(reason: str, **extra):
         logger.warning("[PAYU] Callback rejected (%s) txnid=%s %s", reason, txnid, extra or "")
-        return RedirectResponse(url=f"{front}/checkout?payment=failed", status_code=303)
+        # Send them to the order, not back to an empty checkout: the order
+        # exists and is payable, so the useful thing is a Retry button next to
+        # it. `payment=failed` used to land on /checkout with no explanation at
+        # all, which is why a cancelled payment looked like nothing happened.
+        target = (f"{front}/orders?order_id={order_id}&payment=failed"
+                  if order_id else f"{front}/orders?payment=failed")
+        return RedirectResponse(url=target, status_code=303)
 
     # Without a salt the reverse hash proves nothing: an attacker knows every
     # input and can compute it themselves.
@@ -274,6 +302,9 @@ async def payu_callback(request: Request, db: Session = Depends(get_db)):
     db.commit()
     logger.info("[PAYU] Order %s settled for %.2f (txnid %s)", order_id, paid, txnid)
 
+    # Order of these two matters: the confirmation reads the order at CONFIRMED,
+    # while assignment moves it to ASSIGNED and sends the baker their own copy.
+    _confirm_to_customer_and_admin(db, order_id)
     _release_for_production(db, order_id)
     return RedirectResponse(url=f"{front}/orders?success={order_id}", status_code=303)
 

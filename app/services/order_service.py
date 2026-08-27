@@ -220,16 +220,25 @@ def create_order(db: Session, data: OrderCreate) -> Order:
     # so dispatch_notifications never ran for a new order: no customer
     # confirmation and no admin new-order alert for anything placed on the web.
     #
+    # Only for an order that is actually going ahead. An ONLINE order at this
+    # point has not been paid — the customer has not even reached PayU yet —
+    # and announcing "Order received" to them and to the admin for a checkout
+    # that is then abandoned is worse than saying nothing: the customer thinks
+    # they have bought a cake and the bakery thinks it has sold one. The
+    # confirmation is sent from the payment callback instead, once the money is
+    # actually in (see payments._release_for_production).
+    #
     # Sent BEFORE auto-assignment on purpose. Assignment now transitions the
     # order to ASSIGNED through the service, which fires its own notification;
     # dispatching afterwards would read the new status and send the baker a
     # second copy.
-    try:
-        from app.services.wa_notifications import dispatch_notifications
-        dispatch_notifications(db, order, OrderStatus.CONFIRMED.value)
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).error(f"[WA] Confirmation dispatch failed for order {order.id}: {e}")
+    if is_payable(order):
+        try:
+            from app.services.wa_notifications import dispatch_notifications
+            dispatch_notifications(db, order, OrderStatus.CONFIRMED.value)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"[WA] Confirmation dispatch failed for order {order.id}: {e}")
 
     # ── Auto-assign baker if store is open AND the order is payable ──
     # Off-hours orders stay in CONFIRMED queue — the scheduler assigns them at
@@ -297,6 +306,14 @@ def update_order_status(db: Session, order_id: int, data: StatusUpdate, rework: 
 
     old_status = current.value
     order.status = new_status
+
+    # Give the add-ons back. create_order reserves finite stock by decrementing
+    # it, and nothing ever put it back: every cancelled order permanently ate
+    # its toppers. When stock reaches 0 the public list route filters the addon
+    # out of the customer builder entirely, so it silently disappears from the
+    # menu with no warning to anyone.
+    if new_status == OrderStatus.CANCELLED:
+        _restore_addon_stock(db, order)
 
     emit_event(db, order.id, "STATUS_CHANGED", {
         "from": old_status,
@@ -440,6 +457,29 @@ def _begin_delivery_tracking(db: Session, order: Order):
     except Exception as e:
         import logging
         logging.getLogger(__name__).error(f"[Tracking] start failed for order {order.id}: {e}")
+
+
+def _restore_addon_stock(db: Session, order: Order) -> None:
+    """
+    Return the finite add-on units an order was holding.
+
+    Only touches rules with a finite stock (NULL means unlimited), and never
+    raises: releasing inventory must not be able to block a cancellation.
+    """
+    from app.models.pricing import AddonRule
+
+    try:
+        for item in order.items or []:
+            names = (item.customization or {}).get("addons") or []
+            for name in names:
+                addon = db.query(AddonRule).filter(AddonRule.name == name).first()
+                if addon is not None and addon.stock is not None:
+                    addon.stock = addon.stock + (item.quantity or 1)
+    except Exception as e:                       # noqa: BLE001 — best effort
+        import logging
+        logging.getLogger(__name__).error(
+            "[STOCK] Could not restore add-ons for cancelled order %s: %s", order.id, e
+        )
 
 
 def _end_delivery_tracking(order: Order):

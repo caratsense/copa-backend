@@ -61,8 +61,8 @@ def get(order_id: int, admin: User = Depends(require_admin), db: Session = Depen
 
 @router.patch("/{order_id}/status", response_model=OrderRead)
 def update_status(order_id: int, data: StatusUpdate, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
-    """Update order status — enforces lifecycle. Auto-assigns baker on CONFIRMED."""
-    return update_order_status(db, order_id, data)
+    """Update order status - enforces lifecycle. Auto-assigns baker on CONFIRMED."""
+    return update_order_status(db, order_id, data, rework=data.rework)
 
 
 @router.patch("/{order_id}/payment", response_model=OrderRead)

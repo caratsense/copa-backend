@@ -30,6 +30,7 @@ from app.services.gemini_parser import transcribe_voice, get_audio_url
 from app.services import wa_commands
 from app.services.wa_customer_flow import handle_customer_message
 from app.services.wa_consent import is_opt_out_request, record_opt_in, record_opt_out
+from app.services.store_hours import to_ist
 from app.config import get_settings
 settings = get_settings()
 
@@ -477,7 +478,7 @@ def _handle_baker(db, user, command):
                 for i in o.items
             ) if o.items else "Cake"
             state = "Waiting" if o.status == OrderStatus.ASSIGNED else "In production"
-            dt = o.delivery_time.strftime("%I:%M %p") if o.delivery_time else "ASAP"
+            dt = to_ist(o.delivery_time).strftime("%I:%M %p") if o.delivery_time else "ASAP"
             lines.append(f"#{o.id} - {items}\nStatus: {state} | By {dt}\n")
         return "\n".join(lines)
 

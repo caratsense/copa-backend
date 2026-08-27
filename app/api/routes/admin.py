@@ -8,7 +8,7 @@ List (GET) is open to everyone so the pricing engine and frontend can read rules
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel as PydanticBaseModel
-from sqlalchemy import or_
+from sqlalchemy import or_, func
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -46,6 +46,9 @@ def _build_crud(prefix: str, model, create_schema, read_schema):
 
     @router.get(f"/{prefix}", response_model=list[read_schema], name=f"list_{prefix}")
     def list_all(active_only: bool = True, db: Session = Depends(get_db)):
+        # active_only defaults True because the customer-facing builder calls
+        # this; an admin screen passes active_only=false to manage the full set,
+        # including rules that are currently switched off or out of stock.
         q = db.query(model)
         if active_only:
             q = q.filter(model.is_active == True)
@@ -53,6 +56,31 @@ def _build_crud(prefix: str, model, create_schema, read_schema):
                 from sqlalchemy import or_
                 q = q.filter(or_(model.stock.is_(None), model.stock > 0))
         return q.all()
+
+    @router.patch(
+        f"/{prefix}/{{item_id}}", response_model=read_schema, name=f"update_{prefix}",
+    )
+    def update(
+        item_id: int,
+        data: create_schema,
+        admin: User = Depends(require_admin),
+        db: Session = Depends(get_db),
+    ):
+        """
+        Edit a rule in place.
+
+        There was no update endpoint at all, so correcting a price meant
+        deleting the rule and creating a new one - which changes its id and
+        loses it from the catalogue while orders are mid-flight.
+        """
+        obj = db.query(model).filter(model.id == item_id).first()
+        if not obj:
+            raise HTTPException(status_code=404, detail=f"{prefix} rule not found")
+        for field, value in data.model_dump(exclude_unset=True).items():
+            setattr(obj, field, value)
+        db.commit()
+        db.refresh(obj)
+        return obj
 
     @router.patch(
         f"/{prefix}/{{item_id}}/toggle", response_model=read_schema, name=f"toggle_{prefix}",
@@ -73,6 +101,26 @@ def _build_crud(prefix: str, model, create_schema, read_schema):
         obj = db.query(model).filter(model.id == item_id).first()
         if not obj:
             raise HTTPException(status_code=404, detail=f"{prefix} rule not found")
+
+        # Order.delivery_zone_id is a real foreign key with no ON DELETE rule,
+        # so removing a zone any order ever used raises an IntegrityError and
+        # surfaces as a 500. Refuse with something the admin can act on, and
+        # point them at the toggle, which is what they almost always meant.
+        if model is DeliveryZone:
+            in_use = db.query(func.count(Order.id)).filter(
+                Order.delivery_zone_id == item_id
+            ).scalar() or 0
+            if in_use:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"'{obj.area_name}' is used by {in_use} "
+                        f"order{'s' if in_use != 1 else ''} and cannot be deleted. "
+                        "Pause it instead - customers stop seeing it at checkout "
+                        "and the order history stays intact."
+                    ),
+                )
+
         db.delete(obj)
         db.commit()
 

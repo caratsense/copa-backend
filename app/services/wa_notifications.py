@@ -24,6 +24,7 @@ from app.models.user import User, UserRole
 from app.services import wa_outbox
 from app.services.order_service import _enrich_order
 from app.services.wa_consent import may_message
+from app.services.store_hours import to_ist
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -50,10 +51,17 @@ def _items_str(order: Order) -> str:
 
 
 def _delivery_str(order: Order) -> str:
-    """Build delivery time string."""
-    if order.delivery_time:
-        return order.delivery_time.strftime("%d %b, %I:%M %p")
-    return "ASAP"
+    """
+    Delivery time, rendered in IST.
+
+    delivery_time is a timezone-aware column and Postgres hands it back in UTC,
+    so formatting it directly printed the wrong clock time: a 4:00 PM IST slot
+    came out as "10:30 AM" (16:00 minus the 5:30 offset) in the message the
+    customer actually reads.
+    """
+    if not order.delivery_time:
+        return "ASAP"
+    return to_ist(order.delivery_time).strftime("%d %b, %I:%M %p")
 
 
 def _maps_link(address: str) -> str:
