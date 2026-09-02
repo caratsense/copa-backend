@@ -392,6 +392,9 @@ class OrderRead(BaseModel):
 
 class StatusUpdate(BaseModel):
     status: str
+    # Why, for transitions where "what happened" is the useful part - a failed
+    # delivery above all. Recorded on the order's event timeline.
+    reason: Optional[str] = None
     # Sending a cake back to the baker at quality check. Drives the
     # order_rework WhatsApp template, which distinguishes "redo this" from the
     # baker simply starting work. Only the WhatsApp REJECT command could reach
@@ -500,7 +503,7 @@ class FleetSnapshot(BaseModel):
 
 class DashboardStats(BaseModel):
     today_orders: int
-    # Money actually collected: COD counts on delivery, ONLINE only once PAID.
+    # Money actually collected, i.e. payment_status is PAID.
     today_revenue: float
     # Placed but not yet collected - abandoned checkouts live here. Kept
     # separate because folding it into revenue made every abandoned PayU
@@ -512,6 +515,9 @@ class DashboardStats(BaseModel):
     # and pack. This is the owner's own action queue and it belonged to no
     # bucket at all, so the one thing needing her attention was invisible.
     awaiting_approval_orders: int = 0
+    # Deliveries that were attempted and did not go through. Nobody is carrying
+    # these and the customer has not been told anything, so they need a decision.
+    delivery_failed_orders: int = 0
     # Addons whose finite stock is nearly gone. When stock hits 0 the item
     # silently vanishes from the customer builder with no warning to anyone.
     low_stock_addons: int = 0

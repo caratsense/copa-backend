@@ -69,6 +69,29 @@ def fake_redis(monkeypatch):
     server = fakeredis.FakeServer()
     client = fakeredis.FakeStrictRedis(server=server, decode_responses=True)
     monkeypatch.setattr(delivery_tracking, "_client", client)
+
+    # The webhook keeps its own store for WhatsApp message de-duplication. Left
+    # unpatched it reaches a real Redis, where the keys outlive the test run:
+    # every test that reuses a wamid is then skipped as a duplicate and its
+    # order silently never moves. Give each test a fresh fake instead.
+    from app.api.routes import webhook as webhook_routes
+    monkeypatch.setattr(
+        webhook_routes, "_dedupe_client",
+        fakeredis.FakeStrictRedis(server=fakeredis.FakeServer(), decode_responses=True),
+    )
+
+    # The customer conversation flow keeps a third store: `wa:{phone}` state
+    # with a one-hour TTL, plus `wa:pending_signup:{phone}`. Against a live
+    # Redis a customer left mid-order stays mid-order for the next test, and
+    # for the next run. Its in-process fallback leaks the same way, because it
+    # is a module-level dict that nothing resets.
+    from app.services import wa_customer_flow
+    monkeypatch.setattr(
+        wa_customer_flow, "_client",
+        fakeredis.FakeStrictRedis(server=fakeredis.FakeServer(), decode_responses=True),
+    )
+    monkeypatch.setattr(wa_customer_flow, "_memory", {})
+
     yield client
 
 

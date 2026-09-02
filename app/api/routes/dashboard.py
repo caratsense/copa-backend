@@ -33,10 +33,10 @@ def get_stats(admin: User = Depends(require_admin), db: Session = Depends(get_db
     # Revenue means money we can actually count on. An ONLINE order sitting at
     # PENDING is an abandoned checkout, not a sale; including it inflated the
     # figure every time someone bailed at the payment page.
-    _collected = or_(
-        Order.payment_status == PaymentStatus.PAID,
-        func.upper(func.coalesce(Order.payment_method, "ONLINE")) == "COD",
-    )
+    # Collected means paid. The COD clause that used to sit here counted
+    # cash-on-delivery orders as revenue the moment they were placed; with COD
+    # withdrawn, a legacy COD order only counts once someone marked it paid.
+    _collected = Order.payment_status == PaymentStatus.PAID
 
     today_revenue = db.query(func.coalesce(func.sum(Order.total_price), 0.0)).filter(
         Order.created_at >= today_start,
@@ -60,6 +60,10 @@ def get_stats(admin: User = Depends(require_admin), db: Session = Depends(get_db
 
     awaiting_approval = db.query(func.count(Order.id)).filter(
         Order.status == OrderStatus.AWAITING_APPROVAL
+    ).scalar() or 0
+
+    delivery_failed = db.query(func.count(Order.id)).filter(
+        Order.status == OrderStatus.DELIVERY_FAILED
     ).scalar() or 0
 
     # stock is nullable: NULL means "unlimited", so only finite rows count.
@@ -93,6 +97,7 @@ def get_stats(admin: User = Depends(require_admin), db: Session = Depends(get_db
         pending_orders=pending,
         in_production_orders=in_production,
         awaiting_approval_orders=awaiting_approval,
+        delivery_failed_orders=delivery_failed,
         low_stock_addons=low_stock,
         out_for_delivery_orders=out_for_delivery,
         delivered_today=delivered_today,
@@ -121,11 +126,8 @@ def get_revenue_report(
         .filter(
             Order.created_at >= since,
             Order.status != OrderStatus.CANCELLED,
-            # Same rule as the dashboard tile: only money we actually collected.
-            or_(
-                Order.payment_status == PaymentStatus.PAID,
-                func.upper(func.coalesce(Order.payment_method, "ONLINE")) == "COD",
-            ),
+            # Same rule as the dashboard tile: only money actually collected.
+            Order.payment_status == PaymentStatus.PAID,
         )
         .group_by(cast(Order.created_at, Date))
         .order_by(cast(Order.created_at, Date))

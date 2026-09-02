@@ -3,6 +3,7 @@ Order Routes — complete with auth, payments, tracking, rider self-service.
 """
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -100,7 +101,13 @@ def rider_queue(user: User = Depends(require_role(UserRole.RIDER, UserRole.ADMIN
         db.query(Order)
         .filter(
             Order.assigned_rider_id == user.id,
-            Order.status.in_([OrderStatus.PACKAGED, OrderStatus.OUT_FOR_DELIVERY])
+            Order.status.in_([
+                OrderStatus.PACKAGED,
+                OrderStatus.OUT_FOR_DELIVERY,
+                # Kept visible after a failed attempt so it does not simply
+                # disappear from the rider's queue when they report it.
+                OrderStatus.DELIVERY_FAILED,
+            ])
         )
         .order_by(Order.created_at.asc())
         .all()
@@ -146,30 +153,62 @@ def rider_delivered(order_id: int, user: User = Depends(require_role(UserRole.RI
     return update_order_status(db, order_id, StatusUpdate(status="DELIVERED"))
 
 
-@router.post("/{order_id}/collect-cod", response_model=OrderRead)
-def rider_collect_cod(order_id: int, user: User = Depends(require_role(UserRole.RIDER, UserRole.ADMIN)), db: Session = Depends(get_db)):
-    """Rider marks a COD order as paid after collecting cash on delivery."""
-    from app.services.event_service import emit_event
+class DeliveryFailure(BaseModel):
+    """Why a delivery could not be completed."""
+    reason: str = Field(min_length=1, max_length=300)
 
+
+@router.post("/{order_id}/delivery-failed", response_model=OrderRead)
+def rider_delivery_failed(
+    order_id: int,
+    data: DeliveryFailure,
+    user: User = Depends(require_role(UserRole.RIDER, UserRole.ADMIN)),
+    db: Session = Depends(get_db),
+):
+    """
+    Record a delivery that was attempted and could not be completed.
+
+    Before this existed the only way out of OUT_FOR_DELIVERY was DELIVERED, so
+    a rider who found nobody home had to mark the order delivered - which sent
+    the customer a message saying their cake had arrived. The order now moves
+    to DELIVERY_FAILED with the reason on its timeline, and no arrival message
+    is sent. It can be sent out again or cancelled from there.
+    """
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
     if order.assigned_rider_id != user.id and user.role != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Not assigned to you")
-    if (order.payment_method or "ONLINE").upper() != "COD":
-        raise HTTPException(status_code=400, detail="Only COD orders can be marked paid here")
-    if order.payment_status == PaymentStatus.PAID:
-        raise HTTPException(status_code=400, detail="Order is already paid")
+    if order.status != OrderStatus.OUT_FOR_DELIVERY:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Must be OUT_FOR_DELIVERY. Current: {order.status.value}",
+        )
 
-    old_payment = order.payment_status.value if hasattr(order.payment_status, "value") else order.payment_status
-    order.payment_status = PaymentStatus.PAID
-    emit_event(db, order.id, "PAYMENT_UPDATED", {
-        "from": old_payment,
-        "to": PaymentStatus.PAID.value,
-        "method": "COD",
-        "collected_by_rider_id": user.id,
-    })
-    db.commit()
-    db.refresh(order)
-    _enrich_order(order)
-    return order
+    return update_order_status(
+        db, order_id,
+        StatusUpdate(status="DELIVERY_FAILED", reason=data.reason),
+    )
+
+
+@router.post("/{order_id}/retry-delivery", response_model=OrderRead)
+def retry_delivery(
+    order_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Send a failed delivery back out. Tracking restarts with the transition."""
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.status != OrderStatus.DELIVERY_FAILED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only a failed delivery can be sent out again. Current: {order.status.value}",
+        )
+    if not order.assigned_rider_id:
+        raise HTTPException(status_code=400, detail="Assign a rider before sending it out again")
+
+    return update_order_status(db, order_id, StatusUpdate(status="OUT_FOR_DELIVERY"))
+
+

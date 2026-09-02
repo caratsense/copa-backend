@@ -83,15 +83,33 @@ def _verify_signature(raw_body: bytes, header: str | None) -> bool:
     return hmac.compare_digest(header[len("sha256="):], expected)
 
 
+# Redis client for message de-duplication, held at module level so tests can
+# swap it the way they already swap delivery_tracking._client. It used to be
+# constructed inline inside _already_processed, which meant the test suite could
+# not reach it: dedupe keys went to a REAL Redis and survived for their full
+# 24-hour TTL, so any test reusing a wamid was skipped as a duplicate on the
+# next run. The suite only passed while no Redis happened to be running.
+_dedupe_client = None
+
+
+def _dedupe_store():
+    """The de-duplication store. Built once, replaceable in tests."""
+    global _dedupe_client
+    if _dedupe_client is None:
+        import redis as redis_lib
+        _dedupe_client = redis_lib.from_url(
+            settings.REDIS_URL, db=2, decode_responses=True
+        )
+    return _dedupe_client
+
+
 def _already_processed(message_id: str) -> bool:
     """True if we've already handled this message id (Meta retry / duplicate)."""
     if not message_id:
         return False
     try:
-        import redis as redis_lib
-        r = redis_lib.from_url(settings.REDIS_URL, db=2, decode_responses=True)
         # SET NX returns None when the key already exists.
-        was_set = r.set(f"wa:msg:{message_id}", "1", nx=True, ex=86400)
+        was_set = _dedupe_store().set(f"wa:msg:{message_id}", "1", nx=True, ex=86400)
         return not was_set
     except Exception:
         # Redis down — better to process (and risk a rare duplicate) than to
@@ -554,14 +572,11 @@ def _handle_new_user(db, phone, text):
     from app.core.auth import hash_password
     import json, random, string
 
-    # Check if they are in the consent confirmation step (Redis/memory)
-    r = None
-    try:
-        import redis as redis_lib
-        r = redis_lib.from_url(settings.REDIS_URL, db=2, decode_responses=True)
-        r.ping()
-    except Exception:
-        r = None
+    # Check if they are in the consent confirmation step. This is the same
+    # per-phone conversation store the customer flow uses, so share its
+    # accessor rather than opening a second unpatchable connection to db 2.
+    from app.services.wa_customer_flow import _get_redis
+    r = _get_redis()
 
     pending_key = f"wa:pending_signup:{phone}"
     pending_raw = r.get(pending_key) if r else None

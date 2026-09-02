@@ -71,14 +71,14 @@ def is_payable(order: Order) -> bool:
     """
     Whether this order may consume ingredients and a baker's time.
 
-    COD is payable on delivery, so a COD order is allowed into production
-    unpaid. An ONLINE order is not: it used to be auto-assigned the moment it
-    was created, before the customer had even reached PayU, so an abandoned
-    checkout still got baked.
+    Cash on delivery has been withdrawn, so every new order must be paid for
+    before it consumes ingredients. Orders placed while COD still existed are
+    grandfathered - refusing them here would strand in-flight work that the
+    bakery has already committed to.
     """
     method = (order.payment_method or "ONLINE").upper()
     if method == "COD":
-        return True
+        return True        # legacy rows only; COD orders can no longer be created
     return order.payment_status == PaymentStatus.PAID
 
 
@@ -292,7 +292,7 @@ def update_order_status(db: Session, order_id: int, data: StatusUpdate, rework: 
             status_code=400,
             detail=(
                 f"Order #{order.id} is not paid ({order.payment_status.value}). "
-                "It cannot enter production until payment is received or it is switched to COD."
+                "It cannot enter production until payment is received."
             ),
         )
 
@@ -302,6 +302,28 @@ def update_order_status(db: Session, order_id: int, data: StatusUpdate, rework: 
             status_code=400,
             detail=f"Cannot transition from {current.value} to {new_status.value}. "
                    f"Allowed: {[s.value for s in allowed]}"
+        )
+
+    # Nothing can go out for delivery without someone carrying it. This lived
+    # only in /retry-delivery, so the fleet board enforced it and a plain status
+    # PATCH from the admin orders table did not -- and _begin_delivery_tracking
+    # falls back to `assigned_rider_id or 0`, so the bypass produced a tracked
+    # delivery belonging to a rider 0 who does not exist.
+    if new_status == OrderStatus.OUT_FOR_DELIVERY and not order.assigned_rider_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Assign a rider before sending this order out.",
+        )
+
+    # A failed delivery is only useful if it says why. The dedicated endpoint
+    # requires it, but a plain status PATCH reaches the same transition, so the
+    # rule belongs here where every caller passes rather than in one route.
+    if new_status == OrderStatus.DELIVERY_FAILED and not (
+        getattr(data, "reason", None) or ""
+    ).strip():
+        raise HTTPException(
+            status_code=422,
+            detail="Say why the delivery could not be completed.",
         )
 
     old_status = current.value
@@ -315,10 +337,11 @@ def update_order_status(db: Session, order_id: int, data: StatusUpdate, rework: 
     if new_status == OrderStatus.CANCELLED:
         _restore_addon_stock(db, order)
 
-    emit_event(db, order.id, "STATUS_CHANGED", {
-        "from": old_status,
-        "to": new_status.value,
-    })
+    event_payload = {"from": old_status, "to": new_status.value}
+    reason = (getattr(data, "reason", None) or "").strip()
+    if reason:
+        event_payload["reason"] = reason[:300]
+    emit_event(db, order.id, "STATUS_CHANGED", event_payload)
 
     db.commit()
     db.refresh(order)
@@ -349,6 +372,11 @@ def update_order_status(db: Session, order_id: int, data: StatusUpdate, rework: 
     if new_status == OrderStatus.OUT_FOR_DELIVERY:
         _begin_delivery_tracking(db, order)
     elif new_status == OrderStatus.DELIVERED:
+        _end_delivery_tracking(order)
+    elif new_status == OrderStatus.DELIVERY_FAILED:
+        # The rider is no longer carrying it, so it should not sit on the fleet
+        # map showing a live position. Sending it out again starts tracking
+        # afresh via the OUT_FOR_DELIVERY branch above.
         _end_delivery_tracking(order)
     elif new_status == OrderStatus.PACKAGED:
         # The order joins the fleet view as "assigned, not collected". It has no

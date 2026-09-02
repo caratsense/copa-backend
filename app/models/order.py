@@ -15,6 +15,12 @@ class OrderStatus(str, enum.Enum):
     PACKAGED = "PACKAGED"
     OUT_FOR_DELIVERY = "OUT_FOR_DELIVERY"
     DELIVERED = "DELIVERED"
+    # A delivery that was attempted and could not be completed - nobody home,
+    # wrong address, customer unreachable. Without it the only way to close an
+    # OUT_FOR_DELIVERY order was DELIVERED, so a failed attempt had to be
+    # recorded as a success, which told the customer their cake had arrived.
+    # Not terminal: the order goes back out, or is cancelled.
+    DELIVERY_FAILED = "DELIVERY_FAILED"
     CANCELLED = "CANCELLED"
 
 
@@ -33,8 +39,12 @@ VALID_TRANSITIONS: dict[OrderStatus, list[OrderStatus]] = {
     OrderStatus.IN_PRODUCTION: [OrderStatus.AWAITING_APPROVAL, OrderStatus.CANCELLED],
     OrderStatus.AWAITING_APPROVAL: [OrderStatus.PACKAGED, OrderStatus.IN_PRODUCTION, OrderStatus.CANCELLED],
     OrderStatus.PACKAGED: [OrderStatus.OUT_FOR_DELIVERY],
-    OrderStatus.OUT_FOR_DELIVERY: [OrderStatus.DELIVERED],
+    OrderStatus.OUT_FOR_DELIVERY: [OrderStatus.DELIVERED, OrderStatus.DELIVERY_FAILED],
     OrderStatus.DELIVERED: [],
+    # A failed attempt is recoverable: send it out again, or give up on it.
+    # Deliberately NOT straight to DELIVERED - a second attempt is a real
+    # dispatch and should be recorded as one.
+    OrderStatus.DELIVERY_FAILED: [OrderStatus.OUT_FOR_DELIVERY, OrderStatus.CANCELLED],
     OrderStatus.CANCELLED: [],
 }
 
@@ -59,7 +69,9 @@ class Order(Base):
     delivery_time = Column(DateTime(timezone=True), nullable=True)
     delivery_zone_id = Column(Integer, ForeignKey("delivery_zones.id"), nullable=True)
     payment_status = Column(Enum(PaymentStatus), default=PaymentStatus.PENDING)
-    payment_method = Column(String, default="ONLINE")  # ONLINE or COD
+    # ONLINE for everything new. "COD" survives only on rows created before
+    # cash on delivery was withdrawn; nothing can write it any more.
+    payment_method = Column(String, default="ONLINE")
     payment_id = Column(String, nullable=True)  # Cashfree transaction ID
     assigned_baker_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     assigned_rider_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)

@@ -190,6 +190,11 @@ _NON_PRODUCTION = {"development", "dev", "local", "test", "testing", "ci", "stag
 _KNOWN_WEAK_SECRETS = {
     "super-secret-jwt-key-change-in-production",
     "change-me-in-production",
+    # This project's own .env.example shipped this one, so it is the value a
+    # deployment that copied that file is most likely to be running. It is 27
+    # characters and contains none of the markers below, so it would otherwise
+    # have passed every check here.
+    "your-secret-key-change-this",
     "secret", "changeme", "change-me", "test", "dev",
 }
 _WEAK_MARKERS = ("change-in-production", "change-me-in-production", "changeme-in-production")

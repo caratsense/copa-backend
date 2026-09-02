@@ -342,3 +342,57 @@ def test_customer_cannot_pay_for_someone_elses_order(client, db, customer, other
     res = client.post("/payments/create-order", headers=auth(other_customer),
                       json={"order_id": order.id, "payment_method": "COD"})
     assert res.status_code == 403
+
+
+# ─── TWO CHECKOUT TABS ───────────────────────────────
+# A customer opening checkout twice used to lose their payment: every call to
+# /payments/create-order minted a fresh txnid and overwrote the column, so the
+# first tab's genuine, correctly signed callback no longer matched the order and
+# was refused. Money taken, order left PENDING.
+
+def test_a_second_checkout_tab_reuses_the_pending_txnid(client, db, customer, payu, catalogue):
+    order = online_order(db, customer)
+
+    first = client.post("/payments/create-order", headers=auth(customer),
+                        json={"order_id": order.id, "payment_method": "ONLINE"})
+    assert first.status_code == 200
+    txnid_1 = first.json()["params"]["txnid"]
+
+    second = client.post("/payments/create-order", headers=auth(customer),
+                         json={"order_id": order.id, "payment_method": "ONLINE"})
+    assert second.status_code == 200
+    txnid_2 = second.json()["params"]["txnid"]
+
+    assert txnid_1 == txnid_2, "a second tab minted a new txnid and orphaned the first"
+
+
+def test_paying_in_the_first_tab_still_settles_the_order(client, db, customer, payu, catalogue):
+    """The exact sequence that used to lose a real payment."""
+    order = online_order(db, customer)
+
+    opened_first = client.post("/payments/create-order", headers=auth(customer),
+                               json={"order_id": order.id, "payment_method": "ONLINE"})
+    txnid = opened_first.json()["params"]["txnid"]
+
+    # ...customer opens checkout again in another tab...
+    client.post("/payments/create-order", headers=auth(customer),
+                json={"order_id": order.id, "payment_method": "ONLINE"})
+
+    # ...then completes the payment back in the FIRST tab.
+    callback(client, order, txnid, f"{order.total_price:.2f}")
+
+    db.refresh(order)
+    assert order.payment_status == PaymentStatus.PAID, \
+        "a genuine payment from the first tab was refused"
+
+
+def test_a_foreign_txnid_still_cannot_settle_this_order(client, db, customer, payu, catalogue):
+    """The identity check must survive the reuse change."""
+    order = online_order(db, customer)
+    client.post("/payments/create-order", headers=auth(customer),
+                json={"order_id": order.id, "payment_method": "ONLINE"})
+
+    callback(client, order, f"CO{order.id}-forged", f"{order.total_price:.2f}")
+
+    db.refresh(order)
+    assert order.payment_status == PaymentStatus.PENDING

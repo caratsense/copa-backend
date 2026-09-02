@@ -10,6 +10,7 @@ from typing import Optional
 from app.db import SessionLocal
 from app.models.product import Product
 from app.models.pricing import SizeRule, FlavorRule
+from app.models.delivery import DeliveryZone
 from app.models.user import User
 from app.models.order import Order
 from app.services.gemini_parser import parse_message
@@ -20,13 +21,29 @@ _memory: dict = {}
 SITE = settings.WHATSAPP_TRACKING_BASE_URL.replace("/track", "") if settings.WHATSAPP_TRACKING_BASE_URL else "cakeoclock.co.in"
 
 
+_client = None  # cached connection; tests replace this with a fake
+
+
 def _get_redis():
+    """
+    The conversation-state store (db 2, keyed by phone).
+
+    Cached in a module global so tests can replace it. Building a fresh client
+    per call meant a live Redis carried `wa:{phone}` state across tests and
+    across runs for the full hour of its TTL -- the same way the webhook
+    dedupe store used to make this suite pass only when no Redis happened to
+    be running.
+    """
+    global _client
+    if _client is not None:
+        return _client
     try:
         import redis
         r = redis.from_url(settings.REDIS_URL, db=2, decode_responses=True)
         r.ping()
-        return r
-    except:
+        _client = r
+        return _client
+    except Exception:
         return None
 
 def _get_state(phone): 
@@ -45,6 +62,9 @@ def _clear_state(phone):
     r = _get_redis()
     if r: r.delete(f"wa:{phone}")
     else: _memory.pop(phone, None)
+
+
+DATE_PROMPT = "*Delivery date:*\n\n1. Tomorrow\n2. Day after tomorrow\n3. 3 days from now"
 
 
 def handle_customer_message(phone: str, message: str, user: Optional[User]) -> str:
@@ -206,8 +226,67 @@ def handle_customer_message(phone: str, message: str, user: Optional[User]) -> s
         if step == "DELIVERY_ADDRESS":
             addr = message.strip()
             is_pickup = addr.upper() in ("PICKUP", "SELF PICKUP")
-            _set_state(phone, {**state, "step": "SELECT_DATE", "address": "Self Pickup" if is_pickup else addr})
-            return "*Delivery date:*\n\n1. Tomorrow\n2. Day after tomorrow\n3. 3 days from now"
+            if is_pickup:
+                _set_state(phone, {**state, "step": "SELECT_DATE", "address": "Self Pickup"})
+                return DATE_PROMPT
+
+            # Which area? The conversation never asked, so every WhatsApp
+            # order was created with no zone at all - and a blank zone means
+            # "pickup" to the pricing engine, so delivery was free on all of
+            # them. Passing the value through was not enough on its own;
+            # nothing ever set it.
+            zones = (
+                db.query(DeliveryZone)
+                .filter(DeliveryZone.is_active == True)
+                .order_by(DeliveryZone.area_name)
+                .all()
+            )
+            if not zones:
+                # Nothing configured to deliver to. Carry on rather than
+                # trapping the customer in a step they cannot answer.
+                _set_state(phone, {**state, "step": "SELECT_DATE", "address": addr})
+                return DATE_PROMPT
+
+            _set_state(phone, {
+                **state, "step": "SELECT_AREA", "address": addr,
+                "zone_options": [z.area_name for z in zones],
+            })
+            listing = "\n".join(
+                f"{i}. {z.area_name} - Rs {z.charge:,.0f}"
+                for i, z in enumerate(zones, 1)
+            )
+            return "*Which area are we delivering to?*\n\n" + listing + "\n\nReply with the number."
+
+        # ─── AREA ────────────────────────
+        if step == "SELECT_AREA":
+            options = state.get("zone_options") or []
+            typed = message.strip()
+
+            # Read the number straight from the message rather than relying on
+            # the shared parser: this step decides what the customer is charged
+            # for delivery, so it must not depend on a language-model fallback
+            # to work out that "2" means the second option.
+            choice = int(typed) if typed.isdigit() else None
+            if choice is None and act == "SELECT_OPTION":
+                choice = action.get("value")
+            if choice is None:
+                # Accept the area name as well as its number.
+                lowered = typed.lower()
+                for i, name in enumerate(options, 1):
+                    if name.strip().lower() == lowered:
+                        choice = i
+                        break
+            try:
+                choice = int(choice)
+            except (TypeError, ValueError):
+                choice = 0
+            if not 1 <= choice <= len(options):
+                listing = "\n".join(f"{i}. {n}" for i, n in enumerate(options, 1))
+                return "Please pick your area by number:\n\n" + listing
+
+            _set_state(phone, {**state, "step": "SELECT_DATE",
+                               "delivery_zone": options[choice - 1]})
+            return DATE_PROMPT
 
         # ─── DATE ────────────────────────────
         if step == "SELECT_DATE":

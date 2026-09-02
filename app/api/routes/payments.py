@@ -63,7 +63,10 @@ def _order_id_from_txnid(txnid: str):
 
 class PaymentOrderRequest(BaseModel):
     order_id: int
-    payment_method: str = "ONLINE"  # ONLINE or COD
+    # ONLINE only. Cash on delivery was withdrawn at the client's request. The
+    # field is kept so existing callers keep working, and anything other than
+    # ONLINE is refused explicitly rather than quietly treated as online.
+    payment_method: str = "ONLINE"
 
 
 def _get_own_order(db: Session, order_id: int, user: User) -> Order:
@@ -143,20 +146,20 @@ def create_payment_order(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Create a PayU payment (or register COD). Returns params for the frontend to POST to PayU."""
+    """Create a PayU payment. Returns params for the frontend to POST to PayU."""
     order = _get_own_order(db, data.order_id, user)
 
     # Already-paid orders must not be re-opened for payment.
     if order.payment_status == PaymentStatus.PAID:
         raise HTTPException(status_code=400, detail="This order is already paid")
 
-    # COD — record it and release the order for production.
-    if data.payment_method == "COD":
-        order.payment_method = "COD"
-        order.payment_status = PaymentStatus.COD_PENDING
-        db.commit()
-        _release_for_production(db, order.id)
-        return {"status": "cod", "message": "Order placed with Cash on Delivery"}
+    # Cash on delivery is withdrawn. Refuse plainly; a silent fallthrough to
+    # the online path would charge a customer who chose to pay at the door.
+    if (data.payment_method or "ONLINE").upper() != "ONLINE":
+        raise HTTPException(
+            status_code=400,
+            detail="Cash on delivery is no longer available. Orders are paid online.",
+        )
 
     # ONLINE without PayU configured.
     if not settings.PAYU_KEY or not settings.PAYU_SALT:
@@ -181,7 +184,22 @@ def create_payment_order(
         _release_for_production(db, order.id)
         return {"status": "demo_paid", "message": "Demo mode — payment simulated as paid"}
 
-    txnid = f"CO{order.id}-{secrets.token_hex(4)}"
+    # Reuse the transaction id while a payment is still outstanding.
+    #
+    # This used to mint a fresh one on every call and overwrite the column, so a
+    # customer with checkout open in two tabs had the first tab's id replaced by
+    # the second. Completing payment in the first tab then produced a genuine,
+    # correctly signed callback carrying the older id - which the identity check
+    # above rightly refused. The money was taken and the order stayed PENDING.
+    #
+    # Reissuing after a FAILED attempt is deliberate: PayU rejects a repeated
+    # txnid for a new attempt, so a genuine retry needs a fresh one.
+    reusable = (
+        order.payment_id
+        and str(order.payment_id).startswith(f"CO{order.id}-")
+        and order.payment_status == PaymentStatus.PENDING
+    )
+    txnid = order.payment_id if reusable else f"CO{order.id}-{secrets.token_hex(4)}"
     amount = f"{float(order.total_price):.2f}"
     productinfo = f"Cake O Clock Order {order.id}"
     firstname = (user.name or "Customer").split(" ")[0]
@@ -281,7 +299,13 @@ async def payu_callback(request: Request, db: Session = Depends(get_db)):
         logger.info("[PAYU] Duplicate callback for already-paid order %s ignored", order_id)
         return RedirectResponse(url=f"{front}/orders?success={order_id}", status_code=303)
 
-    # The txnid must be the one this service issued for this order.
+    # The txnid must be the one this service issued for this order. Kept strict:
+    # it is a real barrier against anyone who holds the merchant salt but cannot
+    # read the database, and dropping it would trade that away. The reason a
+    # legitimate payment used to fall foul of this - a second checkout tab
+    # replacing the first tab's txnid - is fixed where it belongs, in
+    # create_payment_order, which now reuses the pending txnid instead of
+    # minting a new one.
     if not order.payment_id or not hmac.compare_digest(order.payment_id, txnid):
         db.rollback()
         return _fail("txnid does not match the order", order_id=order_id,

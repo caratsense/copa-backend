@@ -31,7 +31,14 @@ settings = get_settings()
 # Orders a rider is responsible for right now. PACKAGED is included so the
 # dashboard can show "assigned, not yet collected" honestly instead of the order
 # silently appearing only once GPS starts.
-FLEET_STATUSES = [OrderStatus.PACKAGED, OrderStatus.OUT_FOR_DELIVERY]
+FLEET_STATUSES = [
+    OrderStatus.PACKAGED,
+    OrderStatus.OUT_FOR_DELIVERY,
+    # A failed attempt is exactly the case an operator needs to see on this
+    # board. It carries no live position - tracking is torn down with the
+    # transition - so it shows as awaiting_gps until it goes out again.
+    OrderStatus.DELIVERY_FAILED,
+]
 
 
 def get_active_deliveries(db: Session) -> list[dict]:
