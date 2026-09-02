@@ -342,15 +342,27 @@ def test_both_redispatch_paths_restart_tracking(client, db, wa_secret, fake_redi
     """
     import json
 
-    from app.services.delivery_tracking import update_rider_location
+    from app.services.delivery_tracking import (
+        start_delivery_tracking, update_rider_location,
+    )
 
     order, rider, _ = out_for_delivery
     admin = db.query(type(rider)).filter_by(role=UserRole.ADMIN).first()
+
+    # The fixture puts the order straight into OUT_FOR_DELIVERY, so the
+    # transition that opens a tracking session never ran. Open one, or the
+    # assertions below pass on a key that was never there.
+    start_delivery_tracking(order_id=order.id, rider_id=rider.id)
     update_rider_location(order.id, 26.8467, 80.9462)
 
     _fail_it(client, order, rider)
     assert fake_redis.exists(f"delivery:{order.id}") == 0, "stale position kept"
-    assert fake_redis.exists(f"delivery:{order.id}:meta") == 0, "session kept"
+    assert fake_redis.exists(f"delivery:{order.id}:history") == 0, "stale route kept"
+    # The session record itself is deliberately retained for an hour rather than
+    # deleted. What matters is that it is no longer live -- it must not sit on
+    # the fleet map as an active delivery nobody is carrying.
+    ended = json.loads(fake_redis.get(f"delivery:{order.id}:meta"))
+    assert ended["status"] != "active", "the session is still marked live"
 
     if path == "fleet":
         res = client.post(f"/orders/{order.id}/retry-delivery", headers=auth(admin))
@@ -365,6 +377,7 @@ def test_both_redispatch_paths_restart_tracking(client, db, wa_secret, fake_redi
     meta_raw = fake_redis.get(f"delivery:{order.id}:meta")
     assert meta_raw, "tracking session did not restart"
     meta = json.loads(meta_raw)
+    assert meta["status"] == "active", "the restarted session is not live"
     assert meta["rider_id"] == rider.id,         f"tracking restarted against rider {meta['rider_id']}, not the assigned one"
     assert fake_redis.exists(f"delivery:{order.id}") == 0,         "a redispatch must not resurrect the position from the failed attempt"
 
