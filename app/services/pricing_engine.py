@@ -112,8 +112,23 @@ def calculate_item_price(
     base_price = product.base_price
 
     # ── Size ──
-    size_row = _find_rule(db, SizeRule, customization.size, "size")
-    size_multiplier = float(size_row.multiplier) if size_row else 1.0
+    # Size is a pricing dimension only for per-kg products. For a fixed-price
+    # item - a brownie, a loaf, a pack of six buns - base_price IS the price,
+    # so a size cannot be allowed to multiply it: a Rs 400 brownie ordered at
+    # "2kg" would have been billed Rs 800.
+    #
+    # A size sent for a fixed-price product is ignored rather than rejected.
+    # Every existing client sends one unconditionally (the product page
+    # hardcodes "1kg", the builder defaults to it, the WhatsApp flow always
+    # asks), so rejecting would break checkout for these products the moment
+    # the first one is created. Ignoring is safe by construction - the
+    # multiplier is the literal 1.0 and no SizeRule is ever consulted - and
+    # this can be tightened to a 400 once those callers stop sending a size.
+    if product.pricing_unit == "kg":
+        size_row = _find_rule(db, SizeRule, customization.size, "size")
+        size_multiplier = float(size_row.multiplier) if size_row else 1.0
+    else:
+        size_multiplier = 1.0
     size_adjusted = round(base_price * size_multiplier, 2)
 
     # ── Flavor ──

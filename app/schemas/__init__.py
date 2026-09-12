@@ -5,7 +5,7 @@ Organized by domain — add new schemas at the bottom of each section.
 
 from __future__ import annotations
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
 
@@ -107,6 +107,12 @@ TokenResponse.model_rebuild()
 
 # ─── PRODUCTS ─────────────────────────────────────────
 
+# How to read `base_price`. "kg" means it is a per-kg price and the chosen
+# SizeRule multiplies it; "fixed" means it is the price of the thing and no
+# size applies. Constrained here rather than in the column so a typo is a 422
+# at the edge instead of a product that silently prices the wrong way.
+PricingUnit = Literal["kg", "fixed"]
+
 class ProductCreate(BaseModel):
     name: str
     category: str
@@ -115,6 +121,7 @@ class ProductCreate(BaseModel):
     is_customizable: bool = True
     is_available: bool = True
     tags: list[str] = Field(default_factory=list)
+    pricing_unit: PricingUnit = "kg"
 
 class ProductUpdate(BaseModel):
     name: Optional[str] = None
@@ -124,6 +131,7 @@ class ProductUpdate(BaseModel):
     is_customizable: Optional[bool] = None
     is_available: Optional[bool] = None
     tags: Optional[list[str]] = None
+    pricing_unit: Optional[PricingUnit] = None
 
 class ProductRead(BaseModel):
     id: int
@@ -135,6 +143,7 @@ class ProductRead(BaseModel):
     is_available: bool
     image_url: Optional[str]
     tags: list[str] = Field(default_factory=list)
+    pricing_unit: str
     created_at: datetime
 
     class Config:
