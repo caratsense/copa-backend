@@ -122,6 +122,16 @@ class ProductCreate(BaseModel):
     is_available: bool = True
     tags: list[str] = Field(default_factory=list)
     pricing_unit: PricingUnit = "kg"
+    # Which menu section the product belongs to. None means unassigned, which
+    # the public menu shows in its trailing "Other Cakes" bucket. Both columns
+    # already existed; they were simply unreachable through this schema, so a
+    # section_id sent by the admin form was silently dropped and every product
+    # created through the API landed at sort_order 0.
+    section_id: Optional[int] = None
+    # Defaults to 0 rather than None: the column is nullable with a Python-side
+    # default, and an explicit None would be written as NULL. The public menu
+    # sorts products by this value, and NULL is not comparable to an int.
+    sort_order: int = 0
 
 class ProductUpdate(BaseModel):
     name: Optional[str] = None
@@ -132,6 +142,10 @@ class ProductUpdate(BaseModel):
     is_available: Optional[bool] = None
     tags: Optional[list[str]] = None
     pricing_unit: Optional[PricingUnit] = None
+    # Sending section_id explicitly as null unassigns the product, which is the
+    # same thing POST /admin/sections/assign-product does with a null section.
+    section_id: Optional[int] = None
+    sort_order: Optional[int] = None
 
 class ProductRead(BaseModel):
     id: int
@@ -144,6 +158,8 @@ class ProductRead(BaseModel):
     image_url: Optional[str]
     tags: list[str] = Field(default_factory=list)
     pricing_unit: str
+    section_id: Optional[int] = None
+    sort_order: int = 0
     created_at: datetime
 
     class Config:

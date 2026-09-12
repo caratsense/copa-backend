@@ -32,6 +32,12 @@ def list_products(
         q = q.filter(Product.is_available == True)
     if category:
         q = q.filter(Product.category == category)
+    # There was no ORDER BY at all, so the database was free to return rows in
+    # any order and to change that order between identical requests. With
+    # offset pagination layered on top, that can repeat a product on one page
+    # and skip it on the next. id breaks ties so the order is total, not merely
+    # grouped by sort_order.
+    q = q.order_by(Product.sort_order, Product.id)
     return q.offset(skip).limit(limit).all()
 
 
