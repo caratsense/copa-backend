@@ -84,10 +84,33 @@ PROTECTED_PRODUCT_IDS = {1, 2, 3, 4, 5}
 
 PRICING_UNITS = {"kg", "fixed"}
 
+# DRAFT ROWS AND THE PLACEHOLDER PRICE
+# ------------------------------------
+# products.base_price is NOT NULL, so a draft row has to carry some number.
+# Which number matters, because the number is publicly readable: an
+# is_available=false product is still returned by GET /products/{id} and by
+# GET /products?available_only=false, and POST /pricing/calculate will happily
+# quote it - none of those three check availability. What a draft row CANNOT do
+# is be ordered: create_order rejects an unavailable product with a 400, and
+# that is the only route to an order.
+#
+# So the placeholder must fail in the safe direction if anyone ever flips
+# is_available (one admin toggle does it). 0.0 is the dangerous choice - it is a
+# real price meaning "free", the engine would total the order at zero, and
+# PayU's callback check (paid != owed) is satisfied by 0 == 0. A deliberately
+# absurd number cannot be mistaken for a real price, cannot be ordered by
+# accident, and errs towards overcharging rather than giving cakes away.
+DRAFT_PRICE_SENTINEL = 999999.0
+
+# Stamped on any row created without a real price, so drafts can be found again
+# without relying on the sentinel number alone.
+DRAFT_TAG = "draft-no-price"
+
 # Tags with a fixed meaning. Anything else is a free descriptive tag, but these
 # spellings are the only accepted way to say these particular things - an
 # unvalidated "contains egg" would simply stop rendering its badge.
 CONTROLLED_TAGS = {
+    DRAFT_TAG,
     "contains-egg",
     "eggless",
     "contains-alcohol",
@@ -97,7 +120,7 @@ CONTROLLED_TAGS = {
 }
 # Words that must only ever appear inside a controlled tag, so a near-miss
 # spelling is caught rather than silently accepted as a descriptive tag.
-RESERVED_WORDS = ("egg", "alcohol", "pack", "sugar")
+RESERVED_WORDS = ("egg", "alcohol", "pack", "sugar", "draft", "price")
 
 TAG_FORMAT = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 
@@ -236,6 +259,17 @@ def _validate_definition() -> list[str]:
             # only way to say "not supplied", which is what blocks writes.
             if p.base_price is not None and p.base_price < 0:
                 problems.append(f"{where} ({p.name!r}): negative base_price")
+            if p.base_price == DRAFT_PRICE_SENTINEL:
+                problems.append(
+                    f"{where} ({p.name!r}): base_price equals the draft sentinel "
+                    f"{DRAFT_PRICE_SENTINEL}. A real price must never be that number, "
+                    f"or --apply cannot tell a priced row from an unpriced one."
+                )
+            if DRAFT_TAG in p.tags:
+                problems.append(
+                    f"{where} ({p.name!r}): {DRAFT_TAG!r} is applied by the script, "
+                    f"never written in the definition"
+                )
 
             key = p.name.strip().lower()
             if key in seen:
@@ -329,11 +363,19 @@ def _summary(resolved: dict[str, MenuSection], db) -> None:
     for section_name in KNOWN_EMPTY_SECTIONS:
         print(f"  - {section_name}")
 
+    drafts = db.query(Product).filter(Product.base_price == DRAFT_PRICE_SENTINEL).count()
+    if drafts:
+        print()
+        print(f"Draft rows in the database: {drafts} (unavailable, placeholder price "
+              f"{DRAFT_PRICE_SENTINEL}, tagged {DRAFT_TAG!r}).")
+        print("  They cannot be ordered and do not appear on the menu, in WhatsApp")
+        print("  or in Build-a-Cake. --apply will price them and put them on sale.")
+
     print()
     print("Unresolved / pending client confirmation:")
     missing = _missing_prices()
     print(f"  - NO PRICES SUPPLIED: {len(missing)} of {total} products have base_price=None.")
-    print(f"    Nothing can be written until every one is filled in.")
+    print(f"    Nothing goes on sale until every one is filled in.")
     print("  - Tea Cakes (5) treated as 'fixed' - confirm they are not sold by weight.")
     print("  - Sugar Free Ragi Chocolate Cake treated as 'kg' - confirm.")
     print("  - Button/Jumbo and With/Without-Egg are separate rows, not variants.")
@@ -345,9 +387,19 @@ def _summary(resolved: dict[str, MenuSection], db) -> None:
 # ── WRITE (only with --apply, only when fully priced) ─────────────────────
 
 
-def _apply(db, resolved: dict[str, MenuSection]) -> int:
-    """Create missing catalogue products. Never updates or deletes anything."""
-    created = 0
+def _is_draft_row(row: Product) -> bool:
+    """A row this script created without a real price."""
+    return row.base_price == DRAFT_PRICE_SENTINEL or DRAFT_TAG in (row.tags or [])
+
+
+def _write(db, resolved: dict[str, MenuSection], draft: bool) -> tuple[int, int]:
+    """
+    Create missing catalogue products; in real mode, price up existing drafts.
+
+    Returns (created, promoted). Never deletes, never renames, and never writes
+    to a product that is not part of this catalogue.
+    """
+    created = promoted = 0
 
     for section_name, products in CATALOGUE.items():
         section = resolved[section_name]
@@ -358,6 +410,7 @@ def _apply(db, resolved: dict[str, MenuSection]) -> int:
 
         for position, item in enumerate(products, start=1):
             match = existing.get(item.name.strip().lower())
+
             if match is not None:
                 # Belt and braces: a catalogue name must never resolve onto one
                 # of the original seeded products.
@@ -366,26 +419,50 @@ def _apply(db, resolved: dict[str, MenuSection]) -> int:
                         f"{item.name!r} matches protected product id {match.id}. "
                         f"Refusing to touch the original seeded products."
                     )
-                print(f"  ok      {section_name} / {item.name} (id {match.id})")
+                if draft or not _is_draft_row(match):
+                    print(f"  ok       {section_name} / {item.name} (id {match.id})")
+                    continue
+
+                # Real mode over a draft row: give it its price and let it be
+                # sold. This is the only circumstance in which the script
+                # modifies a row it did not just create.
+                print(f"  PRICE    {section_name} / {item.name} (id {match.id}) "
+                      f"{match.base_price} -> {item.base_price}, now available")
+                match.base_price = item.base_price
+                match.tags = [t for t in (match.tags or []) if t != DRAFT_TAG]
+                match.is_available = True
+                promoted += 1
                 continue
 
-            print(f"  CREATE  {section_name} / {item.name} "
-                  f"[{item.pricing_unit}, sort {position}, Rs {item.base_price}]")
+            price = item.base_price if item.base_price is not None else DRAFT_PRICE_SENTINEL
+            unpriced = item.base_price is None
+            tags = list(item.tags) + ([DRAFT_TAG] if unpriced else [])
+
+            # A draft is never available. An unpriced row must never be
+            # available whatever mode we are in - though real mode cannot reach
+            # here with one, since it refuses to run at all while any price is
+            # missing.
+            available = not draft and not unpriced
+
+            print(f"  {'DRAFT  ' if draft else 'CREATE '} {section_name} / {item.name} "
+                  f"[{item.pricing_unit}, sort {position}, "
+                  f"{'NO PRICE - placeholder ' + str(price) if unpriced else 'Rs ' + str(price)}, "
+                  f"available={available}]")
             db.add(Product(
                 name=item.name,
                 category=item.category,
                 description=item.description,
-                base_price=item.base_price,
+                base_price=price,
                 pricing_unit=item.pricing_unit,
                 is_customizable=False,   # menu items, not Build-a-Cake bases
-                is_available=True,
-                tags=list(item.tags),
+                is_available=available,
+                tags=tags,
                 section_id=section.id,
                 sort_order=position,
             ))
             created += 1
 
-    return created
+    return created, promoted
 
 
 def main() -> int:
@@ -395,13 +472,24 @@ def main() -> int:
         help="create missing catalogue products. Refused while any price is missing.",
     )
     parser.add_argument(
+        "--apply-draft", action="store_true",
+        help=(
+            "create the catalogue as DRAFT rows: is_available=false, and any "
+            "product with no price carries an obviously-wrong placeholder plus "
+            "the '%s' tag. Drafts cannot be ordered - create_order rejects an "
+            "unavailable product - and do not appear on the menu, in WhatsApp "
+            "or in Build-a-Cake." % DRAFT_TAG
+        ),
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
-        help="explicit no-op mode; this is also the default when --apply is absent.",
+        help="explicit no-op mode; this is also the default when no apply flag is given.",
     )
     args = parser.parse_args()
 
-    if args.apply and args.dry_run:
-        print("--apply and --dry-run contradict each other.", file=sys.stderr)
+    modes = [args.apply, args.apply_draft, args.dry_run]
+    if sum(bool(m) for m in modes) > 1:
+        print("Pick one of --apply, --apply-draft or --dry-run.", file=sys.stderr)
         return 2
 
     db = SessionLocal()
@@ -421,6 +509,22 @@ def main() -> int:
         _summary(resolved, db)
 
         missing = _missing_prices()
+
+        if args.apply_draft:
+            print()
+            print("Applying DRAFT catalogue")
+            print(f"  Every row is created with is_available=false. Unpriced rows carry")
+            print(f"  the placeholder {DRAFT_PRICE_SENTINEL} and the {DRAFT_TAG!r} tag - that")
+            print(f"  is NOT a price, and the row cannot be ordered while it is unavailable.")
+            created, _ = _write(db, resolved, draft=True)
+            db.commit()
+            print(f"  committed - {created} draft row(s) created")
+            if missing:
+                print()
+                print(f"  {len(missing)} row(s) still need a real price before --apply "
+                      f"can put them on sale.")
+            return 0
+
         if not args.apply:
             print()
             print("Dry run - no database changes were made"
@@ -428,6 +532,8 @@ def main() -> int:
                   "Validation only (default) - no database changes were made.")
             if missing:
                 print(f"--apply would be REFUSED: {len(missing)} product(s) have no price.")
+                print(f"--apply-draft would create {len(CATALOGUE) and sum(len(v) for v in CATALOGUE.values())} "
+                      f"unavailable draft row(s).")
             return 0
 
         if missing:
@@ -444,9 +550,9 @@ def main() -> int:
 
         print()
         print("Applying")
-        created = _apply(db, resolved)
+        created, promoted = _write(db, resolved, draft=False)
         db.commit()
-        print(f"  committed - {created} product(s) created")
+        print(f"  committed - {created} created, {promoted} draft row(s) priced and put on sale")
         return 0
 
     except ValidationError as e:
