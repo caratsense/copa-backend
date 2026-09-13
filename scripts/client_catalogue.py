@@ -135,14 +135,51 @@ class CatalogueProduct:
     base_price: Optional[float] = None
     description: Optional[str] = None
     tags: tuple[str, ...] = field(default_factory=tuple)
+    # Names this product has previously been written to the database under.
+    # Draft rows are matched by (section, name), so a rename here would
+    # otherwise stop matching its own existing row and create a duplicate on
+    # the next run. Listing the old name makes the match hold; the row itself
+    # is NOT renamed - the script reports the difference and leaves it alone.
+    previous_names: tuple[str, ...] = field(default_factory=tuple)
 
 
-def _kg(name, category, tags=()):
-    return CatalogueProduct(name=name, category=category, pricing_unit="kg", tags=tuple(tags))
+def _kg(name, category, tags=(), description=None, previous_names=()):
+    return CatalogueProduct(name=name, category=category, pricing_unit="kg",
+                            tags=tuple(tags), description=description,
+                            previous_names=tuple(previous_names))
 
 
-def _fixed(name, category, tags=()):
-    return CatalogueProduct(name=name, category=category, pricing_unit="fixed", tags=tuple(tags))
+def _fixed(name, category, tags=(), description=None, previous_names=()):
+    return CatalogueProduct(name=name, category=category, pricing_unit="fixed",
+                            tags=tuple(tags), description=description,
+                            previous_names=tuple(previous_names))
+
+
+# ── SIZES THE CLIENT SELLS EACH CAKE IN ──────────────────────────────────
+# Documentation only. Nothing reads this at runtime and no schema field exists
+# for it: sizes are the global SizeRule table, which is shared by every per-kg
+# product and currently offers 500g / 1kg / 1.5kg / 2kg / 3kg / 5kg.
+#
+# Two entries do not fit that table and need a decision before these cakes go
+# on sale - see the report:
+#   * Blueberry Lemon Curd Cake starts at 700g, and no 700g SizeRule exists.
+#   * Belgian Chocolate Coffee Cake starts at 1kg, but nothing stops a customer
+#     choosing 500g, because SizeRule is global rather than per-product.
+SUPPLIED_SIZES: dict[str, tuple[str, ...]] = {
+    "Belgian Chocolate Cake": ("500 g", "1 kg", "1.5 kg", "2 kg and above"),
+    "Belgian Chocolate Orange Crumble Cake": ("500 g", "1 kg", "1.5 kg", "2 kg and above"),
+    "Belgian Chocolate Coffee Cake With Cinnamon Roll": ("1 kg", "1.5 kg", "2 kg and above"),
+    "Belgian Chocolate Hazelnut Brownie Cake": ("500 g", "1 kg", "1.5 kg", "2 kg and above"),
+    "Belgian Chocolate Salted Caramel Cake With Roasted Pecan & Crumble": ("500 g", "1 kg", "1.5 kg", "2 kg and above"),
+    "Tiramisu Cake": ("500 g", "1 kg", "1.5 kg", "2 kg and above"),
+    "Vanilla Salted Caramel Cake With Plain Crumble": ("500 g", "1 kg", "1.5 kg", "2 kg and above"),
+    "Raspberry Pistachio White Chocolate Cake": ("500 g", "1 kg", "1.5 kg", "2 kg and above"),
+    "Vanilla Cookie Cream Cake": ("500 g", "1 kg", "1.5 kg", "2 kg and above"),
+    "Vanilla Pineapple Cake": ("500 g", "1 kg", "1.5 kg", "2 kg and above"),
+    "Vanilla Chocolate Pineapple Cake": ("500 g", "1 kg", "1.5 kg", "2 kg and above"),
+    "Blueberry Lemon Curd Cake": ("700 g", "1 kg", "1.5 kg", "2 kg and above"),
+    "Vanilla Butterscotch Cake": ("500 g", "1 kg", "1.5 kg", "2 kg and above"),
+}
 
 
 # ── THE CATALOGUE ────────────────────────────────────────────────────────
@@ -152,21 +189,174 @@ def _fixed(name, category, tags=()):
 
 CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
     "Chocolate Celebration Cakes": (
-        _kg("Classic Belgian Chocolate", "chocolate-celebration", ["chocolate", "belgian"]),
-        _kg("Belgian Chocolate Orange Crumble", "chocolate-celebration", ["chocolate", "belgian", "orange"]),
-        _kg("Belgian Chocolate Coffee Cake", "chocolate-celebration", ["chocolate", "belgian", "coffee"]),
-        _kg("Belgian Chocolate Hazelnut Brownie Cake", "chocolate-celebration", ["chocolate", "belgian", "hazelnut"]),
-        _kg("Chocolate Salted Caramel With Roasted Pecan & Crumble", "chocolate-celebration", ["chocolate", "salted-caramel", "pecan"]),
-        _kg("Tiramisu Cake", "chocolate-celebration", ["coffee", "contains-egg", "contains-alcohol"]),
+        _kg("Belgian Chocolate Cake", "chocolate-celebration",
+            ["chocolate", "belgian", "eggless"],
+            previous_names=["Classic Belgian Chocolate"],
+            description=(
+                "Pure chocolate indulgence, made eggless. Rich Belgian chocolate meets "
+                "soft, moist cake and a delicate cocoa finish for a dessert that is "
+                "luxurious, comforting and utterly decadent.\n\n"
+                "Perfect for celebrations, gifting, or simply when you're craving really "
+                "good chocolate cake.\n\n"
+                "Eggless."
+            )),
+        _kg("Belgian Chocolate Orange Crumble Cake", "chocolate-celebration",
+            ["chocolate", "belgian", "orange", "eggless"],
+            previous_names=["Belgian Chocolate Orange Crumble"],
+            description=(
+                "A decadent pairing of rich Belgian chocolate and zesty orange, brought "
+                "together in a beautifully indulgent eggless cake. Finished with crumble "
+                "and an assortment of chocolate, nuts and dehydrated orange for layers of "
+                "texture, flavour and crunch.\n\n"
+                "Deeply chocolatey, bright with citrus and wonderfully satisfying - this "
+                "is a little more special than your everyday chocolate cake."
+            )),
+        # The client's copy names a cinnamon roll the earlier definition did not,
+        # and gives a size list starting at 1kg rather than 500g. Treated as the
+        # same product renamed, because there is exactly one coffee cake to map
+        # onto - but worth a second pair of eyes before it goes on sale.
+        _kg("Belgian Chocolate Coffee Cake With Cinnamon Roll", "chocolate-celebration",
+            ["chocolate", "belgian", "coffee", "eggless"],
+            previous_names=["Belgian Chocolate Coffee Cake"],
+            description=(
+                "A rich and indulgent eggless Belgian chocolate coffee cake, topped with a "
+                "soft, pillowy cinnamon roll and finished with a generous chocolate swirl. "
+                "The deep, velvety notes of Belgian chocolate and coffee pair beautifully "
+                "with the warm, aromatic sweetness of cinnamon - creating a cake that is "
+                "both comforting and decadent.\n\n"
+                "A beautiful choice for celebrations, coffee dates and everything in "
+                "between.\n\n"
+                "Eggless."
+            )),
+        _kg("Belgian Chocolate Hazelnut Brownie Cake", "chocolate-celebration",
+            ["chocolate", "belgian", "hazelnut", "eggless"],
+            description=(
+                "A decadent combination of rich Belgian chocolate, fudgy brownie and "
+                "roasted hazelnuts, all in one irresistible eggless cake. Dense, gooey and "
+                "intensely chocolatey, with the beautiful crunch of hazelnuts running "
+                "through every bite and a glossy chocolate finish on top.\n\n"
+                "For the ones who like their chocolate extra rich, extra fudgy and "
+                "unapologetically indulgent.\n\n"
+                "Eggless."
+            )),
+        _kg("Belgian Chocolate Salted Caramel Cake With Roasted Pecan & Crumble",
+            "chocolate-celebration",
+            ["chocolate", "belgian", "salted-caramel", "pecan", "eggless"],
+            previous_names=["Chocolate Salted Caramel With Roasted Pecan & Crumble"],
+            description=(
+                "A decadent celebration of Belgian chocolate and salted caramel, layered "
+                "with rich, velvety chocolate goodness and finished with roasted pecans on "
+                "the outside and a delicate crumble on the inside. The deep chocolate "
+                "flavour, buttery caramel, nutty crunch and hint of sea salt come together "
+                "in a beautifully indulgent balance of sweet, salty and rich.\n\n"
+                "An eggless chocolate cake with just the right amount of crunch and "
+                "caramel - made for those who like their desserts a little more "
+                "indulgent.\n\n"
+                "Eggless."
+            )),
+        _kg("Tiramisu Cake", "chocolate-celebration",
+            ["coffee", "contains-egg", "contains-alcohol"],
+            description=(
+                "A classic Italian-inspired indulgence, reimagined as a celebration cake. "
+                "Layers of delicate coffee-soaked sponge come together with a rich, creamy "
+                "mascarpone-style filling, finished with a generous dusting of cocoa and "
+                "elegant chocolate accents.\n\n"
+                "Infused with rum for a beautiful depth of flavour, this is a grown-up take "
+                "on the timeless tiramisu - smooth, creamy, coffee-forward and irresistibly "
+                "indulgent.\n\n"
+                "Contains egg & alcohol (rum)."
+            )),
     ),
     "Vanilla Celebration Cakes": (
-        _kg("Vanilla Salted Caramel Cake", "vanilla-celebration", ["vanilla", "salted-caramel"]),
-        _kg("Raspberry Pistachio White Chocolate Cake", "vanilla-celebration", ["white-chocolate", "raspberry", "pistachio"]),
-        _kg("Vanilla Cookie Cream Cake", "vanilla-celebration", ["vanilla", "cookie-cream"]),
-        _kg("Vanilla Pineapple Cake", "vanilla-celebration", ["vanilla", "pineapple"]),
-        _kg("Vanilla Pineapple Chocolate", "vanilla-celebration", ["vanilla", "pineapple", "chocolate"]),
-        _kg("Vanilla Lemon Curd Blueberry Cake", "vanilla-celebration", ["vanilla", "lemon", "blueberry", "contains-egg"]),
-        _kg("Vanilla Butterscotch Cake", "vanilla-celebration", ["vanilla", "butterscotch"]),
+        _kg("Vanilla Salted Caramel Cake With Plain Crumble", "vanilla-celebration",
+            ["vanilla", "salted-caramel", "eggless"],
+            previous_names=["Vanilla Salted Caramel Cake"],
+            description=(
+                "A delicate and indulgent eggless vanilla cake layered with smooth salted "
+                "caramel and finished with a generous topping of buttery, golden crumble. "
+                "The sweetness of vanilla meets the subtle saltiness of caramel, while the "
+                "crumble adds a delightful crunch to every bite.\n\n"
+                "Elegant, comforting and beautifully balanced - a cake that lets simple "
+                "flavours shine.\n\n"
+                "Eggless."
+            )),
+        # NOT tagged eggless. The client's own note is that the cake is eggless
+        # but the macarons decorating it contain egg - so the thing that arrives
+        # at the customer's door contains egg, and that is what an allergy tag
+        # has to describe. Tagging both would render two contradictory badges.
+        # Confirm with the client whether an egg-free decoration is offered.
+        _kg("Raspberry Pistachio White Chocolate Cake", "vanilla-celebration",
+            ["white-chocolate", "raspberry", "pistachio", "contains-egg"],
+            description=(
+                "A delicate and indulgent combination of fruity raspberry, creamy white "
+                "chocolate and nutty pistachio. This eggless cake brings together layers of "
+                "soft cake and rich flavours, finished with white chocolate ganache and a "
+                "playful assortment of pistachio, raspberry and chocolate accents.\n\n"
+                "Fresh, creamy and beautifully balanced, with the perfect contrast of sweet "
+                "white chocolate, vibrant raspberry and earthy pistachio.\n\n"
+                "Please note: The cake is eggless; the macarons used for decoration contain "
+                "egg."
+            )),
+        _kg("Vanilla Cookie Cream Cake", "vanilla-celebration",
+            ["vanilla", "cookie-cream", "eggless"],
+            description=(
+                "A soft and indulgent eggless vanilla cake layered with smooth, creamy "
+                "cookie filling and finished with the irresistible crunch of cookies. "
+                "Delicate vanilla, rich cream and that familiar cookie goodness come "
+                "together for a cake that is comforting, creamy and wonderfully "
+                "nostalgic.\n\n"
+                "Simple, indulgent and impossible to stop at just one slice.\n\n"
+                "Eggless."
+            )),
+        _kg("Vanilla Pineapple Cake", "vanilla-celebration",
+            ["vanilla", "pineapple", "eggless"],
+            description=(
+                "A timeless favourite, our eggless Vanilla Pineapple Cake brings together "
+                "soft, delicate vanilla cake with the bright, juicy sweetness of pineapple "
+                "and smooth, creamy frosting. Light, fruity and wonderfully refreshing, "
+                "with just the right balance of sweetness.\n\n"
+                "A classic that never goes out of style - perfect for birthdays, "
+                "celebrations and all the little moments worth making sweeter.\n\n"
+                "Eggless."
+            )),
+        # Distinct from the Tea Cakes product "Vanilla Chocolate Pineapple";
+        # this is the celebration cake, sold 500g and up.
+        _kg("Vanilla Chocolate Pineapple Cake", "vanilla-celebration",
+            ["vanilla", "pineapple", "chocolate", "eggless"],
+            previous_names=["Vanilla Pineapple Chocolate"],
+            description=(
+                "A twist on a classic favourite - our eggless Vanilla Chocolate Pineapple "
+                "Cake brings together soft vanilla sponge, chocolate and the bright, juicy "
+                "sweetness of pineapple. Finished with smooth cream and delicate hand-made "
+                "floral details, it's fresh, fruity, chocolatey and beautifully "
+                "balanced.\n\n"
+                "A little bit classic, a little bit indulgent, and perfect for celebrations "
+                "of all kinds.\n\n"
+                "Eggless."
+            )),
+        _kg("Blueberry Lemon Curd Cake", "vanilla-celebration",
+            ["vanilla", "lemon", "blueberry", "contains-egg"],
+            previous_names=["Vanilla Lemon Curd Blueberry Cake"],
+            description=(
+                "A beautifully balanced combination of fresh blueberry and zesty lemon "
+                "curd, layered with soft, delicate cake and smooth cream. The sweetness of "
+                "blueberries meets the bright, citrusy tang of lemon, creating a light, "
+                "refreshing flavour with just the right touch of indulgence.\n\n"
+                "A simple cake - that feels as beautiful as it tastes.\n\n"
+                "Contains egg."
+            )),
+        _kg("Vanilla Butterscotch Cake", "vanilla-celebration",
+            ["vanilla", "butterscotch", "eggless"],
+            description=(
+                "A rich and indulgent take on a classic favourite, our eggless Vanilla "
+                "Butterscotch Cake brings together soft vanilla sponge and vanilla cream, "
+                "finished with a generous layer of crunchy caramelised butterscotch.\n\n"
+                "Buttery, creamy and delightfully crunchy, with the nostalgic sweetness of "
+                "butterscotch in every bite. A timeless celebration cake that never fails "
+                "to make an impression.\n\n"
+                "Eggless."
+            )),
+        # No copy supplied by the client for this one - left exactly as it was.
         _kg("Chiffon Fresh Fruit Milk Cake", "vanilla-celebration", ["chiffon", "fresh-fruit", "contains-egg"]),
     ),
     "Desserts & Pudding Tubs": (
@@ -293,6 +483,27 @@ def _validate_definition() -> list[str]:
                         )
                         break
 
+    # A previous name must not be some other product's current name, or the
+    # two would fight over the same database row.
+    current = {
+        p.name.strip().lower()
+        for products in CATALOGUE.values() for p in products
+    }
+    for section_name, products in CATALOGUE.items():
+        for p in products:
+            for old_name in p.previous_names:
+                key = old_name.strip().lower()
+                if key in current:
+                    problems.append(
+                        f"{section_name!r} ({p.name!r}): previous_name {old_name!r} is "
+                        f"another product's current name"
+                    )
+                if key == p.name.strip().lower():
+                    problems.append(
+                        f"{section_name!r} ({p.name!r}): previous_name repeats the "
+                        f"current name"
+                    )
+
     # sort_order is derived from position, so it is deterministic and 1-based by
     # construction. Assert it anyway - the guarantee is the point.
     for section_name, products in CATALOGUE.items():
@@ -411,6 +622,18 @@ def _write(db, resolved: dict[str, MenuSection], draft: bool) -> tuple[int, int]
         for position, item in enumerate(products, start=1):
             match = existing.get(item.name.strip().lower())
 
+            # Renamed since the row was written. Match it anyway so a rename
+            # cannot quietly produce a second row for the same cake. The row is
+            # NOT renamed here - that is a product change, and this script only
+            # reports the difference.
+            renamed_from = None
+            if match is None:
+                for old_name in item.previous_names:
+                    candidate = existing.get(old_name.strip().lower())
+                    if candidate is not None:
+                        match, renamed_from = candidate, old_name
+                        break
+
             if match is not None:
                 # Belt and braces: a catalogue name must never resolve onto one
                 # of the original seeded products.
@@ -419,8 +642,13 @@ def _write(db, resolved: dict[str, MenuSection], draft: bool) -> tuple[int, int]
                         f"{item.name!r} matches protected product id {match.id}. "
                         f"Refusing to touch the original seeded products."
                     )
+                if renamed_from is not None:
+                    print(f"  RENAMED  {section_name} / id {match.id} is still called "
+                          f"{renamed_from!r} in the database; the catalogue now says "
+                          f"{item.name!r}. Not renamed - no duplicate created.")
                 if draft or not _is_draft_row(match):
-                    print(f"  ok       {section_name} / {item.name} (id {match.id})")
+                    if renamed_from is None:
+                        print(f"  ok       {section_name} / {item.name} (id {match.id})")
                     continue
 
                 # Real mode over a draft row: give it its price and let it be
