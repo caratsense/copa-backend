@@ -69,6 +69,7 @@ import argparse
 import os
 import re
 import sys
+import textwrap
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -143,16 +144,72 @@ class CatalogueProduct:
     previous_names: tuple[str, ...] = field(default_factory=tuple)
 
 
-def _kg(name, category, tags=(), description=None, previous_names=()):
+def _kg(name, category, tags=(), description=None, previous_names=(), price=None):
+    """Priced per kilogram: `price` is the price of 1 kg, which the chosen
+    SizeRule multiplies."""
     return CatalogueProduct(name=name, category=category, pricing_unit="kg",
-                            tags=tuple(tags), description=description,
+                            base_price=price, tags=tuple(tags), description=description,
                             previous_names=tuple(previous_names))
 
 
-def _fixed(name, category, tags=(), description=None, previous_names=()):
+def _fixed(name, category, tags=(), description=None, previous_names=(), price=None):
+    """Priced as a unit: `price` is what the thing itself costs, whatever it
+    weighs. No size multiplier is applied."""
     return CatalogueProduct(name=name, category=category, pricing_unit="fixed",
-                            tags=tuple(tags), description=description,
+                            base_price=price, tags=tuple(tags), description=description,
                             previous_names=tuple(previous_names))
+
+
+# ── PRICES THE CURRENT MODEL CANNOT HOLD ─────────────────────────────────
+# Documentation only; nothing reads this at runtime. Every product listed here
+# keeps base_price=None, so it stays an unpriced draft and cannot be put on
+# sale - which is the honest outcome, because writing any single number for
+# these would misprice them.
+#
+# A Product has exactly one base_price and one pricing_unit. That holds "Rs X
+# per kg" and "Rs X per unit". It cannot hold "Rs X for this particular
+# weight", and it cannot hold two prices for two shapes of the same cake.
+#
+# Resolving these needs either per-product sizes or a variant row per shape -
+# both deliberately out of scope for now.
+UNREPRESENTABLE_PRICING: dict[str, str] = {
+    "Chiffon Fresh Fruit Milk Cake": (
+        "Rs 2,400 for a 1.3 kg cake. NOT a per-kg price. This product is 'kg', so "
+        "base_price is multiplied by the chosen SizeRule: 2400 would bill Rs 2,400 "
+        "at 1 kg and Rs 4,800 at 2 kg, when the client's actual cake is 1.3 kg for "
+        "Rs 2,400 (Rs 1,846/kg). Needs a decision: fixed-price product, or a "
+        "per-product weight."
+    ),
+    "Orange Cardamom Crumble": (
+        "Rs 800 for a 500 g loaf, Rs 1,700 for a 1 kg round. Two shapes, two "
+        "prices, one product row."
+    ),
+    "Banana Chocolate Walnut": (
+        "Rs 800 for a 500 g loaf, Rs 1,700 for a 1 kg round."
+    ),
+    "Vanilla Chocolate Pineapple": (
+        "Rs 800 for a 500 g loaf, Rs 1,700 for a 1 kg round. (The Tea Cakes "
+        "product - not the Vanilla Celebration cake of a similar name.)"
+    ),
+    "Almond Tea Cake - With Egg": (
+        "Rs 880 for a 500 g loaf, Rs 1,850 for a 1 kg round. The client has "
+        "confirmed the with-egg and without-egg versions are priced differently, "
+        "which is why they are two rows."
+    ),
+    "Almond Tea Cake - Without Egg": (
+        "Rs 850 for a 500 g loaf, Rs 1,820 for a 1 kg round."
+    ),
+}
+
+# Fixed-price products whose single price corresponds to a specific weight the
+# client quoted. base_price IS correct for these - the weight is what the
+# product is, not a size the customer picks - but the weight is recorded so it
+# is not lost from the menu copy.
+FIXED_WEIGHTS: dict[str, str] = {
+    "Whole Wheat Dates & Walnut Tea Cake": "800 g",
+    "Dog Cake - 500gm": "500 g",
+    "Dog Cake - 1kg": "1 kg",
+}
 
 
 # ── SIZES THE CLIENT SELLS EACH CAKE IN ──────────────────────────────────
@@ -191,6 +248,7 @@ CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
     "Chocolate Celebration Cakes": (
         _kg("Belgian Chocolate Cake", "chocolate-celebration",
             ["chocolate", "belgian", "eggless"],
+            price=2400.0,
             previous_names=["Classic Belgian Chocolate"],
             description=(
                 "Pure chocolate indulgence, made eggless. Rich Belgian chocolate meets "
@@ -202,6 +260,7 @@ CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
             )),
         _kg("Belgian Chocolate Orange Crumble Cake", "chocolate-celebration",
             ["chocolate", "belgian", "orange", "eggless"],
+            price=2450.0,
             previous_names=["Belgian Chocolate Orange Crumble"],
             description=(
                 "A decadent pairing of rich Belgian chocolate and zesty orange, brought "
@@ -217,6 +276,7 @@ CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
         # onto - but worth a second pair of eyes before it goes on sale.
         _kg("Belgian Chocolate Coffee Cake With Cinnamon Roll", "chocolate-celebration",
             ["chocolate", "belgian", "coffee", "eggless"],
+            price=2500.0,
             previous_names=["Belgian Chocolate Coffee Cake"],
             description=(
                 "A rich and indulgent eggless Belgian chocolate coffee cake, topped with a "
@@ -230,6 +290,7 @@ CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
             )),
         _kg("Belgian Chocolate Hazelnut Brownie Cake", "chocolate-celebration",
             ["chocolate", "belgian", "hazelnut", "eggless"],
+            price=2400.0,
             description=(
                 "A decadent combination of rich Belgian chocolate, fudgy brownie and "
                 "roasted hazelnuts, all in one irresistible eggless cake. Dense, gooey and "
@@ -242,6 +303,7 @@ CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
         _kg("Belgian Chocolate Salted Caramel Cake With Roasted Pecan & Crumble",
             "chocolate-celebration",
             ["chocolate", "belgian", "salted-caramel", "pecan", "eggless"],
+            price=2450.0,
             previous_names=["Chocolate Salted Caramel With Roasted Pecan & Crumble"],
             description=(
                 "A decadent celebration of Belgian chocolate and salted caramel, layered "
@@ -256,6 +318,7 @@ CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
             )),
         _kg("Tiramisu Cake", "chocolate-celebration",
             ["coffee", "contains-egg", "contains-alcohol"],
+            price=2500.0,
             description=(
                 "A classic Italian-inspired indulgence, reimagined as a celebration cake. "
                 "Layers of delicate coffee-soaked sponge come together with a rich, creamy "
@@ -270,6 +333,7 @@ CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
     "Vanilla Celebration Cakes": (
         _kg("Vanilla Salted Caramel Cake With Plain Crumble", "vanilla-celebration",
             ["vanilla", "salted-caramel", "eggless"],
+            price=2400.0,
             previous_names=["Vanilla Salted Caramel Cake"],
             description=(
                 "A delicate and indulgent eggless vanilla cake layered with smooth salted "
@@ -280,13 +344,15 @@ CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
                 "flavours shine.\n\n"
                 "Eggless."
             )),
-        # NOT tagged eggless. The client's own note is that the cake is eggless
-        # but the macarons decorating it contain egg - so the thing that arrives
-        # at the customer's door contains egg, and that is what an allergy tag
-        # has to describe. Tagging both would render two contradictory badges.
-        # Confirm with the client whether an egg-free decoration is offered.
+        # Tagged eggless, per the client: the CAKE is eggless, and only the
+        # macarons used to decorate it contain egg. The tag model is a flat list
+        # with no way to qualify a claim, so tagging both would render two
+        # contradictory badges on the same card. The qualification therefore
+        # lives in the description, where it can be read as the sentence it is -
+        # and the last paragraph below is the client's own wording for it.
         _kg("Raspberry Pistachio White Chocolate Cake", "vanilla-celebration",
-            ["white-chocolate", "raspberry", "pistachio", "contains-egg"],
+            ["white-chocolate", "raspberry", "pistachio", "eggless"],
+            price=2400.0,
             description=(
                 "A delicate and indulgent combination of fruity raspberry, creamy white "
                 "chocolate and nutty pistachio. This eggless cake brings together layers of "
@@ -299,6 +365,7 @@ CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
             )),
         _kg("Vanilla Cookie Cream Cake", "vanilla-celebration",
             ["vanilla", "cookie-cream", "eggless"],
+            price=2380.0,
             description=(
                 "A soft and indulgent eggless vanilla cake layered with smooth, creamy "
                 "cookie filling and finished with the irresistible crunch of cookies. "
@@ -310,6 +377,7 @@ CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
             )),
         _kg("Vanilla Pineapple Cake", "vanilla-celebration",
             ["vanilla", "pineapple", "eggless"],
+            price=2300.0,
             description=(
                 "A timeless favourite, our eggless Vanilla Pineapple Cake brings together "
                 "soft, delicate vanilla cake with the bright, juicy sweetness of pineapple "
@@ -323,6 +391,7 @@ CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
         # this is the celebration cake, sold 500g and up.
         _kg("Vanilla Chocolate Pineapple Cake", "vanilla-celebration",
             ["vanilla", "pineapple", "chocolate", "eggless"],
+            price=2450.0,
             previous_names=["Vanilla Pineapple Chocolate"],
             description=(
                 "A twist on a classic favourite - our eggless Vanilla Chocolate Pineapple "
@@ -336,6 +405,7 @@ CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
             )),
         _kg("Blueberry Lemon Curd Cake", "vanilla-celebration",
             ["vanilla", "lemon", "blueberry", "contains-egg"],
+            price=2300.0,
             previous_names=["Vanilla Lemon Curd Blueberry Cake"],
             description=(
                 "A beautifully balanced combination of fresh blueberry and zesty lemon "
@@ -347,6 +417,7 @@ CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
             )),
         _kg("Vanilla Butterscotch Cake", "vanilla-celebration",
             ["vanilla", "butterscotch", "eggless"],
+            price=2280.0,
             description=(
                 "A rich and indulgent take on a classic favourite, our eggless Vanilla "
                 "Butterscotch Cake brings together soft vanilla sponge and vanilla cream, "
@@ -356,7 +427,10 @@ CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
                 "to make an impression.\n\n"
                 "Eggless."
             )),
-        # No copy supplied by the client for this one - left exactly as it was.
+        # No description supplied. Deliberately still unpriced: the client quoted
+        # Rs 2,400 for a 1.3 kg cake, which is not a per-kg price and cannot be
+        # written to a "kg" product without mispricing every size. See
+        # UNREPRESENTABLE_PRICING.
         _kg("Chiffon Fresh Fruit Milk Cake", "vanilla-celebration", ["chiffon", "fresh-fruit", "contains-egg"]),
     ),
     "Desserts & Pudding Tubs": (
@@ -369,11 +443,15 @@ CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
     ),
     # Every brownie is sold as a pack of six; base_price will mean the pack.
     "Brownies": (
-        _fixed("Chocolate Walnut Brownies", "brownies", ["chocolate", "walnut", "pack-of-6"]),
-        _fixed("Cookie Cream Cakey Brownie", "brownies", ["cookie-cream", "pack-of-6"]),
-        _fixed("Chocolate Biscoff Brownie", "brownies", ["chocolate", "biscoff", "pack-of-6"]),
-        _fixed("Chip Chocolate Brownie", "brownies", ["chocolate", "choc-chip", "pack-of-6"]),
+        _fixed("Chocolate Walnut Brownies", "brownies", ["chocolate", "walnut", "pack-of-6"], price=750.0),
+        _fixed("Cookie Cream Cakey Brownie", "brownies", ["cookie-cream", "pack-of-6"], price=750.0),
+        _fixed("Chocolate Biscoff Brownie", "brownies", ["chocolate", "biscoff", "pack-of-6"], price=750.0),
+        _fixed("Chip Chocolate Brownie", "brownies", ["chocolate", "choc-chip", "pack-of-6"], price=750.0),
     ),
+    # Every tea cake is sold in two shapes at two prices - a 500 g loaf and a
+    # 1 kg round - and one base_price cannot hold both. They stay unpriced
+    # rather than guessing which price a customer would be charged; the figures
+    # are recorded in UNREPRESENTABLE_PRICING.
     "Tea Cakes": (
         _fixed("Orange Cardamom Crumble", "tea-cakes", ["orange", "cardamom"]),
         _fixed("Banana Chocolate Walnut", "tea-cakes", ["banana", "chocolate", "walnut"]),
@@ -382,12 +460,12 @@ CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
         _fixed("Almond Tea Cake - Without Egg", "tea-cakes", ["almond"]),
     ),
     "Breads & Bun Collection": (
-        _fixed("Milk Bread", "breads-buns", ["bread"]),
+        _fixed("Milk Bread", "breads-buns", ["bread"], price=45.0),
         _fixed("Wheat Bread", "breads-buns", ["bread", "wheat"]),
         _fixed("100% Wheat Bread", "breads-buns", ["bread", "wheat"]),
-        _fixed("Brioche", "breads-buns", ["bread", "brioche"]),
-        _fixed("Chilli Cheese Garlic Babka", "breads-buns", ["babka", "savoury"]),
-        _fixed("Pesto Babka", "breads-buns", ["babka", "savoury", "pesto"]),
+        _fixed("Brioche", "breads-buns", ["bread", "brioche"], price=250.0),
+        _fixed("Chilli Cheese Garlic Babka", "breads-buns", ["babka", "savoury"], price=290.0),
+        _fixed("Pesto Babka", "breads-buns", ["babka", "savoury", "pesto"], price=290.0),
         _fixed("Burger Bun", "breads-buns", ["bun", "pack-of-6"]),
         _fixed("Pav", "breads-buns", ["bun", "pack-of-6"]),
     ),
@@ -400,14 +478,21 @@ CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
         _fixed("Biscoff Cookie", "cookies", ["cookie", "biscoff", "contains-egg"]),
     ),
     "Healthy Collection": (
-        # "kg" pending confirmation - see the module docstring.
-        _kg("Sugar Free Ragi Chocolate Cake", "healthy", ["ragi", "chocolate", "sugar-free"]),
-        _fixed("Whole Wheat Dates & Walnut Tea Cake", "healthy", ["whole-wheat", "dates", "walnut"]),
+        # "kg" pending confirmation - see the module docstring. The client has now
+        # quoted this one per kg, which supports treating it as a per-kg cake.
+        _kg("Sugar Free Ragi Chocolate Cake", "healthy", ["ragi", "chocolate", "sugar-free"],
+            price=2500.0),
+        # Rs 1,700 for an 800 g cake. Safe as a fixed price: 800 g is what this
+        # product weighs, not a size the customer chooses, so base_price is
+        # simply what the thing costs. The weight is kept in FIXED_WEIGHTS.
+        _fixed("Whole Wheat Dates & Walnut Tea Cake", "healthy", ["whole-wheat", "dates", "walnut"],
+               price=1700.0),
+        # No price supplied yet.
         _fixed("Sourdough Crackers Jar", "healthy", ["sourdough", "crackers", "jar"]),
     ),
     "Dog Cakes": (
-        _fixed("Dog Cake - 500gm", "dog-cakes", ["dog-treat"]),
-        _fixed("Dog Cake - 1kg", "dog-cakes", ["dog-treat"]),
+        _fixed("Dog Cake - 500gm", "dog-cakes", ["dog-treat"], price=950.0),
+        _fixed("Dog Cake - 1kg", "dog-cakes", ["dog-treat"], price=1900.0),
     ),
 }
 
@@ -482,6 +567,18 @@ def _validate_definition() -> list[str]:
                             f"controlled tag. Use one of {sorted(CONTROLLED_TAGS)}"
                         )
                         break
+
+    # A product whose real pricing cannot be expressed as one number must not
+    # quietly acquire one. Clearing the entry from UNREPRESENTABLE_PRICING is
+    # the deliberate act that unblocks it.
+    for section_name, products in CATALOGUE.items():
+        for p in products:
+            if p.name in UNREPRESENTABLE_PRICING and p.base_price is not None:
+                problems.append(
+                    f"{section_name!r} ({p.name!r}): has a base_price but is listed in "
+                    f"UNREPRESENTABLE_PRICING. One number cannot describe its real "
+                    f"pricing - resolve the pricing model first, then remove the entry."
+                )
 
     # A previous name must not be some other product's current name, or the
     # two would fight over the same database row.
@@ -582,17 +679,30 @@ def _summary(resolved: dict[str, MenuSection], db) -> None:
         print("  They cannot be ordered and do not appear on the menu, in WhatsApp")
         print("  or in Build-a-Cake. --apply will price them and put them on sale.")
 
+    blocked = [n for n in UNREPRESENTABLE_PRICING]
+    print()
+    print("Prices the client has given that this model cannot hold "
+          f"({len(blocked)} products, all left unpriced):")
+    for name in blocked:
+        note = " ".join(UNREPRESENTABLE_PRICING[name].split())
+        print(f"  - {name}:")
+        for line in textwrap.wrap(note, width=72):
+            print(f"      {line}")
+
     print()
     print("Unresolved / pending client confirmation:")
     missing = _missing_prices()
-    print(f"  - NO PRICES SUPPLIED: {len(missing)} of {total} products have base_price=None.")
-    print(f"    Nothing goes on sale until every one is filled in.")
-    print("  - Tea Cakes (5) treated as 'fixed' - confirm they are not sold by weight.")
-    print("  - Sugar Free Ragi Chocolate Cake treated as 'kg' - confirm.")
-    print("  - Button/Jumbo and With/Without-Egg are separate rows, not variants.")
+    print(f"  - {total - len(missing)} of {total} products now have a confirmed price.")
+    print(f"    {len(missing)} still have base_price=None; nothing goes on sale until")
+    print(f"    every one is filled in.")
+    print("  - Tea Cakes are 'fixed': the client prices them as a 500 g loaf or a")
+    print("    1 kg round, which are shapes rather than weights chosen at checkout.")
+    print("  - Sugar Free Ragi Chocolate Cake is 'kg': the client quoted it per kg.")
+    print("  - Button/Jumbo cookies are separate rows and still have no prices.")
     print("  - Product names are Title Cased; the client's source mixes cases.")
-    print("  - No product is tagged 'eggless': the source only establishes which")
-    print("    items CONTAIN egg, and silence is not a claim we can make.")
+    print("  - 'eggless' is applied only where the client stated it. Raspberry")
+    print("    Pistachio is eggless with egg-containing macaron decoration; the tag")
+    print("    model cannot qualify a claim, so that sits in its description.")
 
 
 # ── WRITE (only with --apply, only when fully priced) ─────────────────────
