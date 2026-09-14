@@ -78,6 +78,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.db import SessionLocal
 from app.models.menu_section import MenuSection
 from app.models.product import Product
+from app.models.product_option import ProductOption
 
 
 # The original seeded products. Never written to by this script.
@@ -107,11 +108,20 @@ DRAFT_PRICE_SENTINEL = 999999.0
 # without relying on the sentinel number alone.
 DRAFT_TAG = "draft-no-price"
 
+# Stamped on a row that HAS its real price but is deliberately not on sale yet.
+# Reconciliation produces exactly that state, and without a marker for it the
+# row would look finished: --apply decides what still needs publishing, and a
+# priced row with no marker would be skipped and never made available. Keying
+# that decision off is_available instead would be worse - it would also
+# "promote" a product the owner had deliberately paused.
+UNPUBLISHED_TAG = "draft-unpublished"
+
 # Tags with a fixed meaning. Anything else is a free descriptive tag, but these
 # spellings are the only accepted way to say these particular things - an
 # unvalidated "contains egg" would simply stop rendering its badge.
 CONTROLLED_TAGS = {
     DRAFT_TAG,
+    UNPUBLISHED_TAG,
     "contains-egg",
     "eggless",
     "contains-alcohol",
@@ -142,22 +152,40 @@ class CatalogueProduct:
     # the next run. Listing the old name makes the match hold; the row itself
     # is NOT renamed - the script reports the difference and leaves it alone.
     previous_names: tuple[str, ...] = field(default_factory=tuple)
+    # The sizes/shapes this product is sold in, as (label, price, multiplier)
+    # with exactly one of price/multiplier set. Non-empty means these are the
+    # ONLY sizes the product sells in - the global SizeRule table is not
+    # consulted for it, which is how a cake that starts at 700g or is not sold
+    # under 1kg expresses that. See app/models/product_option.py.
+    options: tuple[tuple[str, Optional[float], Optional[float]], ...] = field(default_factory=tuple)
 
 
-def _kg(name, category, tags=(), description=None, previous_names=(), price=None):
+def _kg(name, category, tags=(), description=None, previous_names=(), price=None,
+        options=()):
     """Priced per kilogram: `price` is the price of 1 kg, which the chosen
     SizeRule multiplies."""
     return CatalogueProduct(name=name, category=category, pricing_unit="kg",
                             base_price=price, tags=tuple(tags), description=description,
-                            previous_names=tuple(previous_names))
+                            previous_names=tuple(previous_names), options=tuple(options))
 
 
-def _fixed(name, category, tags=(), description=None, previous_names=(), price=None):
+def _fixed(name, category, tags=(), description=None, previous_names=(), price=None,
+           options=()):
     """Priced as a unit: `price` is what the thing itself costs, whatever it
     weighs. No size multiplier is applied."""
     return CatalogueProduct(name=name, category=category, pricing_unit="fixed",
                             base_price=price, tags=tuple(tags), description=description,
-                            previous_names=tuple(previous_names))
+                            previous_names=tuple(previous_names), options=tuple(options))
+
+
+def _by_weight(*labels_and_multipliers):
+    """Sizes of a per-kg cake. The kg price lives on the product, not here."""
+    return tuple((label, None, mult) for label, mult in labels_and_multipliers)
+
+
+def _priced(*labels_and_prices):
+    """Sizes/shapes priced outright, because they do not scale."""
+    return tuple((label, price, None) for label, price in labels_and_prices)
 
 
 # ── PRICES THE CURRENT MODEL CANNOT HOLD ─────────────────────────────────
@@ -173,32 +201,13 @@ def _fixed(name, category, tags=(), description=None, previous_names=(), price=N
 # Resolving these needs either per-product sizes or a variant row per shape -
 # both deliberately out of scope for now.
 UNREPRESENTABLE_PRICING: dict[str, str] = {
-    "Chiffon Fresh Fruit Milk Cake": (
-        "Rs 2,400 for a 1.3 kg cake. NOT a per-kg price. This product is 'kg', so "
-        "base_price is multiplied by the chosen SizeRule: 2400 would bill Rs 2,400 "
-        "at 1 kg and Rs 4,800 at 2 kg, when the client's actual cake is 1.3 kg for "
-        "Rs 2,400 (Rs 1,846/kg). Needs a decision: fixed-price product, or a "
-        "per-product weight."
-    ),
-    "Orange Cardamom Crumble": (
-        "Rs 800 for a 500 g loaf, Rs 1,700 for a 1 kg round. Two shapes, two "
-        "prices, one product row."
-    ),
-    "Banana Chocolate Walnut": (
-        "Rs 800 for a 500 g loaf, Rs 1,700 for a 1 kg round."
-    ),
-    "Vanilla Chocolate Pineapple": (
-        "Rs 800 for a 500 g loaf, Rs 1,700 for a 1 kg round. (The Tea Cakes "
-        "product - not the Vanilla Celebration cake of a similar name.)"
-    ),
-    "Almond Tea Cake - With Egg": (
-        "Rs 880 for a 500 g loaf, Rs 1,850 for a 1 kg round. The client has "
-        "confirmed the with-egg and without-egg versions are priced differently, "
-        "which is why they are two rows."
-    ),
-    "Almond Tea Cake - Without Egg": (
-        "Rs 850 for a 500 g loaf, Rs 1,820 for a 1 kg round."
-    ),
+    # Empty. Every price the client has given can now be expressed, because a
+    # product can carry its own options: a weight the global size table does
+    # not have (700g), a restricted list (no 500g), a price that is not per kg
+    # (1.3kg for Rs 2,400) and two shapes at two prices (loaf and round).
+    #
+    # Kept as the place to record any future price the model cannot hold. A
+    # product listed here must keep base_price=None, and validation enforces it.
 }
 
 # Fixed-price products whose single price corresponds to a specific weight the
@@ -277,6 +286,8 @@ CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
         _kg("Belgian Chocolate Coffee Cake With Cinnamon Roll", "chocolate-celebration",
             ["chocolate", "belgian", "coffee", "eggless"],
             price=2500.0,
+            # Not sold under 1kg, so 500g is simply not one of its options.
+            options=_by_weight(("1kg", 1.0), ("1.5kg", 1.5), ("2kg", 2.0)),
             previous_names=["Belgian Chocolate Coffee Cake"],
             description=(
                 "A rich and indulgent eggless Belgian chocolate coffee cake, topped with a "
@@ -406,6 +417,8 @@ CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
         _kg("Blueberry Lemon Curd Cake", "vanilla-celebration",
             ["vanilla", "lemon", "blueberry", "contains-egg"],
             price=2300.0,
+            # Starts at 700g, which is not one of the global sizes.
+            options=_by_weight(("700g", 0.7), ("1kg", 1.0), ("1.5kg", 1.5), ("2kg", 2.0)),
             previous_names=["Vanilla Lemon Curd Blueberry Cake"],
             description=(
                 "A beautifully balanced combination of fresh blueberry and zesty lemon "
@@ -427,11 +440,14 @@ CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
                 "to make an impression.\n\n"
                 "Eggless."
             )),
-        # No description supplied. Deliberately still unpriced: the client quoted
-        # Rs 2,400 for a 1.3 kg cake, which is not a per-kg price and cannot be
-        # written to a "kg" product without mispricing every size. See
-        # UNREPRESENTABLE_PRICING.
-        _kg("Chiffon Fresh Fruit Milk Cake", "vanilla-celebration", ["chiffon", "fresh-fruit", "contains-egg"]),
+        # No description supplied. Rs 2,400 is the price of the 1.3kg cake, NOT
+        # a per-kg rate - so it is an outright-priced option rather than a
+        # base_price, and base_price is never consulted for it. Recorded as the
+        # option price so no size can scale it.
+        _kg("Chiffon Fresh Fruit Milk Cake", "vanilla-celebration",
+            ["chiffon", "fresh-fruit", "contains-egg"],
+            price=2400.0,
+            options=_priced(("1.3kg", 2400.0))),
     ),
     "Desserts & Pudding Tubs": (
         _fixed("Classic Fruit Cream Tub", "desserts-tubs", ["tub", "fresh-fruit"]),
@@ -448,16 +464,23 @@ CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
         _fixed("Chocolate Biscoff Brownie", "brownies", ["chocolate", "biscoff", "pack-of-6"], price=750.0),
         _fixed("Chip Chocolate Brownie", "brownies", ["chocolate", "choc-chip", "pack-of-6"], price=750.0),
     ),
-    # Every tea cake is sold in two shapes at two prices - a 500 g loaf and a
-    # 1 kg round - and one base_price cannot hold both. They stay unpriced
-    # rather than guessing which price a customer would be charged; the figures
-    # are recorded in UNREPRESENTABLE_PRICING.
+    # Each tea cake is sold as a 500g loaf or a 1kg round at two prices that are
+    # not a scaling of one another, so both are outright-priced options.
+    # base_price is the loaf, which is what a menu card shows as the "from"
+    # price; the option the customer picks is what they are charged.
     "Tea Cakes": (
-        _fixed("Orange Cardamom Crumble", "tea-cakes", ["orange", "cardamom"]),
-        _fixed("Banana Chocolate Walnut", "tea-cakes", ["banana", "chocolate", "walnut"]),
-        _fixed("Vanilla Chocolate Pineapple", "tea-cakes", ["vanilla", "chocolate", "pineapple"]),
-        _fixed("Almond Tea Cake - With Egg", "tea-cakes", ["almond", "contains-egg"]),
-        _fixed("Almond Tea Cake - Without Egg", "tea-cakes", ["almond"]),
+        _fixed("Orange Cardamom Crumble", "tea-cakes", ["orange", "cardamom"],
+               price=800.0, options=_priced(("500g loaf", 800.0), ("1kg round", 1700.0))),
+        _fixed("Banana Chocolate Walnut", "tea-cakes", ["banana", "chocolate", "walnut"],
+               price=800.0, options=_priced(("500g loaf", 800.0), ("1kg round", 1700.0))),
+        _fixed("Vanilla Chocolate Pineapple", "tea-cakes", ["vanilla", "chocolate", "pineapple"],
+               price=800.0, options=_priced(("500g loaf", 800.0), ("1kg round", 1700.0))),
+        # The client confirmed the with-egg and without-egg versions differ in
+        # price, which is why they are two products rather than one.
+        _fixed("Almond Tea Cake - With Egg", "tea-cakes", ["almond", "contains-egg"],
+               price=880.0, options=_priced(("500g loaf", 880.0), ("1kg round", 1850.0))),
+        _fixed("Almond Tea Cake - Without Egg", "tea-cakes", ["almond"],
+               price=850.0, options=_priced(("500g loaf", 850.0), ("1kg round", 1820.0))),
     ),
     "Breads & Bun Collection": (
         _fixed("Milk Bread", "breads-buns", ["bread"], price=45.0),
@@ -540,11 +563,12 @@ def _validate_definition() -> list[str]:
                     f"{DRAFT_PRICE_SENTINEL}. A real price must never be that number, "
                     f"or --apply cannot tell a priced row from an unpriced one."
                 )
-            if DRAFT_TAG in p.tags:
-                problems.append(
-                    f"{where} ({p.name!r}): {DRAFT_TAG!r} is applied by the script, "
-                    f"never written in the definition"
-                )
+            for managed in (DRAFT_TAG, UNPUBLISHED_TAG):
+                if managed in p.tags:
+                    problems.append(
+                        f"{where} ({p.name!r}): {managed!r} is applied by the script, "
+                        f"never written in the definition"
+                    )
 
             key = p.name.strip().lower()
             if key in seen:
@@ -567,6 +591,30 @@ def _validate_definition() -> list[str]:
                             f"controlled tag. Use one of {sorted(CONTROLLED_TAGS)}"
                         )
                         break
+
+    # Options: exactly one of price/multiplier, no duplicate labels, and a
+    # product cannot be both option-priced and left unpriced.
+    for section_name, products in CATALOGUE.items():
+        for p in products:
+            seen_labels = set()
+            for label, price, mult in p.options:
+                where = f"{section_name!r} ({p.name!r}) option {label!r}"
+                if (price is None) == (mult is None):
+                    problems.append(f"{where}: set exactly one of price or multiplier")
+                if price is not None and price < 0:
+                    problems.append(f"{where}: negative price")
+                if mult is not None and mult <= 0:
+                    problems.append(f"{where}: multiplier must be positive")
+                key = " ".join(label.split()).lower()
+                if key in seen_labels:
+                    problems.append(f"{where}: duplicate label")
+                seen_labels.add(key)
+            # A multiplier option scales base_price, so base_price has to exist.
+            if any(m is not None for _, _, m in p.options) and p.base_price is None:
+                problems.append(
+                    f"{section_name!r} ({p.name!r}): has multiplier options but no "
+                    f"base_price for them to scale"
+                )
 
     # A product whose real pricing cannot be expressed as one number must not
     # quietly acquire one. Clearing the entry from UNREPRESENTABLE_PRICING is
@@ -679,6 +727,18 @@ def _summary(resolved: dict[str, MenuSection], db) -> None:
         print("  They cannot be ordered and do not appear on the menu, in WhatsApp")
         print("  or in Build-a-Cake. --apply will price them and put them on sale.")
 
+    with_options = [(s_, p) for s_, ps in CATALOGUE.items() for p in ps if p.options]
+    if with_options:
+        print()
+        print(f"Products with their own sizes ({len(with_options)}) - these do NOT use")
+        print("the global size list, so anything not listed here is not selectable:")
+        for section_name, item in with_options:
+            shown = ", ".join(
+                f"{label} {'Rs ' + format(price, ',.0f') if price is not None else f'x{mult}'}"
+                for label, price, mult in item.options
+            )
+            print(f"  - {item.name}: {shown}")
+
     blocked = [n for n in UNREPRESENTABLE_PRICING]
     print()
     print("Prices the client has given that this model cannot hold "
@@ -708,9 +768,69 @@ def _summary(resolved: dict[str, MenuSection], db) -> None:
 # ── WRITE (only with --apply, only when fully priced) ─────────────────────
 
 
+def _sync_options(row: Product, item: CatalogueProduct) -> int:
+    """
+    Give an existing row the sizes the catalogue says it sells in.
+
+    Additive and idempotent: an option already on the row by label is left
+    exactly as it is, so a price corrected by hand in the admin is not silently
+    reverted by a re-run. Nothing is removed - an option the catalogue has
+    dropped is reported rather than deleted, because a customer may have
+    ordered it.
+    """
+    existing = {" ".join(o.label.split()).lower() for o in row.options}
+    added = 0
+    for i, (label, opt_price, opt_mult) in enumerate(item.options, start=1):
+        if " ".join(label.split()).lower() in existing:
+            continue
+        print(f"  OPTION   {row.name} (id {row.id}): + {label} "
+              f"{'Rs ' + format(opt_price, ',.0f') if opt_price is not None else f'x{opt_mult}'}")
+        row.options.append(ProductOption(label=label, price=opt_price,
+                                         multiplier=opt_mult, sort_order=i,
+                                         is_active=True))
+        added += 1
+
+    wanted = {" ".join(l.split()).lower() for l, _, _ in item.options}
+    for o in row.options:
+        if o.id is not None and " ".join(o.label.split()).lower() not in wanted:
+            print(f"  NOTE     {row.name} (id {row.id}): option {o.label!r} is on the row "
+                  f"but not in the catalogue. Left alone - deactivate it by hand if "
+                  f"it should no longer sell.")
+    return added
+
+
 def _is_draft_row(row: Product) -> bool:
-    """A row this script created without a real price."""
-    return row.base_price == DRAFT_PRICE_SENTINEL or DRAFT_TAG in (row.tags or [])
+    """
+    A row this script put in place that is not yet on sale.
+
+    Either it never had a real price (the sentinel / DRAFT_TAG), or it has been
+    reconciled to its real price but deliberately left unpublished
+    (UNPUBLISHED_TAG). Both still need --apply to put them on sale; neither is
+    a product the owner has simply paused, which carries no tag at all.
+    """
+    tags = row.tags or []
+    return (row.base_price == DRAFT_PRICE_SENTINEL
+            or DRAFT_TAG in tags
+            or UNPUBLISHED_TAG in tags)
+
+
+def _match_existing(existing: dict, item: CatalogueProduct):
+    """
+    Find the row for a catalogue product: by current name, else by a name it
+    used to be written under. Returns (row, matched_by) where matched_by is
+    "name", a previous name, or None.
+
+    Shared by the write and reconcile paths so the two cannot drift about what
+    counts as the same product.
+    """
+    row = existing.get(item.name.strip().lower())
+    if row is not None:
+        return row, "name"
+    for old_name in item.previous_names:
+        row = existing.get(old_name.strip().lower())
+        if row is not None:
+            return row, old_name
+    return None, None
 
 
 def _write(db, resolved: dict[str, MenuSection], draft: bool) -> tuple[int, int]:
@@ -721,6 +841,9 @@ def _write(db, resolved: dict[str, MenuSection], draft: bool) -> tuple[int, int]
     to a product that is not part of this catalogue.
     """
     created = promoted = 0
+    # Options are attached when a row is created, and reconciled when a draft
+    # row is priced up. A draft pass deliberately does not touch a row that
+    # already exists - see the module docstring.
 
     for section_name, products in CATALOGUE.items():
         section = resolved[section_name]
@@ -730,19 +853,12 @@ def _write(db, resolved: dict[str, MenuSection], draft: bool) -> tuple[int, int]
         }
 
         for position, item in enumerate(products, start=1):
-            match = existing.get(item.name.strip().lower())
-
-            # Renamed since the row was written. Match it anyway so a rename
-            # cannot quietly produce a second row for the same cake. The row is
-            # NOT renamed here - that is a product change, and this script only
-            # reports the difference.
-            renamed_from = None
-            if match is None:
-                for old_name in item.previous_names:
-                    candidate = existing.get(old_name.strip().lower())
-                    if candidate is not None:
-                        match, renamed_from = candidate, old_name
-                        break
+            # Matched by current name, or by a name it used to be written
+            # under, so a rename cannot quietly produce a second row for the
+            # same cake. --apply-draft does NOT rename the row; --reconcile-draft
+            # is the mode that does.
+            match, matched_by = _match_existing(existing, item)
+            renamed_from = matched_by if matched_by not in (None, "name") else None
 
             if match is not None:
                 # Belt and braces: a catalogue name must never resolve onto one
@@ -767,7 +883,9 @@ def _write(db, resolved: dict[str, MenuSection], draft: bool) -> tuple[int, int]
                 print(f"  PRICE    {section_name} / {item.name} (id {match.id}) "
                       f"{match.base_price} -> {item.base_price}, now available")
                 match.base_price = item.base_price
-                match.tags = [t for t in (match.tags or []) if t != DRAFT_TAG]
+                _sync_options(match, item)
+                match.tags = [t for t in (match.tags or [])
+                              if t not in (DRAFT_TAG, UNPUBLISHED_TAG)]
                 match.is_available = True
                 promoted += 1
                 continue
@@ -786,7 +904,7 @@ def _write(db, resolved: dict[str, MenuSection], draft: bool) -> tuple[int, int]
                   f"[{item.pricing_unit}, sort {position}, "
                   f"{'NO PRICE - placeholder ' + str(price) if unpriced else 'Rs ' + str(price)}, "
                   f"available={available}]")
-            db.add(Product(
+            product = Product(
                 name=item.name,
                 category=item.category,
                 description=item.description,
@@ -797,10 +915,178 @@ def _write(db, resolved: dict[str, MenuSection], draft: bool) -> tuple[int, int]
                 tags=tags,
                 section_id=section.id,
                 sort_order=position,
-            ))
+            )
+            for i, (label, opt_price, opt_mult) in enumerate(item.options, start=1):
+                product.options.append(ProductOption(
+                    label=label, price=opt_price, multiplier=opt_mult,
+                    sort_order=i, is_active=True,
+                ))
+            db.add(product)
             created += 1
 
     return created, promoted
+
+
+def _reconcile(db, resolved: dict[str, MenuSection]) -> dict:
+    """
+    Bring the existing draft rows in line with the catalogue, WITHOUT publishing.
+
+    This is the local step between "the rows exist" and "the menu is live". It
+    renames, prices and gives rows their options, and it never sets
+    is_available - so nothing it does can put a product in front of a customer.
+    Publishing stays the job of --apply, which still refuses while any price is
+    missing.
+
+    What it will not do:
+      * create a row - a catalogue product with no matching row is an error,
+        because it means the database and the catalogue have diverged and
+        --apply-draft should have run first
+      * touch products 1-5
+      * overwrite an option price that already exists - a correction made by
+        hand in the admin survives a re-run, and the difference is reported
+        instead
+      * delete an option - one may already be on an order
+
+    Idempotent: a second run finds everything in place and changes nothing.
+    """
+    report = {
+        "matched_by_name": [], "matched_by_previous_name": [], "renamed": [],
+        "repriced": [], "options_added": [], "option_differences": [],
+        "left_unpriced": [], "left_unavailable": [], "created": [],
+        "protected_touched": [], "missing": [],
+    }
+
+    for section_name, products in CATALOGUE.items():
+        section = resolved[section_name]
+        existing = {
+            p.name.strip().lower(): p
+            for p in db.query(Product).filter(Product.section_id == section.id).all()
+        }
+
+        for item in products:
+            match, matched_by = _match_existing(existing, item)
+
+            if match is None:
+                report["missing"].append(f"{section_name} / {item.name}")
+                continue
+
+            if match.id in PROTECTED_PRODUCT_IDS:
+                report["protected_touched"].append(f"id {match.id} ({match.name})")
+                raise ValidationError(
+                    f"{item.name!r} matches protected product id {match.id}. "
+                    f"Refusing to touch the original seeded products."
+                )
+
+            where = f"{section_name} / {item.name}"
+            if matched_by == "name":
+                report["matched_by_name"].append(where)
+            else:
+                report["matched_by_previous_name"].append(f"{where} (was {matched_by!r})")
+
+            # ── Name ──
+            if match.name != item.name:
+                report["renamed"].append(f"id {match.id}: {match.name!r} -> {item.name!r}")
+                match.name = item.name
+
+            # ── Price ──
+            if item.base_price is not None:
+                if match.base_price != item.base_price:
+                    report["repriced"].append(
+                        f"id {match.id} {item.name}: {match.base_price} -> {item.base_price}"
+                    )
+                    match.base_price = item.base_price
+                # Priced now, so the "no price" marker would be a lie. Replaced
+                # with the marker that says what is actually true: priced, but
+                # not yet on sale.
+                tags = [t for t in (match.tags or []) if t != DRAFT_TAG]
+                if UNPUBLISHED_TAG not in tags:
+                    tags.append(UNPUBLISHED_TAG)
+                match.tags = tags
+            else:
+                # No price supplied. Left exactly as it is: the placeholder, the
+                # draft tag and unavailable. Nothing here makes it orderable.
+                report["left_unpriced"].append(f"id {match.id} {item.name}")
+
+            # ── Options ──
+            for added in _plan_options(match, item):
+                if added["action"] == "add":
+                    report["options_added"].append(
+                        f"id {match.id} {item.name}: + {added['label']}"
+                    )
+                    match.options.append(ProductOption(
+                        label=added["label"], price=added["price"],
+                        multiplier=added["multiplier"], sort_order=added["sort_order"],
+                        is_active=True,
+                    ))
+                else:
+                    report["option_differences"].append(added["note"])
+
+            # ── Availability: never touched ──
+            if not match.is_available:
+                report["left_unavailable"].append(f"id {match.id} {item.name}")
+
+    return report
+
+
+def _plan_options(row: Product, item: CatalogueProduct) -> list[dict]:
+    """
+    What to do about this row's options: add the missing ones, and report - not
+    overwrite - any whose stored value differs from the catalogue. An option
+    already on the row may have been corrected by hand, or already sold.
+    """
+    by_label = {" ".join(o.label.split()).lower(): o for o in row.options}
+    plan = []
+    for i, (label, price, mult) in enumerate(item.options, start=1):
+        key = " ".join(label.split()).lower()
+        current = by_label.get(key)
+        if current is None:
+            plan.append({"action": "add", "label": label, "price": price,
+                         "multiplier": mult, "sort_order": i})
+            continue
+        if current.price != price or current.multiplier != mult:
+            plan.append({"action": "differs", "note": (
+                f"id {row.id} {row.name}: option {label!r} is "
+                f"{'Rs ' + str(current.price) if current.price is not None else 'x' + str(current.multiplier)} "
+                f"in the database, catalogue says "
+                f"{'Rs ' + str(price) if price is not None else 'x' + str(mult)}. "
+                f"Left as it is - change it in the admin if the database is wrong."
+            )})
+    return plan
+
+
+def _print_reconcile_report(report: dict, dry_run: bool) -> None:
+    def block(title, key, empty="none"):
+        rows = report[key]
+        print(f"  {title}: {len(rows)}")
+        for r in rows:
+            print(f"      {r}")
+        if not rows:
+            print(f"      ({empty})")
+
+    print()
+    print("Reconciliation plan" if dry_run else "Reconciliation")
+    print(f"  matched by current name : {len(report['matched_by_name'])}")
+    print(f"  matched by previous name: {len(report['matched_by_previous_name'])}")
+    for r in report["matched_by_previous_name"]:
+        print(f"      {r}")
+    print()
+    block("renamed", "renamed")
+    print()
+    block("price changes", "repriced")
+    print()
+    block("options to attach", "options_added")
+    if report["option_differences"]:
+        print()
+        block("options that DIFFER (left alone)", "option_differences")
+    print()
+    print(f"  left unpriced (placeholder, draft tag): {len(report['left_unpriced'])}")
+    print(f"  left unavailable                      : {len(report['left_unavailable'])}")
+    print(f"  products created                      : {len(report['created'])} (must be 0)")
+    print(f"  protected products touched            : {len(report['protected_touched'])} (must be 0)")
+    if report["missing"]:
+        print(f"  MISSING rows (catalogue has no match) : {len(report['missing'])}")
+        for r in report["missing"]:
+            print(f"      {r}")
 
 
 def main() -> int:
@@ -820,14 +1106,28 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--reconcile-draft", action="store_true",
+        help=(
+            "bring existing draft rows in line with the catalogue WITHOUT "
+            "publishing: rename, apply confirmed prices, attach options. Never "
+            "sets is_available, never creates a row, never touches products "
+            "1-5. Rows with no confirmed price keep their placeholder and stay "
+            "unavailable. Idempotent."
+        ),
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
-        help="explicit no-op mode; this is also the default when no apply flag is given.",
+        help=(
+            "plan only. On its own it validates and reports; combined with a "
+            "write mode it runs that mode in a transaction and rolls it back, "
+            "so the exact plan can be read before anything is kept."
+        ),
     )
     args = parser.parse_args()
 
-    modes = [args.apply, args.apply_draft, args.dry_run]
-    if sum(bool(m) for m in modes) > 1:
-        print("Pick one of --apply, --apply-draft or --dry-run.", file=sys.stderr)
+    write_modes = [args.apply, args.apply_draft, args.reconcile_draft]
+    if sum(bool(m) for m in write_modes) > 1:
+        print("Pick one of --apply, --apply-draft or --reconcile-draft.", file=sys.stderr)
         return 2
 
     db = SessionLocal()
@@ -848,6 +1148,32 @@ def main() -> int:
 
         missing = _missing_prices()
 
+        if args.reconcile_draft:
+            report = _reconcile(db, resolved)
+            _print_reconcile_report(report, dry_run=args.dry_run)
+
+            if report["missing"]:
+                db.rollback()
+                print()
+                print("ABORTED: the catalogue has products with no row in the database.")
+                print("Run --apply-draft first to create them.")
+                return 1
+            if report["protected_touched"]:
+                db.rollback()
+                print("\nABORTED: refused to touch a protected product.")
+                return 2
+
+            if args.dry_run:
+                db.rollback()
+                print()
+                print("Dry run - rolled back. Nothing was written.")
+                return 0
+
+            db.commit()
+            print()
+            print("  committed - no product was made available; publishing is still --apply.")
+            return 0
+
         if args.apply_draft:
             print()
             print("Applying DRAFT catalogue")
@@ -855,6 +1181,10 @@ def main() -> int:
             print(f"  the placeholder {DRAFT_PRICE_SENTINEL} and the {DRAFT_TAG!r} tag - that")
             print(f"  is NOT a price, and the row cannot be ordered while it is unavailable.")
             created, _ = _write(db, resolved, draft=True)
+            if args.dry_run:
+                db.rollback()
+                print(f"  dry run - rolled back; {created} row(s) would have been created")
+                return 0
             db.commit()
             print(f"  committed - {created} draft row(s) created")
             if missing:
@@ -868,6 +1198,8 @@ def main() -> int:
             print("Dry run - no database changes were made"
                   if args.dry_run else
                   "Validation only (default) - no database changes were made.")
+            print(f"--reconcile-draft would align {sum(len(v) for v in CATALOGUE.values())} "
+                  f"existing row(s) without publishing any.")
             if missing:
                 print(f"--apply would be REFUSED: {len(missing)} product(s) have no price.")
                 print(f"--apply-draft would create {len(CATALOGUE) and sum(len(v) for v in CATALOGUE.values())} "
@@ -889,6 +1221,10 @@ def main() -> int:
         print()
         print("Applying")
         created, promoted = _write(db, resolved, draft=False)
+        if args.dry_run:
+            db.rollback()
+            print(f"  dry run - rolled back; {created} created, {promoted} would be published")
+            return 0
         db.commit()
         print(f"  committed - {created} created, {promoted} draft row(s) priced and put on sale")
         return 0

@@ -6,7 +6,7 @@ Organized by domain — add new schemas at the bottom of each section.
 from __future__ import annotations
 from datetime import datetime
 from typing import Literal, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ─── AUTH ─────────────────────────────────────────────
@@ -147,6 +147,49 @@ class ProductUpdate(BaseModel):
     section_id: Optional[int] = None
     sort_order: Optional[int] = None
 
+class ProductOptionBase(BaseModel):
+    """
+    One size/shape a product is sold in.
+
+    Exactly one of `price` and `multiplier`: `multiplier` scales the product's
+    per-kg base_price, `price` replaces it outright. Enforced here so an option
+    that means nothing cannot be stored.
+    """
+    label: str = Field(min_length=1, max_length=60)
+    price: Optional[float] = Field(default=None, ge=0)
+    multiplier: Optional[float] = Field(default=None, gt=0)
+    sort_order: int = 0
+    is_active: bool = True
+
+    @model_validator(mode="after")
+    def _exactly_one_pricing_rule(self):
+        if (self.price is None) == (self.multiplier is None):
+            raise ValueError(
+                "set exactly one of price (the option costs this) or multiplier "
+                "(the option costs base_price x this)"
+            )
+        return self
+
+class ProductOptionCreate(ProductOptionBase):
+    pass
+
+class ProductOptionUpdate(BaseModel):
+    label: Optional[str] = Field(default=None, min_length=1, max_length=60)
+    price: Optional[float] = Field(default=None, ge=0)
+    multiplier: Optional[float] = Field(default=None, gt=0)
+    sort_order: Optional[int] = None
+    is_active: Optional[bool] = None
+
+class ProductOptionRead(BaseModel):
+    id: int
+    label: str
+    price: Optional[float]
+    multiplier: Optional[float]
+    sort_order: int
+    is_active: bool
+    class Config:
+        from_attributes = True
+
 class ProductRead(BaseModel):
     id: int
     name: str
@@ -160,6 +203,10 @@ class ProductRead(BaseModel):
     pricing_unit: str
     section_id: Optional[int] = None
     sort_order: int = 0
+    # Empty for a product that uses the global sizes (or none at all). When it
+    # is non-empty these are the ONLY sizes this product can be ordered in, and
+    # the client must not offer the global size list for it.
+    options: list[ProductOptionRead] = Field(default_factory=list)
     created_at: datetime
 
     class Config:
@@ -319,6 +366,10 @@ class PricingRequest(BaseModel):
 
 class PriceBreakdown(BaseModel):
     base_price: float
+    # Which ProductOption was bought, when the product has its own sizes.
+    # Snapshotted onto the order line, so "500g loaf" and "1kg round" stay
+    # distinguishable in the order history long after the option is edited.
+    option_label: str = ""
     size_multiplier: float
     size_adjusted: float
     flavor_cost: float

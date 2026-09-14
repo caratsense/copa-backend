@@ -402,3 +402,213 @@ def test_notification_text_does_not_invent_a_size(db, brownie):
     db.refresh(order)
 
     assert _items_str(order) == "Chocolate Walnut Brownie x2"
+
+
+# ─── PRODUCT-SPECIFIC SIZES ──────────────────────────
+# Some products sell in their own sizes rather than the global six: a cake that
+# starts at 700g, one not sold under 1kg, a 1.3kg chiffon priced outright, and
+# tea cakes sold as a loaf or a round at two unrelated prices. WhatsApp must
+# offer those and only those, and must not invent a "1kg".
+
+from app.models.product_option import ProductOption
+
+
+def _with_options(db, name, price, unit, options):
+    product = Product(name=name, category="test", base_price=price,
+                      pricing_unit=unit, is_customizable=False, is_available=True)
+    db.add(product)
+    db.commit()
+    db.refresh(product)
+    for i, (label, kwargs) in enumerate(options, start=1):
+        db.add(ProductOption(product_id=product.id, label=label, sort_order=i, **kwargs))
+    db.commit()
+    db.refresh(product)
+    return product
+
+
+def _reply(phone, text):
+    return handle_customer_message(phone, text, None)
+
+
+PHONE = "919222222222"
+
+
+@pytest.fixture
+def blueberry(db):
+    return _with_options(db, "Blueberry Lemon Curd Cake", 2300.0, "kg", [
+        ("700g", {"multiplier": 0.7}), ("1kg", {"multiplier": 1.0}),
+        ("1.5kg", {"multiplier": 1.5}), ("2kg", {"multiplier": 2.0})])
+
+
+@pytest.fixture
+def coffee_cake(db):
+    return _with_options(db, "Belgian Chocolate Coffee Cake With Cinnamon Roll",
+                         2500.0, "kg", [
+        ("1kg", {"multiplier": 1.0}), ("1.5kg", {"multiplier": 1.5}),
+        ("2kg", {"multiplier": 2.0})])
+
+
+@pytest.fixture
+def tea_cake(db):
+    return _with_options(db, "Orange Cardamom Crumble", 800.0, "fixed", [
+        ("500g loaf", {"price": 800.0}), ("1kg round", {"price": 1700.0})])
+
+
+def test_blueberry_offers_700g_and_never_500g(db, catalogue, blueberry):
+    reply = _choose(PHONE, blueberry)
+
+    assert "700g" in reply
+    assert "500g" not in reply, "offered a weight this cake is not sold in"
+    assert wcf._get_state(PHONE)["step"] == "SELECT_SIZE"
+    assert [s["name"] for s in wcf._get_state(PHONE)["sizes"]] == \
+        ["700g", "1kg", "1.5kg", "2kg"]
+
+
+def test_coffee_cake_offers_1kg_and_never_500g(db, catalogue, coffee_cake):
+    reply = _choose(PHONE, coffee_cake)
+
+    assert "1kg" in reply and "1.5kg" in reply and "2kg" in reply
+    assert "500g" not in reply
+    assert [s["name"] for s in wcf._get_state(PHONE)["sizes"]] == ["1kg", "1.5kg", "2kg"]
+
+
+def test_the_global_size_list_is_not_shown_for_an_option_product(db, catalogue, blueberry):
+    """`catalogue` seeds a global 1kg SizeRule; it must not leak in."""
+    # Deliberately not a weight: "5kg" would be a substring of the "1.5kg"
+    # option and the assertion would pass or fail for the wrong reason.
+    db.add(SizeRule(name="Party Platter", multiplier=5.0, is_active=True))
+    db.commit()
+
+    reply = _choose(PHONE, blueberry)
+
+    assert "Party Platter" not in reply, "a global SizeRule leaked into a product's own list"
+    # The offered list is exactly the product's own options, nothing appended.
+    assert [s["name"] for s in wcf._get_state(PHONE)["sizes"]] == \
+        ["700g", "1kg", "1.5kg", "2kg"]
+
+
+def test_chiffon_offers_its_single_option_and_is_not_quoted_per_kg(db, catalogue):
+    chiffon = _with_options(db, "Chiffon Fresh Fruit Milk Cake", 2400.0, "kg", [
+        ("1.3kg", {"price": 2400.0})])
+
+    reply = _choose(PHONE, chiffon)
+
+    assert "1.3kg" in reply
+    assert "/kg" not in reply, "quoted a 1.3kg cake as a per-kg price"
+    assert "₹2,400" in reply
+
+
+def test_tea_cake_shows_both_shapes_with_their_prices(db, catalogue, tea_cake):
+    reply = _choose(PHONE, tea_cake)
+
+    assert "500g loaf" in reply and "₹800" in reply
+    assert "1kg round" in reply and "₹1,700" in reply
+    assert "from ₹800" in reply, "a two-price product needs a 'from' headline"
+
+
+def test_picking_an_option_carries_its_label_into_the_conversation(db, catalogue, blueberry):
+    _choose(PHONE, blueberry)
+    reply = _reply(PHONE, "1")          # 700g
+
+    assert "Size: *700g*" in reply
+    assert wcf._get_state(PHONE)["size"]["name"] == "700g"
+    assert wcf._get_state(PHONE)["step"] == "SELECT_FLAVOR"
+
+
+def test_an_unmatched_size_is_refused_rather_than_defaulted(db, catalogue, blueberry):
+    _choose(PHONE, blueberry)
+    reply = _reply(PHONE, "9")
+
+    assert "Please select a size" in reply
+    assert wcf._get_state(PHONE)["step"] == "SELECT_SIZE", "moved on without a size"
+    assert "size" not in wcf._get_state(PHONE)
+
+
+# ─── EXISTING BEHAVIOUR IS UNCHANGED ─────────────────
+
+def test_a_normal_per_kg_product_still_uses_the_global_sizes(db, catalogue):
+    """`catalogue`'s Premium Cake has no options."""
+    reply = _choose(PHONE, catalogue)
+
+    assert "Select size:" in reply
+    assert [s["name"] for s in wcf._get_state(PHONE)["sizes"]] == ["1kg"]
+    assert wcf._get_state(PHONE)["sizes"][0]["multiplier"] == 1.0
+
+
+def test_a_fixed_product_with_no_options_still_skips_the_size_step(db, catalogue, brownie):
+    reply = _choose(PHONE, brownie)
+
+    assert "Select size:" not in reply
+    assert "Select flavor:" in reply
+    assert wcf._get_state(PHONE)["size"] is None
+
+
+# ─── THE CHOICE REACHES PRICING AND THE ORDER ────────
+
+def test_the_summary_quotes_the_option_price_from_the_pricing_engine(db, catalogue, tea_cake):
+    _choose(PHONE, tea_cake)
+    _reply(PHONE, "2")                  # 1kg round, Rs 1,700
+    state = wcf._get_state(PHONE)
+    wcf._set_state(PHONE, {**state, "step": "SELECT_TIME", "flavor": {},
+                           "address": "Self Pickup", "delivery_date": "2026-12-25"})
+
+    summary = _reply(PHONE, "2")
+
+    assert "*Total: ₹1,700*" in summary
+    assert "Size: 1kg round" in summary
+
+
+def test_almond_with_and_without_egg_quote_different_prices(db, catalogue):
+    with_egg = _with_options(db, "Almond Tea Cake - With Egg", 880.0, "fixed", [
+        ("500g loaf", {"price": 880.0}), ("1kg round", {"price": 1850.0})])
+    without = _with_options(db, "Almond Tea Cake - Without Egg", 850.0, "fixed", [
+        ("500g loaf", {"price": 850.0}), ("1kg round", {"price": 1820.0})])
+
+    quotes = {}
+    for product in (with_egg, without):
+        wcf._clear_state(PHONE)
+        _choose(PHONE, product)
+        _reply(PHONE, "2")              # 1kg round
+        state = wcf._get_state(PHONE)
+        wcf._set_state(PHONE, {**state, "step": "SELECT_TIME", "flavor": {},
+                               "address": "Self Pickup", "delivery_date": "2026-12-25"})
+        quotes[product.name] = _reply(PHONE, "2")
+
+    assert "*Total: ₹1,850*" in quotes["Almond Tea Cake - With Egg"]
+    assert "*Total: ₹1,820*" in quotes["Almond Tea Cake - Without Egg"]
+
+
+def test_the_chosen_option_reaches_the_order_with_no_fake_1kg(db, catalogue, tea_cake, wa_secret):
+    from app.models.order import Order
+
+    user = make_user(db, "Priya", UserRole.CUSTOMER, phone="+919222222222")
+    user.whatsapp_opt_in = True
+    db.commit()
+
+    _choose(PHONE, tea_cake)
+    _reply(PHONE, "1")                  # 500g loaf
+    state = wcf._get_state(PHONE)
+    assert state["size"]["name"] == "500g loaf"
+    wcf._set_state(PHONE, {**state, "step": "CONFIRM", "flavor": {"name": ""},
+                           "address": "Self Pickup", "delivery_date": "2026-12-25",
+                           "time_hours": 14})
+
+    handle_customer_message(PHONE, "CONFIRM", user)
+
+    order = db.query(Order).order_by(Order.id.desc()).first()
+    assert order.items[0].customization["size"] == "500g loaf"
+    assert order.items[0].customization["size"] != "1kg"
+    assert order.total_price == 800.0
+    assert order.items[0].price_breakdown["option_label"] == "500g loaf"
+
+
+def test_no_step_of_the_flow_invents_a_1kg_for_an_option_product(db, catalogue, tea_cake):
+    """A fixed-price tea cake must never acquire a weight it is not sold by."""
+    replies = [_choose(PHONE, tea_cake)]
+    replies.append(_reply(PHONE, "1"))
+    state = wcf._get_state(PHONE)
+    wcf._set_state(PHONE, {**state, "step": "SELECT_TIME", "flavor": {},
+                           "address": "Self Pickup", "delivery_date": "2026-12-25"})
+    replies.append(_reply(PHONE, "2"))
+
+    assert not any("1kg" in r and "1kg round" not in r for r in replies)

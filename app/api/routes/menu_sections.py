@@ -71,6 +71,13 @@ def get_menu_sections(db: Session = Depends(get_db)):
                 "tags": p.tags or [],
                 # Tells the menu whether to show "/kg" and a size selector.
                 "pricing_unit": p.pricing_unit,
+                # When non-empty these are the ONLY sizes this product sells in;
+                # the global size list must not be offered for it.
+                "options": [
+                    {"id": o.id, "label": o.label, "price": o.price,
+                     "multiplier": o.multiplier, "sort_order": o.sort_order}
+                    for o in p.options if o.is_active
+                ],
                 "sort_order": p.sort_order,
             }
             for p in sec.products
@@ -108,6 +115,11 @@ def get_menu_sections(db: Session = Depends(get_db)):
                     "image_url": p.image_url, "is_customizable": p.is_customizable,
                     "is_available": p.is_available, "tags": p.tags or [],
                     "pricing_unit": p.pricing_unit,
+                    "options": [
+                        {"id": o.id, "label": o.label, "price": o.price,
+                         "multiplier": o.multiplier, "sort_order": o.sort_order}
+                        for o in p.options if o.is_active
+                    ],
                     "sort_order": p.sort_order,
                 }
                 for p in orphan_products

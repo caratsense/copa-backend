@@ -81,10 +81,64 @@ def _is_per_kg(product: Optional[dict]) -> bool:
     return (product or {}).get("pricing_unit", "kg") == "kg"
 
 
+def _options(product: Optional[dict]) -> list[dict]:
+    """
+    The sizes this particular product is sold in, or [] if it uses the global
+    ones. Absent from conversations parked in Redis before this shipped, which
+    read as "no options" - the behaviour those conversations already had.
+    """
+    return list((product or {}).get("options") or [])
+
+
+def _needs_size(product: Optional[dict]) -> bool:
+    """Whether to ask for a size at all: a per-kg cake, or anything with its
+    own options - including a fixed-price tea cake sold as a loaf or a round."""
+    return bool(_options(product)) or _is_per_kg(product)
+
+
 def _price_label(product: dict) -> str:
-    """"Rs 2,000/kg" for a cake sold by weight, "Rs 400" for a fixed-price item."""
+    """
+    The headline price.
+
+    "Rs 2,000/kg" for a cake sold by weight, "Rs 400" for a fixed-price item,
+    and for a product whose options carry their own prices, those prices - a
+    1.3kg chiffon cake at Rs 2,400 is not Rs 2,400/kg, and quoting it that way
+    would be a lie whichever size the customer then picked. The numbers here
+    are read from the options, never worked out from a multiplier: what an
+    option costs is the pricing engine's business, not this flow's.
+    """
+    priced = [o["price"] for o in _options(product) if o.get("price") is not None]
+    if len(priced) == 1:
+        return f"₹{priced[0]:,.0f}"
+    if priced:
+        return f"from ₹{min(priced):,.0f}"
     price = f"₹{product.get('base_price', 0):,.0f}"
     return f"{price}/kg" if _is_per_kg(product) else price
+
+
+def _ask_for_size(phone: str, state: dict, product: dict) -> str:
+    """
+    Offer the product's own sizes, and only those.
+
+    The global size list is not shown for these products, so a weight it does
+    not sell in is not offered and cannot be picked. An explicitly priced
+    option shows its price, because a Rs 800 loaf and a Rs 1,700 round are not
+    the same choice; a per-kg option shows only its label, since its price
+    comes from the kg rate in the header.
+    """
+    options = _options(product)
+    lines = [f"*{product['name']}* — {_price_label(product)}\n\n*Select size:*\n"]
+    for i, option in enumerate(options, 1):
+        price = option.get("price")
+        suffix = f" — ₹{price:,.0f}" if price is not None else ""
+        lines.append(f"{i}. {option['label']}{suffix}")
+    # Stored under the same key the size step already reads, so an option and a
+    # global SizeRule are picked the same way.
+    _set_state(phone, {
+        **state, "step": "SELECT_SIZE", "product": product,
+        "sizes": [{"name": o["label"], "price": o.get("price")} for o in options],
+    })
+    return "\n".join(lines)
 
 
 def _ask_for_flavor(db, phone: str, state: dict, header: str) -> str:
@@ -142,7 +196,9 @@ def handle_customer_message(phone: str, message: str, user: Optional[User]) -> s
 
     try:
         products = [{"id": p.id, "name": p.name, "base_price": p.base_price,
-                     "pricing_unit": p.pricing_unit}
+                     "pricing_unit": p.pricing_unit,
+                     "options": [{"label": o.label, "price": o.price}
+                                 for o in p.options if o.is_active]}
                     for p in db.query(Product).filter(Product.is_available == True).all()]
         context = {"step": step, "products": products}
         action = parse_message(message, "customer", context)
@@ -237,10 +293,16 @@ def handle_customer_message(phone: str, message: str, user: Optional[User]) -> s
             if not selected:
                 return f"Please select a valid option (1 to {len(prods)}) or type the cake name."
 
-            # A fixed-price product has no size to ask about - base_price is
-            # its price - so it goes straight to the flavour step. Asking a
-            # customer whether they want 500g or 5kg of a pack of six buns is
-            # a question with no answer.
+            # This product sells in its own sizes. Offer those and nothing
+            # else - the global list is not consulted for it, which is how a
+            # cake that is not sold under 1kg stops offering 500g.
+            if _options(selected):
+                return _ask_for_size(phone, state, selected)
+
+            # A fixed-price product with no options has no size to ask about -
+            # base_price is its price - so it goes straight to the flavour
+            # step. Asking a customer whether they want 500g or 5kg of a pack
+            # of six buns is a question with no answer.
             if not _is_per_kg(selected):
                 return _ask_for_flavor(
                     db, phone, {**state, "product": selected, "size": None},
@@ -400,7 +462,7 @@ def handle_customer_message(phone: str, message: str, user: Optional[User]) -> s
             # sell it by. Gated on the product as well as on the state, so a
             # stale size left over from an earlier choice cannot put a weight
             # back on a fixed-price line.
-            if size.get("name") and _is_per_kg(product):
+            if size.get("name") and _needs_size(product):
                 summary += f"Size: {size['name']}\n"
             summary += f"Flavor: {flavor.get('name', 'Classic')}\n"
             if cake_msg:

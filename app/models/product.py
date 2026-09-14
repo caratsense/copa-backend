@@ -27,3 +27,13 @@ class Product(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     section = relationship("MenuSection", back_populates="products")
+    # The sizes/shapes this particular product is sold in. Empty for most
+    # products, which fall back to the global SizeRule table (per-kg) or to a
+    # single fixed price. See app/models/product_option.py.
+    options = relationship(
+        "ProductOption",
+        back_populates="product",
+        cascade="all, delete-orphan",
+        order_by="(ProductOption.sort_order, ProductOption.id)",
+        lazy="selectin",
+    )

@@ -28,6 +28,7 @@ from sqlalchemy.orm import Session
 from fastapi import HTTPException
 
 from app.models.product import Product
+from app.models.product_option import ProductOption
 from app.models.pricing import SizeRule, FlavorRule, DesignRule, AddonRule, RushRule
 from app.models.delivery import DeliveryZone
 from app.schemas import ItemCustomization, PriceBreakdown, PricingRequest, PricingResponse
@@ -63,6 +64,45 @@ def _find_rule(db: Session, model, name: str, label: str):
             detail=f"Unknown {label}: '{name}'. Choose one of the available options.",
         )
     return row
+
+
+def _resolve_option(db: Session, product: Product, chosen: str):
+    """
+    The product option the customer picked, or None if this product has none.
+
+    A product with options is priced only from them - the global SizeRule table
+    is not consulted for it - so a size that is not one of its options is not
+    selectable, and saying so is the whole mechanism. No product is named here;
+    the rule is the same for every one of them.
+
+    A blank choice is rejected rather than defaulted. These options are not
+    proportional to each other: a tea cake is Rs 800 as a loaf and Rs 1,700 as
+    a round, so guessing which one the customer meant is guessing what to
+    charge them.
+    """
+    options = [o for o in (product.options or []) if o.is_active]
+    if not options:
+        return None
+
+    wanted = _normalise(chosen)
+    if wanted:
+        for option in options:
+            if _normalise(option.label) == wanted:
+                return option
+
+    available = ", ".join(o.label for o in options)
+    if not wanted:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Choose a size for '{product.name}': {available}.",
+        )
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"'{chosen}' is not available for '{product.name}'. "
+            f"Choose one of: {available}."
+        ),
+    )
 
 
 def _cost_of(db: Session, model, name: str, cost_field: str, label: str) -> float:
@@ -124,12 +164,27 @@ def calculate_item_price(
     # the first one is created. Ignoring is safe by construction - the
     # multiplier is the literal 1.0 and no SizeRule is ever consulted - and
     # this can be tightened to a 400 once those callers stop sending a size.
-    if product.pricing_unit == "kg":
+    #
+    # A product may instead carry its own options - the weights and shapes that
+    # particular product is sold in. Those replace the global SizeRule table
+    # for it entirely, which is how a cake that is not sold under 1kg stops
+    # offering 500g without the engine knowing which cake it is.
+    option = _resolve_option(db, product, customization.size)
+    if option is not None:
+        option_label = option.label
+        size_adjusted = option.price_for(base_price)
+        # Reported for the breakdown only. An option priced outright has no
+        # multiplier to report, so it shows as 1.0 against its own price.
+        size_multiplier = float(option.multiplier) if option.multiplier is not None else 1.0
+    elif product.pricing_unit == "kg":
+        option_label = _normalise(customization.size) and customization.size or ""
         size_row = _find_rule(db, SizeRule, customization.size, "size")
         size_multiplier = float(size_row.multiplier) if size_row else 1.0
+        size_adjusted = round(base_price * size_multiplier, 2)
     else:
+        option_label = ""
         size_multiplier = 1.0
-    size_adjusted = round(base_price * size_multiplier, 2)
+        size_adjusted = round(base_price * size_multiplier, 2)
 
     # ── Flavor ──
     flavor_cost = _cost_of(db, FlavorRule, customization.flavor, "extra_cost", "flavour")
@@ -160,6 +215,7 @@ def calculate_item_price(
 
     return PriceBreakdown(
         base_price=base_price,
+        option_label=option_label,
         size_multiplier=size_multiplier,
         size_adjusted=size_adjusted,
         flavor_cost=flavor_cost,
