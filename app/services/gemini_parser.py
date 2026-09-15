@@ -130,6 +130,26 @@ def _quick_match(message: str, role: str, context: dict) -> dict | None:
     return None
 
 
+def business_info() -> str:
+    """
+    The facts the assistant is allowed to state about the bakery.
+
+    Lifted out of the prompt so what customers get told can be asserted on
+    without calling the model. Payment reads "online, in advance" because that
+    is what the backend actually accepts: cash on delivery has been withdrawn,
+    and POST /payments/create-order refuses any method but ONLINE. The prompt
+    used to offer COD, so the assistant promised customers a way to pay that
+    the API would then reject.
+    """
+    return f"""- Founded by Shriya Mahendru
+- 40+ flavors, premium handcrafted cakes
+- Delivery across Lucknow
+- Orders require minimum 24 hours advance notice
+- Website: {SITE}
+- Phone: +91 955 444 4462
+- Payment: Online (UPI/Card), in advance"""
+
+
 def _groq_parse(message: str, role: str, context: dict) -> dict:
     step = context.get("step", "IDLE")
     products = context.get("products", [])
@@ -137,13 +157,7 @@ def _groq_parse(message: str, role: str, context: dict) -> dict:
     system = f"""You are a professional WhatsApp assistant for Cake O' Clock — a premium bakery in Lucknow, India.
 
 BUSINESS INFO:
-- Founded by Shriya Mahendru
-- 40+ flavors, premium handcrafted cakes
-- Delivery across Lucknow
-- Orders require minimum 24 hours advance notice
-- Website: {SITE}
-- Phone: +91 955 444 4462
-- Payment: Online (UPI/Card) or Cash on Delivery
+{business_info()}
 
 MENU: {json.dumps(products[:8]) if products else "Fetching..."}
 
