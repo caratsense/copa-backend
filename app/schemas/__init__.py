@@ -5,17 +5,52 @@ Organized by domain — add new schemas at the bottom of each section.
 
 from __future__ import annotations
 from datetime import datetime
-from typing import Literal, Optional
-from pydantic import BaseModel, Field, model_validator
+from typing import Annotated, Literal, Optional
+from fastapi import HTTPException
+from pydantic import BaseModel, BeforeValidator, Field, model_validator
+
+from app.core.email import normalize_email
+from app.core.phone import normalize_phone
+
+
+def _as_value_error(fn):
+    """
+    Run one of the core normalisers inside a pydantic validator.
+
+    The normalisers raise HTTPException because they are also called directly
+    from routes. Inside a validator that would escape as a bare 422 with no
+    field attached; re-raising as ValueError lets pydantic report which field
+    was wrong, in the same shape as every other validation error, while keeping
+    the normaliser's wording.
+    """
+    def run(value):
+        try:
+            return fn(value)
+        except HTTPException as exc:  # pragma: no cover - re-raised below
+            raise ValueError(exc.detail) from None
+    return run
+
+
+# An Indian mobile number, stored as +91XXXXXXXXXX. Ten digits starting 6-9,
+# accepting the +91 / 91 / 0 prefixes people actually type. Rejecting at the
+# edge means no route has to wonder whether its phone is trustworthy.
+IndianPhone = Annotated[str, BeforeValidator(_as_value_error(normalize_phone))]
+
+# An optional email: blank or absent becomes None, anything else must be a
+# plausible address. Trimmed, because a trailing space from a paste is not a
+# different address.
+OptionalEmail = Annotated[
+    Optional[str], BeforeValidator(_as_value_error(normalize_email))
+]
 
 
 # ─── AUTH ─────────────────────────────────────────────
 
 class RegisterRequest(BaseModel):
     name: str
-    phone: str
+    phone: IndianPhone
     password: str
-    email: Optional[str] = None
+    email: OptionalEmail = None
     date_of_birth: Optional[str] = None  # "YYYY-MM-DD"
     role: str = "customer"
     # WhatsApp order updates. Must be an explicit, unticked-by-default choice —
@@ -24,7 +59,7 @@ class RegisterRequest(BaseModel):
     whatsapp_opt_in: bool = False
 
 class LoginRequest(BaseModel):
-    phone: str
+    phone: IndianPhone
     password: str
     device_fingerprint: Optional[str] = None   # for trusted device check
 
