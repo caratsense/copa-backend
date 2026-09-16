@@ -246,7 +246,7 @@ def seed():
                        story="Hand-selected vanilla pods from Madagascar give our cakes their signature warm, aromatic sweetness."),
             Ingredient(name="Fresh Cream", category="dairy", is_premium=False, sort_order=3,
                        description="Fresh heavy cream for silky smooth frosting.",
-                       story="We use only the freshest cream — never powdered — for our buttercream and ganache."),
+                       story="We use only the freshest cream — never powdered — for our ganache."),
             Ingredient(name="Premium Pistachios", category="dry-fruit", is_premium=True, sort_order=4,
                        description="Hand-picked Iranian pistachios.",
                        story="Our pistachio flavors use premium Iranian pistachios, roasted in-house for the perfect nutty crunch."),
