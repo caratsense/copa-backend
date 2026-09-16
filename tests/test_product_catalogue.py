@@ -20,6 +20,24 @@ from tests.conftest import auth
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def no_rate_limit(monkeypatch):
+    """
+    Exercise pagination, not throttling.
+
+    The app carries a global 100/minute limit and these tests create sixty-odd
+    products apiece, so without this the later cases come back 429 and look
+    like truncation bugs - the very thing they exist to detect. Scoped to this
+    file; the limits are real behaviour and stay on everywhere else.
+    """
+    from app.main import app, limiter as app_limiter
+
+    monkeypatch.setattr(app_limiter, "enabled", False)
+    if hasattr(app.state, "limiter"):
+        monkeypatch.setattr(app.state.limiter, "enabled", False)
+    yield
+
+
 @pytest.fixture
 def section(db):
     s = MenuSection(name="Brownies", sort_order=5, is_active=True)
@@ -229,3 +247,105 @@ def test_menu_sections_breaks_ties_by_id_like_products_does(client, admin, secti
 
     assert in_section == sorted(in_section)
     assert in_section == in_list, "the menu and the product list disagree on order"
+
+
+# ─── PAGINATION: THE DEFAULT MUST NOT TRUNCATE ───────
+# `limit` defaulted to 50. Three callers fetch /products with no parameters -
+# the homepage, the admin product list and the cake builder - so once the
+# catalogue passed fifty products they each silently showed a prefix of it.
+# Nothing about a page of fifty looks wrong, which is what made it dangerous.
+
+
+def _bulk(client, admin, count, section=None, available=True):
+    """Create `count` products, ordered by sort_order so the set is checkable."""
+    made = []
+    for i in range(count):
+        res = client.post("/products", headers=auth(admin), json=_payload(
+            name=f"Catalogue Item {i:03d}", sort_order=i,
+            is_available=available,
+            section_id=section.id if section else None,
+        ))
+        assert res.status_code == 201, res.text
+        made.append(res.json())
+    return made
+
+
+def test_a_catalogue_larger_than_fifty_is_returned_whole(client, admin, db):
+    _bulk(client, admin, 63)
+
+    listed = client.get("/products").json()
+
+    assert len(listed) == 63, f"truncated to {len(listed)}"
+    assert [p["name"] for p in listed] == [f"Catalogue Item {i:03d}" for i in range(63)]
+
+
+def test_the_old_fifty_boundary_is_gone(client, admin, db):
+    """51 is the smallest catalogue the old default would have clipped."""
+    _bulk(client, admin, 51)
+
+    assert len(client.get("/products").json()) == 51
+
+
+def test_unavailable_products_are_included_when_asked_and_not_truncated(client, admin, db):
+    """The admin list fetches available_only=false with no limit."""
+    _bulk(client, admin, 30, available=True)
+    _bulk(client, admin, 30, available=False)
+
+    assert len(client.get("/products?available_only=false").json()) == 60
+    assert len(client.get("/products").json()) == 30
+
+
+def test_a_category_filter_is_not_truncated_either(client, admin, db):
+    for i in range(55):
+        client.post("/products", headers=auth(admin),
+                    json=_payload(name=f"Brownie {i:03d}", category="brownies"))
+
+    assert len(client.get("/products?category=brownies").json()) == 55
+
+
+# ─── EXPLICIT PAGING IS UNCHANGED ────────────────────
+
+def test_an_explicit_limit_is_still_honoured(client, admin, db):
+    _bulk(client, admin, 60)
+
+    assert len(client.get("/products?limit=50").json()) == 50
+    assert len(client.get("/products?limit=10").json()) == 10
+    assert len(client.get("/products?limit=100").json()) == 60, "asked for more than exists"
+
+
+def test_skip_and_limit_still_page_without_repeating_or_dropping(client, admin, db):
+    _bulk(client, admin, 55)
+
+    seen = []
+    for skip in range(0, 55, 10):
+        seen += [p["id"] for p in client.get(f"/products?skip={skip}&limit=10").json()]
+
+    assert len(seen) == 55
+    assert len(set(seen)) == 55, "a product appeared on two pages"
+    assert seen == sorted(seen), "pages were not in a stable order"
+
+
+def test_skip_without_a_limit_returns_the_rest(client, admin, db):
+    _bulk(client, admin, 55)
+
+    rest = client.get("/products?skip=50").json()
+
+    assert len(rest) == 5, "skip alone should return everything after the offset"
+
+
+def test_limit_zero_still_returns_nothing(client, admin, db):
+    """Preserved deliberately: it is what LIMIT 0 did before."""
+    _bulk(client, admin, 3)
+
+    assert client.get("/products?limit=0").json() == []
+
+
+@pytest.mark.parametrize("bad", ["-1", "-50"])
+def test_negative_paging_is_rejected_rather_than_erroring(client, admin, db, bad):
+    """A negative offset used to reach the database and surface as a 500."""
+    assert client.get(f"/products?skip={bad}").status_code == 422
+    assert client.get(f"/products?limit={bad}").status_code == 422
+
+
+def test_an_empty_catalogue_is_still_an_empty_list(client, db):
+    assert client.get("/products").json() == []

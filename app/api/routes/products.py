@@ -4,7 +4,7 @@ Product Routes
 - Admin: create, update, toggle availability, delete
 """
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -26,11 +26,24 @@ router = APIRouter(prefix="/products", tags=["Products"])
 def list_products(
     category: str | None = None,
     available_only: bool = True,
-    skip: int = 0,
-    limit: int = 50,
+    skip: int = Query(0, ge=0),
+    limit: int | None = Query(None, ge=0),
     db: Session = Depends(get_db),
 ):
-    """List products — public. Defaults to only available products."""
+    """
+    List products — public. Defaults to only available products.
+
+    `limit` defaults to no limit: the whole matching catalogue is returned.
+    It used to default to 50, which silently truncated every caller that did
+    not think to ask for more - the admin product list and the cake builder
+    both fetch this with no parameters, and the catalogue passed fifty products
+    some time ago. A page that quietly shows the first fifty of fifty-three is
+    worse than one that fails, because nothing about it looks wrong.
+
+    Paging still works exactly as before for anyone who asks for it: pass
+    `limit` (with `skip`) and you get that page, ordered deterministically by
+    sort_order then id so pages cannot repeat or drop a row.
+    """
     q = db.query(Product)
     if available_only:
         q = q.filter(Product.is_available == True)
@@ -42,7 +55,13 @@ def list_products(
     # and skip it on the next. id breaks ties so the order is total, not merely
     # grouped by sort_order.
     q = q.order_by(Product.sort_order, Product.id)
-    return q.offset(skip).limit(limit).all()
+
+    q = q.offset(skip)
+    if limit is not None:
+        # SQLAlchemy treats .limit(None) as "no limit" anyway; spelling it out
+        # so the default cannot be mistaken for an oversight.
+        q = q.limit(limit)
+    return q.all()
 
 
 @router.get("/{product_id}", response_model=ProductRead)
