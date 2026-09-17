@@ -174,7 +174,10 @@ def create_payment_order(
             )
             raise HTTPException(
                 status_code=503,
-                detail="Online payment is temporarily unavailable. Please choose Cash on Delivery or try again shortly.",
+                detail=(
+                    "Online payment is temporarily unavailable. Please try again "
+                    "shortly or contact us on WhatsApp."
+                ),
             )
         logger.warning("[PAYU] DEMO MODE: simulating payment for order %s", order.id)
         order.payment_method = "ONLINE"

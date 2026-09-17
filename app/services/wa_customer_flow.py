@@ -14,6 +14,8 @@ from app.models.delivery import DeliveryZone
 from app.models.user import User
 from app.models.order import Order
 from app.services.gemini_parser import parse_message
+from app.schemas import ItemCustomization
+from app.services.pricing_engine import calculate_item_price
 from app.config import get_settings
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -67,13 +69,136 @@ def _clear_state(phone):
 DATE_PROMPT = "*Delivery date:*\n\n1. Tomorrow\n2. Day after tomorrow\n3. 3 days from now"
 
 
+def _is_per_kg(product: Optional[dict]) -> bool:
+    """
+    Whether this product is sold by weight, so a size applies to it.
+
+    Defaults to "kg" for a product dict that carries no pricing_unit at all:
+    conversations already parked in Redis when this shipped hold the older
+    shape, and "kg" is both the column default and what those conversations
+    were already being quoted.
+    """
+    return (product or {}).get("pricing_unit", "kg") == "kg"
+
+
+def _options(product: Optional[dict]) -> list[dict]:
+    """
+    The sizes this particular product is sold in, or [] if it uses the global
+    ones. Absent from conversations parked in Redis before this shipped, which
+    read as "no options" - the behaviour those conversations already had.
+    """
+    return list((product or {}).get("options") or [])
+
+
+def _needs_size(product: Optional[dict]) -> bool:
+    """Whether to ask for a size at all: a per-kg cake, or anything with its
+    own options - including a fixed-price tea cake sold as a loaf or a round."""
+    return bool(_options(product)) or _is_per_kg(product)
+
+
+def _price_label(product: dict) -> str:
+    """
+    The headline price.
+
+    "Rs 2,000/kg" for a cake sold by weight, "Rs 400" for a fixed-price item,
+    and for a product whose options carry their own prices, those prices - a
+    1.3kg chiffon cake at Rs 2,400 is not Rs 2,400/kg, and quoting it that way
+    would be a lie whichever size the customer then picked. The numbers here
+    are read from the options, never worked out from a multiplier: what an
+    option costs is the pricing engine's business, not this flow's.
+    """
+    priced = [o["price"] for o in _options(product) if o.get("price") is not None]
+    if len(priced) == 1:
+        return f"₹{priced[0]:,.0f}"
+    if priced:
+        return f"from ₹{min(priced):,.0f}"
+    price = f"₹{product.get('base_price', 0):,.0f}"
+    return f"{price}/kg" if _is_per_kg(product) else price
+
+
+def _ask_for_size(phone: str, state: dict, product: dict) -> str:
+    """
+    Offer the product's own sizes, and only those.
+
+    The global size list is not shown for these products, so a weight it does
+    not sell in is not offered and cannot be picked. An explicitly priced
+    option shows its price, because a Rs 800 loaf and a Rs 1,700 round are not
+    the same choice; a per-kg option shows only its label, since its price
+    comes from the kg rate in the header.
+    """
+    options = _options(product)
+    lines = [f"*{product['name']}* — {_price_label(product)}\n\n*Select size:*\n"]
+    for i, option in enumerate(options, 1):
+        price = option.get("price")
+        suffix = f" — ₹{price:,.0f}" if price is not None else ""
+        lines.append(f"{i}. {option['label']}{suffix}")
+    # Stored under the same key the size step already reads, so an option and a
+    # global SizeRule are picked the same way.
+    _set_state(phone, {
+        **state, "step": "SELECT_SIZE", "product": product,
+        "sizes": [{"name": o["label"], "price": o.get("price")} for o in options],
+    })
+    return "\n".join(lines)
+
+
+def _ask_for_flavor(db, phone: str, state: dict, header: str) -> str:
+    """
+    Move the conversation to the flavour step.
+
+    Shared because two steps now arrive here: a per-kg cake after its size, and
+    a fixed-price product straight from the product list, which has no size to
+    choose.
+    """
+    flavors = [{"id": f.id, "name": f.name, "extra_cost": f.extra_cost}
+               for f in db.query(FlavorRule).filter(FlavorRule.is_active == True).all()][:10]
+    lines = [f"{header}\n\n*Select flavor:*\n"]
+    for i, f in enumerate(flavors, 1):
+        cost = f" (+₹{f['extra_cost']})" if f['extra_cost'] > 0 else ""
+        lines.append(f"{i}. {f['name']}{cost}")
+    _set_state(phone, {**state, "step": "SELECT_FLAVOR", "flavors": flavors})
+    return "\n".join(lines)
+
+
+def _quote(db, product: dict, size: Optional[dict], flavor: dict, quantity: int = 1):
+    """
+    Price the conversation through the pricing engine, or None if it cannot.
+
+    The summary used to work the total out for itself as
+    (base_price + flavour) * size multiplier. That is not what the customer is
+    charged: the engine multiplies only the base by the size and adds the
+    flavour afterwards, so a 2kg Rs 1,000 cake with a Rs 2,000 flavour was
+    quoted Rs 6,000 in chat and billed Rs 4,000. Asking the engine is the only
+    way the quote and the charge cannot disagree - and it is also what makes a
+    fixed-price product skip the size multiplier, since the engine already
+    knows to.
+
+    Delivery is deliberately not included, which matches what this summary has
+    always shown; the charge for it is quoted from the real order at CONFIRM.
+    """
+    row = db.query(Product).filter(Product.id == product.get("id")).first()
+    if row is None:
+        return None
+    return calculate_item_price(
+        db=db,
+        product=row,
+        customization=ItemCustomization(
+            size=(size or {}).get("name") or "",
+            flavor=(flavor or {}).get("name") or "",
+        ),
+        quantity=quantity,
+    )
+
+
 def handle_customer_message(phone: str, message: str, user: Optional[User]) -> str:
     state = _get_state(phone)
     step = state.get("step", "IDLE")
     db = SessionLocal()
 
     try:
-        products = [{"id": p.id, "name": p.name, "base_price": p.base_price}
+        products = [{"id": p.id, "name": p.name, "base_price": p.base_price,
+                     "pricing_unit": p.pricing_unit,
+                     "options": [{"label": o.label, "price": o.price}
+                                 for o in p.options if o.is_active]}
                     for p in db.query(Product).filter(Product.is_available == True).all()]
         context = {"step": step, "products": products}
         action = parse_message(message, "customer", context)
@@ -102,7 +227,7 @@ def handle_customer_message(phone: str, message: str, user: Optional[User]) -> s
         if act == "VIEW_MENU":
             lines = ["*Our Menu*\n"]
             for p in products:
-                lines.append(f"· {p['name']} — ₹{p['base_price']:,.0f}/kg")
+                lines.append(f"· {p['name']} — {_price_label(p)}")
             lines.append(f"\nFull menu with customization options: {SITE}/menu")
             lines.append(f"\nWould you like to place an order?")
             return "\n".join(lines)
@@ -149,7 +274,7 @@ def handle_customer_message(phone: str, message: str, user: Optional[User]) -> s
         if act == "START_ORDER":
             lines = ["*Select a cake:*\n"]
             for i, p in enumerate(products, 1):
-                lines.append(f"{i}. {p['name']} — ₹{p['base_price']:,.0f}/kg")
+                lines.append(f"{i}. {p['name']} — {_price_label(p)}")
             lines.append(f"\nYou can type the number or the cake name.")
             _set_state(phone, {"step": "SELECT_PRODUCT", "products": products})
             return "\n".join(lines)
@@ -168,9 +293,25 @@ def handle_customer_message(phone: str, message: str, user: Optional[User]) -> s
             if not selected:
                 return f"Please select a valid option (1 to {len(prods)}) or type the cake name."
 
+            # This product sells in its own sizes. Offer those and nothing
+            # else - the global list is not consulted for it, which is how a
+            # cake that is not sold under 1kg stops offering 500g.
+            if _options(selected):
+                return _ask_for_size(phone, state, selected)
+
+            # A fixed-price product with no options has no size to ask about -
+            # base_price is its price - so it goes straight to the flavour
+            # step. Asking a customer whether they want 500g or 5kg of a pack
+            # of six buns is a question with no answer.
+            if not _is_per_kg(selected):
+                return _ask_for_flavor(
+                    db, phone, {**state, "product": selected, "size": None},
+                    header=f"*{selected['name']}* — {_price_label(selected)}",
+                )
+
             sizes = [{"id": s.id, "name": s.name, "multiplier": s.multiplier}
                      for s in db.query(SizeRule).filter(SizeRule.is_active == True).all()]
-            lines = [f"*{selected['name']}* — ₹{selected['base_price']:,.0f}/kg\n\n*Select size:*\n"]
+            lines = [f"*{selected['name']}* — {_price_label(selected)}\n\n*Select size:*\n"]
             for i, s in enumerate(sizes, 1):
                 lines.append(f"{i}. {s['name']}")
             _set_state(phone, {**state, "step": "SELECT_SIZE", "product": selected, "sizes": sizes})
@@ -190,14 +331,8 @@ def handle_customer_message(phone: str, message: str, user: Optional[User]) -> s
             if not selected:
                 return f"Please select a size (1 to {len(sizes)})."
 
-            flavors = [{"id": f.id, "name": f.name, "extra_cost": f.extra_cost}
-                       for f in db.query(FlavorRule).filter(FlavorRule.is_active == True).all()][:10]
-            lines = [f"Size: *{selected['name']}*\n\n*Select flavor:*\n"]
-            for i, f in enumerate(flavors, 1):
-                cost = f" (+₹{f['extra_cost']})" if f['extra_cost'] > 0 else ""
-                lines.append(f"{i}. {f['name']}{cost}")
-            _set_state(phone, {**state, "step": "SELECT_FLAVOR", "size": selected, "flavors": flavors})
-            return "\n".join(lines)
+            return _ask_for_flavor(db, phone, {**state, "size": selected},
+                                   header=f"Size: *{selected['name']}*")
 
         # ─── SELECT FLAVOR ───────────────────
         if step == "SELECT_FLAVOR":
@@ -302,19 +437,34 @@ def handle_customer_message(phone: str, message: str, user: Optional[User]) -> s
             time_label = {1: "Morning (8 AM – 12 PM)", 2: "Afternoon (12 PM – 4 PM)", 3: "Evening (4 PM – 8 PM)"}.get(val, "Afternoon")
 
             product = state.get("product", {})
-            size = state.get("size", {})
+            size = state.get("size") or {}
             flavor = state.get("flavor", {})
             addr = state.get("address", "")
             cake_msg = state.get("cake_message", "")
             ddate_display = state.get("delivery_date_display", state.get("delivery_date", ""))
-            total = (product.get("base_price", 0) + flavor.get("extra_cost", 0)) * size.get("multiplier", 1)
+            quantity = state.get("quantity", 1)
+
+            breakdown = _quote(db, product, size, flavor, quantity)
+            if breakdown is None:
+                # The product went away mid-conversation. Saying so beats
+                # quoting a number for something that can no longer be ordered.
+                _clear_state(phone)
+                return ("That item is no longer available. "
+                        "Reply *1* to start a new order.")
+            total = breakdown.line_total
 
             summary = (
                 f"*Order Summary*\n\n"
                 f"Cake: {product.get('name', 'Cake')}\n"
-                f"Size: {size.get('name', '1kg')}\n"
-                f"Flavor: {flavor.get('name', 'Classic')}\n"
             )
+            # Only a per-kg cake has one. Printing "Size: 1kg" against a
+            # brownie invented a weight the customer never chose and we do not
+            # sell it by. Gated on the product as well as on the state, so a
+            # stale size left over from an earlier choice cannot put a weight
+            # back on a fixed-price line.
+            if size.get("name") and _needs_size(product):
+                summary += f"Size: {size['name']}\n"
+            summary += f"Flavor: {flavor.get('name', 'Classic')}\n"
             if cake_msg:
                 summary += f"Message: \"{cake_msg}\"\n"
             summary += (
@@ -334,9 +484,9 @@ def handle_customer_message(phone: str, message: str, user: Optional[User]) -> s
                 return "Please share your name to create an account."
 
             product = state.get("product", {})
-            size = state.get("size", {})
+            size = state.get("size") or {}
             flavor = state.get("flavor", {})
-            total = state.get("total", 0)
+            quantity = state.get("quantity", 1)
             addr = state.get("address", "Self Pickup")
             cake_msg = state.get("cake_message", "")
             ddate = state.get("delivery_date", "")
@@ -350,8 +500,13 @@ def handle_customer_message(phone: str, message: str, user: Optional[User]) -> s
                     # Without this the pricing engine sees no zone and charges
                     # nothing for delivery, so every WhatsApp order shipped free.
                     delivery_zone=state.get("delivery_zone"),
-                    items=[OrderItemCreate(product_id=product.get("id", 1), quantity=1,
-                        customization={"size": size.get("name", "1kg"), "flavor": flavor.get("name", "Classic"),
+                    items=[OrderItemCreate(product_id=product.get("id", 1), quantity=quantity,
+                        # Blank size for a fixed-price product. The default
+                        # used to be "1kg", which the engine reads as a real
+                        # SizeRule - harmless at a 1.0 multiplier, but it wrote
+                        # a weight onto the order line for something never sold
+                        # by weight, and every staff screen then showed it.
+                        customization={"size": size.get("name") or "", "flavor": flavor.get("name", "Classic"),
                             # The WhatsApp conversation never asks about design
                             # or rush, so it must not assert values for them.
                             # Both were hardcoded to zero-cost rule names, which

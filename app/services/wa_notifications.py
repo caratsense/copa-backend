@@ -39,14 +39,21 @@ def _consenting_admins(db: Session) -> list[User]:
 
 
 def _items_str(order: Order) -> str:
-    """Build a human-readable items string."""
+    """
+    Build a human-readable items string.
+
+    Assembled from the parts that are actually present. Size used to default to
+    "1kg", which printed a weight onto a fixed-price item - a brownie, a pack of
+    six buns - that is not sold by weight, so the baker and the customer both
+    read a size nobody chose. A blank flavour left a double space for the same
+    reason.
+    """
     parts = []
     for item in (order.items or []):
         c = item.customization or {}
-        parts.append(
-            f"{c.get('size', '1kg')} {c.get('flavor', '')} "
-            f"{item.product.name if item.product else 'Cake'} x{item.quantity}"
-        )
+        name = item.product.name if item.product else "Cake"
+        bits = [b for b in (c.get("size"), c.get("flavor"), name) if b]
+        parts.append(f"{' '.join(bits)} x{item.quantity}")
     return ", ".join(parts) or "Cake"
 
 

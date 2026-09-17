@@ -6,6 +6,7 @@ from .session import get_db, engine, SessionLocal
 from app.models.user import User  # noqa
 from app.models.menu_section import MenuSection  # noqa
 from app.models.product import Product  # noqa
+from app.models.product_option import ProductOption  # noqa
 from app.models.pricing import SizeRule, FlavorRule, DesignRule, AddonRule, RushRule  # noqa
 from app.models.delivery import DeliveryZone  # noqa
 from app.models.order import Order  # noqa

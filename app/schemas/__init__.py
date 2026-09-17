@@ -5,17 +5,52 @@ Organized by domain — add new schemas at the bottom of each section.
 
 from __future__ import annotations
 from datetime import datetime
-from typing import Optional
-from pydantic import BaseModel, Field
+from typing import Annotated, Literal, Optional
+from fastapi import HTTPException
+from pydantic import BaseModel, BeforeValidator, Field, model_validator
+
+from app.core.email import normalize_email
+from app.core.phone import normalize_phone
+
+
+def _as_value_error(fn):
+    """
+    Run one of the core normalisers inside a pydantic validator.
+
+    The normalisers raise HTTPException because they are also called directly
+    from routes. Inside a validator that would escape as a bare 422 with no
+    field attached; re-raising as ValueError lets pydantic report which field
+    was wrong, in the same shape as every other validation error, while keeping
+    the normaliser's wording.
+    """
+    def run(value):
+        try:
+            return fn(value)
+        except HTTPException as exc:  # pragma: no cover - re-raised below
+            raise ValueError(exc.detail) from None
+    return run
+
+
+# An Indian mobile number, stored as +91XXXXXXXXXX. Ten digits starting 6-9,
+# accepting the +91 / 91 / 0 prefixes people actually type. Rejecting at the
+# edge means no route has to wonder whether its phone is trustworthy.
+IndianPhone = Annotated[str, BeforeValidator(_as_value_error(normalize_phone))]
+
+# An optional email: blank or absent becomes None, anything else must be a
+# plausible address. Trimmed, because a trailing space from a paste is not a
+# different address.
+OptionalEmail = Annotated[
+    Optional[str], BeforeValidator(_as_value_error(normalize_email))
+]
 
 
 # ─── AUTH ─────────────────────────────────────────────
 
 class RegisterRequest(BaseModel):
     name: str
-    phone: str
+    phone: IndianPhone
     password: str
-    email: Optional[str] = None
+    email: OptionalEmail = None
     date_of_birth: Optional[str] = None  # "YYYY-MM-DD"
     role: str = "customer"
     # WhatsApp order updates. Must be an explicit, unticked-by-default choice —
@@ -24,7 +59,7 @@ class RegisterRequest(BaseModel):
     whatsapp_opt_in: bool = False
 
 class LoginRequest(BaseModel):
-    phone: str
+    phone: IndianPhone
     password: str
     device_fingerprint: Optional[str] = None   # for trusted device check
 
@@ -107,6 +142,12 @@ TokenResponse.model_rebuild()
 
 # ─── PRODUCTS ─────────────────────────────────────────
 
+# How to read `base_price`. "kg" means it is a per-kg price and the chosen
+# SizeRule multiplies it; "fixed" means it is the price of the thing and no
+# size applies. Constrained here rather than in the column so a typo is a 422
+# at the edge instead of a product that silently prices the wrong way.
+PricingUnit = Literal["kg", "fixed"]
+
 class ProductCreate(BaseModel):
     name: str
     category: str
@@ -115,6 +156,17 @@ class ProductCreate(BaseModel):
     is_customizable: bool = True
     is_available: bool = True
     tags: list[str] = Field(default_factory=list)
+    pricing_unit: PricingUnit = "kg"
+    # Which menu section the product belongs to. None means unassigned, which
+    # the public menu shows in its trailing "Other Cakes" bucket. Both columns
+    # already existed; they were simply unreachable through this schema, so a
+    # section_id sent by the admin form was silently dropped and every product
+    # created through the API landed at sort_order 0.
+    section_id: Optional[int] = None
+    # Defaults to 0 rather than None: the column is nullable with a Python-side
+    # default, and an explicit None would be written as NULL. The public menu
+    # sorts products by this value, and NULL is not comparable to an int.
+    sort_order: int = 0
 
 class ProductUpdate(BaseModel):
     name: Optional[str] = None
@@ -124,6 +176,54 @@ class ProductUpdate(BaseModel):
     is_customizable: Optional[bool] = None
     is_available: Optional[bool] = None
     tags: Optional[list[str]] = None
+    pricing_unit: Optional[PricingUnit] = None
+    # Sending section_id explicitly as null unassigns the product, which is the
+    # same thing POST /admin/sections/assign-product does with a null section.
+    section_id: Optional[int] = None
+    sort_order: Optional[int] = None
+
+class ProductOptionBase(BaseModel):
+    """
+    One size/shape a product is sold in.
+
+    Exactly one of `price` and `multiplier`: `multiplier` scales the product's
+    per-kg base_price, `price` replaces it outright. Enforced here so an option
+    that means nothing cannot be stored.
+    """
+    label: str = Field(min_length=1, max_length=60)
+    price: Optional[float] = Field(default=None, ge=0)
+    multiplier: Optional[float] = Field(default=None, gt=0)
+    sort_order: int = 0
+    is_active: bool = True
+
+    @model_validator(mode="after")
+    def _exactly_one_pricing_rule(self):
+        if (self.price is None) == (self.multiplier is None):
+            raise ValueError(
+                "set exactly one of price (the option costs this) or multiplier "
+                "(the option costs base_price x this)"
+            )
+        return self
+
+class ProductOptionCreate(ProductOptionBase):
+    pass
+
+class ProductOptionUpdate(BaseModel):
+    label: Optional[str] = Field(default=None, min_length=1, max_length=60)
+    price: Optional[float] = Field(default=None, ge=0)
+    multiplier: Optional[float] = Field(default=None, gt=0)
+    sort_order: Optional[int] = None
+    is_active: Optional[bool] = None
+
+class ProductOptionRead(BaseModel):
+    id: int
+    label: str
+    price: Optional[float]
+    multiplier: Optional[float]
+    sort_order: int
+    is_active: bool
+    class Config:
+        from_attributes = True
 
 class ProductRead(BaseModel):
     id: int
@@ -135,6 +235,13 @@ class ProductRead(BaseModel):
     is_available: bool
     image_url: Optional[str]
     tags: list[str] = Field(default_factory=list)
+    pricing_unit: str
+    section_id: Optional[int] = None
+    sort_order: int = 0
+    # Empty for a product that uses the global sizes (or none at all). When it
+    # is non-empty these are the ONLY sizes this product can be ordered in, and
+    # the client must not offer the global size list for it.
+    options: list[ProductOptionRead] = Field(default_factory=list)
     created_at: datetime
 
     class Config:
@@ -294,6 +401,10 @@ class PricingRequest(BaseModel):
 
 class PriceBreakdown(BaseModel):
     base_price: float
+    # Which ProductOption was bought, when the product has its own sizes.
+    # Snapshotted onto the order line, so "500g loaf" and "1kg round" stay
+    # distinguishable in the order history long after the option is edited.
+    option_label: str = ""
     size_multiplier: float
     size_adjusted: float
     flavor_cost: float

@@ -14,4 +14,14 @@ class MenuSection(Base):
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    products = relationship("Product", back_populates="section", lazy="joined")
+    # Ordered here rather than at each call site: the public menu renders a
+    # section's products straight off this relationship, which had no ordering
+    # of its own, so products within a section came back in whatever order the
+    # database happened to return them. id breaks ties between products that
+    # share a sort_order.
+    products = relationship(
+        "Product",
+        back_populates="section",
+        lazy="joined",
+        order_by="(Product.sort_order, Product.id)",
+    )

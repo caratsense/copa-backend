@@ -44,6 +44,7 @@ from app.core.auth import (
     get_current_user,
 )
 from app.services.otp_service import send_otp, verify_otp
+from app.core.phone import lookup_values, normalize_phone
 from app.schemas import (
     RegisterRequest, LoginRequest, LoginResponse,
     OTPVerifyRequest, TokenResponse, UserRead,
@@ -60,7 +61,12 @@ limiter = Limiter(key_func=get_remote_address)
 def register(request: Request, data: RegisterRequest, db: Session = Depends(get_db)):
     """Register a new CUSTOMER account. No OTP on registration — direct token."""
 
-    existing = db.query(User).filter(User.phone == data.phone).first()
+    # data.phone is already normalised to +91XXXXXXXXXX by the schema. The
+    # duplicate check looks for every spelling the same handset may be stored
+    # under, because accounts created before normalisation kept whatever was
+    # typed - without that, the same number could register twice and only one
+    # of the two accounts would ever be reachable by login.
+    existing = db.query(User).filter(User.phone.in_(lookup_values(data.phone))).first()
     if existing:
         raise HTTPException(status_code=409, detail="Phone number already registered")
 
@@ -115,7 +121,7 @@ def login(request: Request, data: LoginRequest, db: Session = Depends(get_db)):
     - Customer on new device → send OTP
     """
 
-    user = db.query(User).filter(User.phone == data.phone).first()
+    user = db.query(User).filter(User.phone.in_(lookup_values(data.phone))).first()
     if not user:
         raise HTTPException(status_code=401, detail="Invalid phone or password")
 
@@ -173,14 +179,8 @@ class OTPLoginRequest(BaseModel):
 @limiter.limit("5/minute")
 def login_otp(request: Request, data: OTPLoginRequest, db: Session = Depends(get_db)):
     """Start OTP-based login: send an OTP to a registered phone. Complete via /verify-otp."""
-    phone = data.phone.replace(" ", "").replace("-", "")
-    if not phone.startswith("+"):
-        if phone.startswith("91") and len(phone) == 12:
-            phone = "+" + phone
-        elif len(phone) == 10:
-            phone = "+91" + phone
-
-    user = db.query(User).filter(User.phone == phone).first()
+    phone = normalize_phone(data.phone)
+    user = db.query(User).filter(User.phone.in_(lookup_values(phone))).first()
     if not user:
         raise HTTPException(status_code=401, detail="No account found with this phone number")
     if not user.is_active:
@@ -316,14 +316,8 @@ class ResetPasswordRequest(BaseModel):
 @limiter.limit("3/minute")
 def forgot_password(request: Request, data: ForgotPasswordRequest, db: Session = Depends(get_db)):
     """Send OTP to phone for password reset."""
-    phone = data.phone.replace(" ", "").replace("-", "")
-    if not phone.startswith("+"):
-        if phone.startswith("91") and len(phone) == 12:
-            phone = "+" + phone
-        elif len(phone) == 10:
-            phone = "+91" + phone
-
-    user = db.query(User).filter(User.phone == phone).first()
+    phone = normalize_phone(data.phone)
+    user = db.query(User).filter(User.phone.in_(lookup_values(phone))).first()
     if not user:
         raise HTTPException(status_code=404, detail="No account found with this phone number")
 
@@ -335,17 +329,11 @@ def forgot_password(request: Request, data: ForgotPasswordRequest, db: Session =
 @limiter.limit("5/minute")
 def reset_password(request: Request, data: ResetPasswordRequest, db: Session = Depends(get_db)):
     """Verify OTP and set new password."""
-    phone = data.phone.replace(" ", "").replace("-", "")
-    if not phone.startswith("+"):
-        if phone.startswith("91") and len(phone) == 12:
-            phone = "+" + phone
-        elif len(phone) == 10:
-            phone = "+91" + phone
-
+    phone = normalize_phone(data.phone)
     if not verify_otp(phone, data.otp, purpose="reset"):
         raise HTTPException(status_code=401, detail="Invalid or expired OTP")
 
-    user = db.query(User).filter(User.phone == phone).first()
+    user = db.query(User).filter(User.phone.in_(lookup_values(phone))).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 

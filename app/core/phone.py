@@ -57,6 +57,21 @@ def normalize_phone(raw: str | None) -> str:
     return f"+91{digits}"
 
 
+def lookup_values(raw: str | None) -> list[str]:
+    """
+    Every stored spelling that means this handset, normalised form first.
+
+    Accounts predate normalisation: /auth/register stored whatever was typed,
+    so the same customer may sit in the database as "+919876543210" or as
+    "9876543210". Validating a login without allowing for that would lock those
+    accounts out - the number is the login identifier, and there is no other
+    way in. Writes use normalize_phone alone; only lookups need this.
+    """
+    normalized = normalize_phone(raw)          # validates, raises 422 if bad
+    bare = normalized[3:]
+    return [normalized, bare, f"91{bare}", f"0{bare}"]
+
+
 def same_number(a: str | None, b: str | None) -> bool:
     """Whether two numbers refer to the same handset, ignoring formatting."""
     def bare(v):
