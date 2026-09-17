@@ -532,6 +532,11 @@ CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
 # loud rather than leaving their absence looking like an oversight.
 KNOWN_EMPTY_SECTIONS = ("Cheesecakes", "Gifting Collection", "Wedding")
 
+# Every section this catalogue needs to exist, for tests that build a database
+# from nothing. The running order is setup_menu_sections' business; this is
+# only the set, derived rather than restated so the two cannot drift.
+FINAL_ORDER_FOR_TESTS = tuple(CATALOGUE.keys()) + KNOWN_EMPTY_SECTIONS
+
 
 # ── VALIDATION ───────────────────────────────────────────────────────────
 
@@ -1116,11 +1121,10 @@ def main() -> int:
     parser.add_argument(
         "--apply-draft", action="store_true",
         help=(
-            "create the catalogue as DRAFT rows: is_available=false, and any "
-            "product with no price carries an obviously-wrong placeholder plus "
-            "the '%s' tag. Drafts cannot be ordered - create_order rejects an "
-            "unavailable product - and do not appear on the menu, in WhatsApp "
-            "or in Build-a-Cake." % DRAFT_TAG
+            "create missing catalogue rows only, as drafts: is_available=false, "
+            "and any product the client has not priced carries the placeholder "
+            "price plus the '%s' tag. Prefer --sync, which also reconciles the "
+            "rows that already exist." % DRAFT_TAG
         ),
     )
     parser.add_argument(
@@ -1134,6 +1138,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--sync", action="store_true",
+        help=(
+            "the deployment command: create any missing catalogue rows AND bring "
+            "existing ones in line, in one transaction. Products the client has "
+            "not priced get the placeholder and stay unavailable; nothing is "
+            "published. Idempotent - safe to re-run."
+        ),
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help=(
             "plan only. On its own it validates and reports; combined with a "
@@ -1143,9 +1156,10 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    write_modes = [args.apply, args.apply_draft, args.reconcile_draft]
+    write_modes = [args.apply, args.apply_draft, args.reconcile_draft, args.sync]
     if sum(bool(m) for m in write_modes) > 1:
-        print("Pick one of --apply, --apply-draft or --reconcile-draft.", file=sys.stderr)
+        print("Pick one of --sync, --apply, --apply-draft or --reconcile-draft.",
+              file=sys.stderr)
         return 2
 
     db = SessionLocal()
@@ -1165,6 +1179,51 @@ def main() -> int:
         _summary(resolved, db)
 
         missing = _missing_prices()
+
+        if args.sync:
+            # Create then reconcile, committed once. Two separate commands in a
+            # required order is a trap for whoever runs the deploy: running only
+            # the first leaves 48 rows with no prices and no options, and
+            # nothing says so. Both halves share a transaction, so a failure in
+            # the second does not leave the first half applied.
+            print()
+            print("Syncing catalogue (create + reconcile, nothing published)")
+            created, _ = _write(db, resolved, draft=True)
+            # SessionLocal is autoflush=False, so the rows just added are
+            # invisible to the reconcile pass's queries until they are flushed.
+            # Without this the reconcile reports every new product as missing
+            # and the whole sync aborts. Flush, not commit: the two passes stay
+            # in one transaction.
+            db.flush()
+            print(f"  {created} row(s) created")
+            report = _reconcile(db, resolved)
+            _print_reconcile_report(report, dry_run=args.dry_run)
+
+            if report["missing"]:
+                db.rollback()
+                print("\nABORTED: a catalogue product still has no row after the "
+                      "create pass. That should be impossible - nothing was written.")
+                return 1
+            if report["protected_touched"]:
+                db.rollback()
+                print("\nABORTED: refused to touch a protected product.")
+                return 2
+
+            if args.dry_run:
+                db.rollback()
+                print("\nDry run - rolled back. Nothing was written.")
+                return 0
+
+            db.commit()
+            print()
+            print(f"  committed - {created} created, {len(report['repriced'])} priced, "
+                  f"{len(report['options_added'])} option(s) attached, "
+                  f"{len(report['left_unpriced'])} left at the placeholder.")
+            print("  Nothing was published: every catalogue row is still unavailable.")
+            if missing:
+                print(f"  {len(missing)} product(s) await a real price - set it in the "
+                      f"admin, which clears the placeholder and allows publishing.")
+            return 0
 
         if args.reconcile_draft:
             report = _reconcile(db, resolved)
@@ -1216,8 +1275,9 @@ def main() -> int:
             print("Dry run - no database changes were made"
                   if args.dry_run else
                   "Validation only (default) - no database changes were made.")
-            print(f"--reconcile-draft would align {sum(len(v) for v in CATALOGUE.values())} "
-                  f"existing row(s) without publishing any.")
+            print(f"--sync would populate and align all "
+                  f"{sum(len(v) for v in CATALOGUE.values())} product(s) without "
+                  f"publishing any. That is the deployment command.")
             if missing:
                 print(f"--apply would be REFUSED: {len(missing)} product(s) have no price.")
                 print(f"--apply-draft would create {len(CATALOGUE) and sum(len(v) for v in CATALOGUE.values())} "
@@ -1226,10 +1286,12 @@ def main() -> int:
 
         if missing:
             print()
-            print(f"REFUSING TO WRITE: {len(missing)} product(s) have no price.")
-            print("A placeholder price is indistinguishable from a real one once it is in")
-            print("the table, and the first customer to order would be charged it. Fill in")
-            print("every base_price in this file, then re-run with --apply.")
+            print(f"REFUSING TO PUBLISH: {len(missing)} product(s) have no client price.")
+            print("--apply puts products ON SALE, and a product the client has not priced")
+            print("must not go on sale at a placeholder. This is not a blocked deployment:")
+            print("use --sync to populate the whole catalogue now - priced products get")
+            print("their price, unpriced ones get the placeholder, and nothing is")
+            print("published. Set the remaining prices in the admin as they arrive.")
             for name in missing[:5]:
                 print(f"  - {name}")
             if len(missing) > 5:
