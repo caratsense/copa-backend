@@ -126,6 +126,27 @@ PRICING_UNITS = {"kg", "fixed"}
 # Rs 1 fails the other way, so the guard carries the weight the number used to.
 PLACEHOLDER_PRICE = 1.0
 
+# WHERE CATALOGUE PRODUCTS SIT IN A SECTION
+# -----------------------------------------
+# The customer menu orders products by (sort_order, id). The five original
+# Build-a-Cake bases already hold sort_order 1 and 2 inside the same sections
+# this catalogue writes into, so numbering the catalogue from 1 interleaves
+# them: "Vanilla Base Cake" (1), then "Vanilla Salted Caramel" (1, higher id),
+# then "Vanilla Premium Cake" (2), then "Raspberry Pistachio" (2). Every
+# position collides with a builder base rather than following it.
+#
+# Starting the catalogue at 10 leaves the bases grouped at the top of their
+# section and the client's named cakes in their given order underneath, with
+# room for a base to be added later without renumbering anything.
+#
+# The alternative - pushing the bases to the end - would read at least as well,
+# but it means writing to products 1-5, which PROTECTED_PRODUCT_IDS exists to
+# refuse. Offsetting this side needs no such exception.
+#
+# sort_order is only set when a row is created; reconciliation leaves it alone.
+# Changing this number therefore affects new rows, not rows already written.
+CATALOGUE_SORT_BASE = 10
+
 # Stamped on any row whose price is the placeholder rather than the client's.
 # This is the authoritative marker: "is this a real price?" is answered by the
 # tag, never by comparing base_price to a magic number, because an admin may
@@ -274,8 +295,10 @@ SUPPLIED_SIZES: dict[str, tuple[str, ...]] = {
 
 # ── THE CATALOGUE ────────────────────────────────────────────────────────
 # Keyed by exact MenuSection.name. Order within each tuple IS the sort_order,
-# numbered from 1. Sections with no products supplied are absent entirely
-# rather than present-and-empty, so the script never implies it manages them.
+# numbered from CATALOGUE_SORT_BASE so the client's cakes sit below the
+# Build-a-Cake bases rather than interleaved with them. Sections with no
+# products supplied are absent entirely rather than present-and-empty, so the
+# script never implies it manages them.
 
 CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
     "Chocolate Celebration Cakes": (
@@ -701,12 +724,23 @@ def _validate_definition() -> list[str]:
                         f"current name"
                     )
 
-    # sort_order is derived from position, so it is deterministic and 1-based by
-    # construction. Assert it anyway - the guarantee is the point.
+    # sort_order is derived from position, so it is contiguous from
+    # CATALOGUE_SORT_BASE by construction. Assert it anyway - the guarantee is
+    # the point - and assert the offset itself, which is what keeps the client's
+    # cakes clear of the Build-a-Cake bases at 1 and 2.
+    if CATALOGUE_SORT_BASE <= 2:
+        problems.append(
+            f"CATALOGUE_SORT_BASE is {CATALOGUE_SORT_BASE}: it must leave room "
+            f"for the seeded bases at sort_order 1 and 2, or the menu interleaves"
+        )
     for section_name, products in CATALOGUE.items():
-        orders = [i for i, _ in enumerate(products, start=1)]
-        if orders != list(range(1, len(products) + 1)):
-            problems.append(f"{section_name!r}: sort_order is not 1..n")
+        expected = list(range(CATALOGUE_SORT_BASE, CATALOGUE_SORT_BASE + len(products)))
+        orders = [i for i, _ in enumerate(products, start=CATALOGUE_SORT_BASE)]
+        if orders != expected:
+            problems.append(
+                f"{section_name!r}: sort_order is not contiguous from "
+                f"{CATALOGUE_SORT_BASE}"
+            )
 
     return problems
 
@@ -908,7 +942,7 @@ def _write(db, resolved: dict[str, MenuSection], draft: bool,
             for p in db.query(Product).filter(Product.section_id == section.id).all()
         }
 
-        for position, item in enumerate(products, start=1):
+        for position, item in enumerate(products, start=CATALOGUE_SORT_BASE):
             # Matched by current name, or by a name it used to be written
             # under, so a rename cannot quietly produce a second row for the
             # same cake. --apply-draft does NOT rename the row; --reconcile-draft
