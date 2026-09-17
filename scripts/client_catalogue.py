@@ -88,24 +88,33 @@ PRICING_UNITS = {"kg", "fixed"}
 
 # DRAFT ROWS AND THE PLACEHOLDER PRICE
 # ------------------------------------
-# products.base_price is NOT NULL, so a draft row has to carry some number.
-# Which number matters, because the number is publicly readable: an
-# is_available=false product is still returned by GET /products/{id} and by
-# GET /products?available_only=false, and POST /pricing/calculate will happily
-# quote it - none of those three check availability. What a draft row CANNOT do
-# is be ordered: create_order rejects an unavailable product with a 400, and
-# that is the only route to an order.
+# products.base_price is NOT NULL, so a row for a product the client has not
+# priced still has to carry some number. Rs 1 is that number: the catalogue has
+# to be demonstrable and editable in the admin before every price is in, and a
+# visible Rs 1 reads as obviously provisional to whoever is looking at it.
 #
-# So the placeholder must fail in the safe direction if anyone ever flips
-# is_available (one admin toggle does it). 0.0 is the dangerous choice - it is a
-# real price meaning "free", the engine would total the order at zero, and
-# PayU's callback check (paid != owed) is satisfied by 0 == 0. A deliberately
-# absurd number cannot be mistaken for a real price, cannot be ordered by
-# accident, and errs towards overcharging rather than giving cakes away.
-DRAFT_PRICE_SENTINEL = 999999.0
+# Rs 1 is NOT a safe number to sell at, and nothing here pretends otherwise. It
+# is not a price; it is the absence of one, written down. Three things keep it
+# from ever being charged:
+#
+#   1. the row is created is_available=false, and create_order refuses an
+#      unavailable product - that is the only route to an order;
+#   2. it carries DRAFT_TAG, so "placeholder" is a fact about the row rather
+#      than a guess from its value;
+#   3. PATCH /products/{id} and the availability toggle refuse to publish a row
+#      that is still at the placeholder price while still tagged - see
+#      app/api/routes/products.py. Giving it a real price clears the tag and
+#      the refusal with it, which is the normal admin flow, not a special one.
+#
+# That third guard is what makes this safe where it would not otherwise be.
+# The previous placeholder was 999999.0, chosen to fail towards overcharging;
+# Rs 1 fails the other way, so the guard carries the weight the number used to.
+PLACEHOLDER_PRICE = 1.0
 
-# Stamped on any row created without a real price, so drafts can be found again
-# without relying on the sentinel number alone.
+# Stamped on any row whose price is the placeholder rather than the client's.
+# This is the authoritative marker: "is this a real price?" is answered by the
+# tag, never by comparing base_price to a magic number, because an admin may
+# legitimately set a product to Rs 1 one day.
 DRAFT_TAG = "draft-no-price"
 
 # Stamped on a row that HAS its real price but is deliberately not on sale yet.
@@ -557,12 +566,9 @@ def _validate_definition() -> list[str]:
             # only way to say "not supplied", which is what blocks writes.
             if p.base_price is not None and p.base_price < 0:
                 problems.append(f"{where} ({p.name!r}): negative base_price")
-            if p.base_price == DRAFT_PRICE_SENTINEL:
-                problems.append(
-                    f"{where} ({p.name!r}): base_price equals the draft sentinel "
-                    f"{DRAFT_PRICE_SENTINEL}. A real price must never be that number, "
-                    f"or --apply cannot tell a priced row from an unpriced one."
-                )
+            # No check against PLACEHOLDER_PRICE here: a real product may one
+            # day genuinely cost Rs 1, and the tag - not the number - is what
+            # distinguishes a placeholder from a price.
             for managed in (DRAFT_TAG, UNPUBLISHED_TAG):
                 if managed in p.tags:
                     problems.append(
@@ -719,11 +725,11 @@ def _summary(resolved: dict[str, MenuSection], db) -> None:
     for section_name in KNOWN_EMPTY_SECTIONS:
         print(f"  - {section_name}")
 
-    drafts = db.query(Product).filter(Product.base_price == DRAFT_PRICE_SENTINEL).count()
+    drafts = db.query(Product).filter(Product.tags.contains([DRAFT_TAG])).count()
     if drafts:
         print()
         print(f"Draft rows in the database: {drafts} (unavailable, placeholder price "
-              f"{DRAFT_PRICE_SENTINEL}, tagged {DRAFT_TAG!r}).")
+              f"{PLACEHOLDER_PRICE}, tagged {DRAFT_TAG!r}).")
         print("  They cannot be ordered and do not appear on the menu, in WhatsApp")
         print("  or in Build-a-Cake. --apply will price them and put them on sale.")
 
@@ -809,9 +815,7 @@ def _is_draft_row(row: Product) -> bool:
     a product the owner has simply paused, which carries no tag at all.
     """
     tags = row.tags or []
-    return (row.base_price == DRAFT_PRICE_SENTINEL
-            or DRAFT_TAG in tags
-            or UNPUBLISHED_TAG in tags)
+    return DRAFT_TAG in tags or UNPUBLISHED_TAG in tags
 
 
 def _match_existing(existing: dict, item: CatalogueProduct):
@@ -890,7 +894,7 @@ def _write(db, resolved: dict[str, MenuSection], draft: bool) -> tuple[int, int]
                 promoted += 1
                 continue
 
-            price = item.base_price if item.base_price is not None else DRAFT_PRICE_SENTINEL
+            price = item.base_price if item.base_price is not None else PLACEHOLDER_PRICE
             unpriced = item.base_price is None
             tags = list(item.tags) + ([DRAFT_TAG] if unpriced else [])
 
@@ -953,6 +957,7 @@ def _reconcile(db, resolved: dict[str, MenuSection]) -> dict:
         "matched_by_name": [], "matched_by_previous_name": [], "renamed": [],
         "repriced": [], "options_added": [], "option_differences": [],
         "left_unpriced": [], "left_unavailable": [], "created": [],
+        "placeholder_applied": [],
         "protected_touched": [], "missing": [],
     }
 
@@ -1003,8 +1008,19 @@ def _reconcile(db, resolved: dict[str, MenuSection]) -> dict:
                     tags.append(UNPUBLISHED_TAG)
                 match.tags = tags
             else:
-                # No price supplied. Left exactly as it is: the placeholder, the
-                # draft tag and unavailable. Nothing here makes it orderable.
+                # No price supplied by the client. The row sits at the
+                # placeholder so the product can still be seen and edited in
+                # the admin, tagged so nothing mistakes that for a price, and
+                # unavailable so it cannot be sold. Availability is not touched
+                # here - an admin who has deliberately taken something off sale
+                # keeps that.
+                if match.base_price != PLACEHOLDER_PRICE:
+                    report["placeholder_applied"].append(
+                        f"id {match.id} {item.name}: {match.base_price} -> {PLACEHOLDER_PRICE}"
+                    )
+                    match.base_price = PLACEHOLDER_PRICE
+                if DRAFT_TAG not in (match.tags or []):
+                    match.tags = list(match.tags or []) + [DRAFT_TAG]
                 report["left_unpriced"].append(f"id {match.id} {item.name}")
 
             # ── Options ──
@@ -1075,6 +1091,8 @@ def _print_reconcile_report(report: dict, dry_run: bool) -> None:
     block("price changes", "repriced")
     print()
     block("options to attach", "options_added")
+    print()
+    block("placeholder price applied (no client price yet)", "placeholder_applied")
     if report["option_differences"]:
         print()
         block("options that DIFFER (left alone)", "option_differences")
@@ -1178,7 +1196,7 @@ def main() -> int:
             print()
             print("Applying DRAFT catalogue")
             print(f"  Every row is created with is_available=false. Unpriced rows carry")
-            print(f"  the placeholder {DRAFT_PRICE_SENTINEL} and the {DRAFT_TAG!r} tag - that")
+            print(f"  the placeholder {PLACEHOLDER_PRICE} and the {DRAFT_TAG!r} tag - that")
             print(f"  is NOT a price, and the row cannot be ordered while it is unavailable.")
             created, _ = _write(db, resolved, draft=True)
             if args.dry_run:

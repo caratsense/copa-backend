@@ -19,6 +19,46 @@ from app.schemas import (
 
 router = APIRouter(prefix="/products", tags=["Products"])
 
+# Products the client has not priced yet are created at a placeholder price
+# (see scripts/client_catalogue.py) and carry this tag. The tag - not the
+# number - is what says "this is not a real price", because a product may one
+# day genuinely cost the same as the placeholder.
+PLACEHOLDER_PRICE_TAG = "draft-no-price"
+PLACEHOLDER_PRICE = 1.0
+
+
+def _is_placeholder_priced(product: Product) -> bool:
+    return PLACEHOLDER_PRICE_TAG in (product.tags or [])
+
+
+def _clear_placeholder_tag(product: Product) -> None:
+    """A real price has been set, so the row is no longer a placeholder."""
+    product.tags = [t for t in (product.tags or []) if t != PLACEHOLDER_PRICE_TAG]
+
+
+def _refuse_if_placeholder_priced(product: Product) -> None:
+    """
+    Do not let a product go on sale at its placeholder price.
+
+    The placeholder exists so the full catalogue can be demonstrated and
+    managed before the client has priced everything; it is deliberately not a
+    price, and selling at it would be selling a cake for a rupee. One click on
+    the availability toggle is all that would take, so the refusal lives here
+    rather than in a convention nobody can enforce.
+
+    This is not a trap: setting any real price clears the tag in the same
+    request, and the product publishes normally afterwards.
+    """
+    if _is_placeholder_priced(product):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"'{product.name}' is still at its placeholder price. Set the "
+                f"real price first - saving a price clears the placeholder and "
+                f"lets the product be published."
+            ),
+        )
+
 
 # ─── PUBLIC ───────────────────────────────────────────
 
@@ -93,8 +133,25 @@ def update_product(
     product = db.query(Product).filter(Product.id == product_id).first()
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
-    for field, value in data.model_dump(exclude_unset=True).items():
+
+    fields = data.model_dump(exclude_unset=True)
+
+    # A real price has been supplied, so this is no longer a placeholder.
+    # Done before the availability check below, so one save can both price a
+    # product and publish it - which is what an admin filling in a price
+    # actually wants.
+    if "base_price" in fields and fields["base_price"] != PLACEHOLDER_PRICE:
+        _clear_placeholder_tag(product)
+
+    # An explicit `tags` in the same request is the admin's own list and wins;
+    # clearing the marker by hand is a legitimate way to say "this Rs 1 is
+    # real".
+    for field, value in fields.items():
         setattr(product, field, value)
+
+    if fields.get("is_available") is True:
+        _refuse_if_placeholder_priced(product)
+
     db.commit()
     db.refresh(product)
     return product
@@ -110,6 +167,10 @@ def toggle_availability(
     product = db.query(Product).filter(Product.id == product_id).first()
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
+    # Taking a product OFF sale is always allowed; only putting one ON sale at
+    # a placeholder price is refused.
+    if not product.is_available:
+        _refuse_if_placeholder_priced(product)
     product.is_available = not product.is_available
     db.commit()
     db.refresh(product)
