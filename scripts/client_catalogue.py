@@ -1,22 +1,37 @@
 """
-The client's menu, as data. Validates by default; writes only with --apply.
+The client's menu, as data. Validates by default; writes only when told to.
 
 WHAT THIS IS
 ------------
-One declarative definition of Cake O' Clock's real catalogue - 48 products
-across 9 sections - plus the checks that have to pass before any of it reaches
-a database. It is the single place the menu is written down, so a correction
-from the client is a one-line edit here rather than a hand-written UPDATE.
+One declarative definition of Cake O' Clock's real catalogue - 51 products
+across 10 sections, from the client's menu of 17/09 - plus the checks that have
+to pass before any of it reaches a database. It is the single place the menu is
+written down, so a correction from the client is a one-line edit here rather
+than a hand-written UPDATE.
 
-NO PRICES ARE KNOWN YET
------------------------
-Every product below carries `base_price=None`, which means "not supplied by the
-client", not "free". The script REFUSES to write while any price is None - a
-placeholder price would otherwise be indistinguishable from a real one once it
-was in the table, and the first customer to order would be charged it.
+NOT EVERY PRODUCT HAS A PRICE YET
+---------------------------------
+`base_price=None` in the definition below means "the client has not given us
+this price", not "free". Eighteen products are in that state. They must not
+hold up the other thirty-three, so they are created too - at the placeholder
+price, tagged, and off sale. See PLACEHOLDER_PRICE for why Rs 1 is safe here
+and what keeps it from ever being charged.
 
-  python -m scripts.client_catalogue            # validate, change nothing
-  python -m scripts.client_catalogue --apply    # refuses while prices are None
+DEPLOYING
+---------
+Two commands, in this order. They are separate because creating the catalogue
+and putting it in front of customers are different decisions, and the first is
+worth reviewing before the second happens.
+
+  python -m scripts.client_catalogue              # validate, change nothing
+  python -m scripts.client_catalogue --sync       # create + reconcile, publish nothing
+  python -m scripts.client_catalogue --publish    # put the priced products on sale
+
+Both take --dry-run, which runs the whole thing in a transaction and rolls it
+back, so the exact plan can be read first. Both are idempotent.
+
+`--apply` and `--apply-draft` predate --sync and are kept for the narrower jobs
+they do; --sync is the deployment command.
 
 DECISIONS THAT ARE STILL TEMPORARY
 ----------------------------------
@@ -110,6 +125,27 @@ PRICING_UNITS = {"kg", "fixed"}
 # The previous placeholder was 999999.0, chosen to fail towards overcharging;
 # Rs 1 fails the other way, so the guard carries the weight the number used to.
 PLACEHOLDER_PRICE = 1.0
+
+# WHERE CATALOGUE PRODUCTS SIT IN A SECTION
+# -----------------------------------------
+# The customer menu orders products by (sort_order, id). The five original
+# Build-a-Cake bases already hold sort_order 1 and 2 inside the same sections
+# this catalogue writes into, so numbering the catalogue from 1 interleaves
+# them: "Vanilla Base Cake" (1), then "Vanilla Salted Caramel" (1, higher id),
+# then "Vanilla Premium Cake" (2), then "Raspberry Pistachio" (2). Every
+# position collides with a builder base rather than following it.
+#
+# Starting the catalogue at 10 leaves the bases grouped at the top of their
+# section and the client's named cakes in their given order underneath, with
+# room for a base to be added later without renumbering anything.
+#
+# The alternative - pushing the bases to the end - would read at least as well,
+# but it means writing to products 1-5, which PROTECTED_PRODUCT_IDS exists to
+# refuse. Offsetting this side needs no such exception.
+#
+# sort_order is only set when a row is created; reconciliation leaves it alone.
+# Changing this number therefore affects new rows, not rows already written.
+CATALOGUE_SORT_BASE = 10
 
 # Stamped on any row whose price is the placeholder rather than the client's.
 # This is the authoritative marker: "is this a real price?" is answered by the
@@ -259,8 +295,10 @@ SUPPLIED_SIZES: dict[str, tuple[str, ...]] = {
 
 # ── THE CATALOGUE ────────────────────────────────────────────────────────
 # Keyed by exact MenuSection.name. Order within each tuple IS the sort_order,
-# numbered from 1. Sections with no products supplied are absent entirely
-# rather than present-and-empty, so the script never implies it manages them.
+# numbered from CATALOGUE_SORT_BASE so the client's cakes sit below the
+# Build-a-Cake bases rather than interleaved with them. Sections with no
+# products supplied are absent entirely rather than present-and-empty, so the
+# script never implies it manages them.
 
 CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
     "Chocolate Celebration Cakes": (
@@ -458,9 +496,33 @@ CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
             price=2400.0,
             options=_priced(("1.3kg", 2400.0))),
     ),
+    # Supplied in the client's menu of 17/09. This section was previously
+    # listed as deliberately empty - a section with a homepage card and no
+    # products - and now has both its products and their prices.
+    "Cheesecakes": (
+        _kg("Biscoff Cheesecake", "cheesecakes",
+            ["cheesecake", "biscoff", "eggless"],
+            price=2300.0),
+        # The client states egg for this one and eggless for the Biscoff, so
+        # both claims come straight from the source rather than from what a
+        # cheesecake usually contains.
+        _kg("Basque Cheesecake", "cheesecakes",
+            ["cheesecake", "basque", "contains-egg"],
+            price=2500.0),
+    ),
     "Desserts & Pudding Tubs": (
         _fixed("Classic Fruit Cream Tub", "desserts-tubs", ["tub", "fresh-fruit"]),
         _fixed("Chocolate Coffee Baileys Mousse Cake Tub", "desserts-tubs", ["tub", "chocolate", "coffee", "contains-alcohol"]),
+        # New in the client's menu of 17/09, between the Baileys tub and the
+        # Banoffee tub, and given as a bare name: no price, no size, nothing
+        # about what is in it. So it carries no descriptive tag either - a
+        # Matilda cake is conventionally chocolate, but the client has not said
+        # so here and the rest of this file only records what they did say.
+        # Priced `fixed` to match everything else in this section, which is
+        # sold by the item; if it turns out to be sold by weight this becomes
+        # "kg" and its price changes meaning. Worth confirming along with the
+        # price itself.
+        _fixed("Matilda Cake", "desserts-tubs"),
         _fixed("Banoffee Tub", "desserts-tubs", ["tub", "banoffee"]),
         _fixed("Classic Apple Pie", "desserts-tubs", ["pie", "apple"]),
         _fixed("Coffee Chocolate Hazelnut Choux Au Craquelin", "desserts-tubs", ["choux", "coffee", "hazelnut", "pack-of-6", "contains-egg"]),
@@ -530,7 +592,9 @@ CATALOGUE: dict[str, tuple[CatalogueProduct, ...]] = {
 
 # Supplied by the client with no products. Listed so the summary can say so out
 # loud rather than leaving their absence looking like an oversight.
-KNOWN_EMPTY_SECTIONS = ("Cheesecakes", "Gifting Collection", "Wedding")
+# Cheesecakes was here until the client's menu of 17/09 supplied its two
+# products; it is now a normal section in CATALOGUE above.
+KNOWN_EMPTY_SECTIONS = ("Gifting Collection", "Wedding")
 
 # Every section this catalogue needs to exist, for tests that build a database
 # from nothing. The running order is setup_menu_sections' business; this is
@@ -660,12 +724,23 @@ def _validate_definition() -> list[str]:
                         f"current name"
                     )
 
-    # sort_order is derived from position, so it is deterministic and 1-based by
-    # construction. Assert it anyway - the guarantee is the point.
+    # sort_order is derived from position, so it is contiguous from
+    # CATALOGUE_SORT_BASE by construction. Assert it anyway - the guarantee is
+    # the point - and assert the offset itself, which is what keeps the client's
+    # cakes clear of the Build-a-Cake bases at 1 and 2.
+    if CATALOGUE_SORT_BASE <= 2:
+        problems.append(
+            f"CATALOGUE_SORT_BASE is {CATALOGUE_SORT_BASE}: it must leave room "
+            f"for the seeded bases at sort_order 1 and 2, or the menu interleaves"
+        )
     for section_name, products in CATALOGUE.items():
-        orders = [i for i, _ in enumerate(products, start=1)]
-        if orders != list(range(1, len(products) + 1)):
-            problems.append(f"{section_name!r}: sort_order is not 1..n")
+        expected = list(range(CATALOGUE_SORT_BASE, CATALOGUE_SORT_BASE + len(products)))
+        orders = [i for i, _ in enumerate(products, start=CATALOGUE_SORT_BASE)]
+        if orders != expected:
+            problems.append(
+                f"{section_name!r}: sort_order is not contiguous from "
+                f"{CATALOGUE_SORT_BASE}"
+            )
 
     return problems
 
@@ -842,12 +917,18 @@ def _match_existing(existing: dict, item: CatalogueProduct):
     return None, None
 
 
-def _write(db, resolved: dict[str, MenuSection], draft: bool) -> tuple[int, int]:
+def _write(db, resolved: dict[str, MenuSection], draft: bool,
+           created_rows: list | None = None) -> tuple[int, int]:
     """
     Create missing catalogue products; in real mode, price up existing drafts.
 
     Returns (created, promoted). Never deletes, never renames, and never writes
     to a product that is not part of this catalogue.
+
+    Pass `created_rows` to collect the Product objects this pass added. They
+    have no id until the caller flushes; --sync flushes and then hands their
+    ids to _reconcile, which cannot otherwise tell a row created seconds ago
+    from one an admin has taken off sale.
     """
     created = promoted = 0
     # Options are attached when a row is created, and reconciled when a draft
@@ -861,7 +942,7 @@ def _write(db, resolved: dict[str, MenuSection], draft: bool) -> tuple[int, int]
             for p in db.query(Product).filter(Product.section_id == section.id).all()
         }
 
-        for position, item in enumerate(products, start=1):
+        for position, item in enumerate(products, start=CATALOGUE_SORT_BASE):
             # Matched by current name, or by a name it used to be written
             # under, so a rename cannot quietly produce a second row for the
             # same cake. --apply-draft does NOT rename the row; --reconcile-draft
@@ -931,12 +1012,15 @@ def _write(db, resolved: dict[str, MenuSection], draft: bool) -> tuple[int, int]
                     sort_order=i, is_active=True,
                 ))
             db.add(product)
+            if created_rows is not None:
+                created_rows.append(product)
             created += 1
 
     return created, promoted
 
 
-def _reconcile(db, resolved: dict[str, MenuSection]) -> dict:
+def _reconcile(db, resolved: dict[str, MenuSection],
+               newly_created_ids: set[int] | None = None) -> dict:
     """
     Bring the existing draft rows in line with the catalogue, WITHOUT publishing.
 
@@ -955,9 +1039,17 @@ def _reconcile(db, resolved: dict[str, MenuSection]) -> dict:
         hand in the admin survives a re-run, and the difference is reported
         instead
       * delete an option - one may already be on an order
+      * re-mark a product that is already live, or one an admin has taken off
+        sale on purpose - see UNPUBLISHED_TAG below
+
+    `newly_created_ids` is the set of product ids the create pass just added in
+    this same transaction. Those rows are unavailable and carry no marker yet,
+    which is indistinguishable by state alone from a product somebody paused by
+    hand - hence being told rather than guessing.
 
     Idempotent: a second run finds everything in place and changes nothing.
     """
+    newly_created_ids = newly_created_ids or set()
     report = {
         "matched_by_name": [], "matched_by_previous_name": [], "renamed": [],
         "repriced": [], "options_added": [], "option_differences": [],
@@ -1008,8 +1100,25 @@ def _reconcile(db, resolved: dict[str, MenuSection]) -> dict:
                 # Priced now, so the "no price" marker would be a lie. Replaced
                 # with the marker that says what is actually true: priced, but
                 # not yet on sale.
-                tags = [t for t in (match.tags or []) if t != DRAFT_TAG]
-                if UNPUBLISHED_TAG not in tags:
+                #
+                # Only for a row that has genuinely never gone live. The marker
+                # is what --publish acts on, so stamping it on anything else
+                # would put that product on sale: a live product would be
+                # re-marked by the next sync and pointlessly "republished", and
+                # a product an admin had deliberately taken off sale would be
+                # put back on it. Neither is this script's decision to make.
+                #
+                # Never-published means: created by the create pass moments ago,
+                # or still carrying a marker from an earlier run. A row with no
+                # marker is either live or paused on purpose, and is left alone.
+                current = list(match.tags or [])
+                never_published = (
+                    match.id in newly_created_ids
+                    or DRAFT_TAG in current
+                    or UNPUBLISHED_TAG in current
+                )
+                tags = [t for t in current if t != DRAFT_TAG]
+                if never_published and not match.is_available and UNPUBLISHED_TAG not in tags:
                     tags.append(UNPUBLISHED_TAG)
                 match.tags = tags
             else:
@@ -1047,6 +1156,125 @@ def _reconcile(db, resolved: dict[str, MenuSection]) -> dict:
                 report["left_unavailable"].append(f"id {match.id} {item.name}")
 
     return report
+
+
+def _sync_catalogue(db, resolved: dict[str, MenuSection]) -> tuple[int, dict]:
+    """
+    The create-then-reconcile pass, as one callable. Returns (created, report).
+
+    Does not commit - the caller owns the transaction, which is what lets the
+    two halves succeed or fail together.
+
+    This exists so there is exactly one definition of what a sync does. The
+    two passes have to be wired together in a particular way - flush between
+    them, and the ids of the new rows handed to the second - and when that
+    wiring lived in main() alone, anything else driving a sync had to
+    reimplement it and could silently reimplement it wrongly.
+    """
+    fresh: list = []
+    created = _write(db, resolved, draft=True, created_rows=fresh)[0]
+    # SessionLocal is autoflush=False, so the rows just added are invisible to
+    # the reconcile pass's queries until they are flushed. Without this the
+    # reconcile reports every new product as missing and the whole sync aborts.
+    # The flush is also what gives the new rows the ids reconcile needs to tell
+    # them apart from a product somebody took off sale by hand.
+    db.flush()
+    report = _reconcile(db, resolved, newly_created_ids={p.id for p in fresh})
+    return created, report
+
+
+def _publish(db, resolved: dict[str, MenuSection]) -> dict:
+    """
+    Put the products that have a confirmed client price on sale.
+
+    This is the step that makes the menu visible. --sync populates and prices
+    the catalogue but publishes nothing, so without this the whole catalogue
+    sits in the database where no customer can see it, and the alternative is
+    somebody clicking dozens of availability toggles by hand and missing one.
+
+    What it publishes: exactly the rows carrying UNPUBLISHED_TAG - "priced, but
+    never yet on sale". That marker is the queue, and reading it is the whole
+    point. Publishing off `is_available` instead would also switch on every
+    product an admin had deliberately taken off sale.
+
+    What it will not do:
+      * publish a row still at the placeholder price (DRAFT_TAG) - that is the
+        same refusal the admin API makes, and for the same reason: Rs 1 is not
+        a price. Those rows are reported and left alone.
+      * touch products 1-5
+      * touch a row with no marker - already live, or paused on purpose
+      * create, rename, reprice or delete anything
+
+    Idempotent: publishing clears the marker, so a second run finds nothing to
+    do. Run --sync first; a catalogue product with no row is an error here.
+    """
+    report = {
+        "published": [], "still_unpriced": [], "already_live": [],
+        "paused_by_hand": [], "protected_touched": [], "missing": [],
+    }
+
+    for section_name, products in CATALOGUE.items():
+        section = resolved[section_name]
+        existing = {
+            p.name.strip().lower(): p
+            for p in db.query(Product).filter(Product.section_id == section.id).all()
+        }
+
+        for item in products:
+            match, _matched_by = _match_existing(existing, item)
+            where = f"{section_name} / {item.name}"
+
+            if match is None:
+                report["missing"].append(where)
+                continue
+
+            if match.id in PROTECTED_PRODUCT_IDS:
+                report["protected_touched"].append(f"id {match.id} ({match.name})")
+                raise ValidationError(
+                    f"{item.name!r} matches protected product id {match.id}. "
+                    f"Refusing to touch the original seeded products."
+                )
+
+            tags = list(match.tags or [])
+
+            if DRAFT_TAG in tags:
+                report["still_unpriced"].append(f"id {match.id} {item.name}")
+                continue
+
+            if UNPUBLISHED_TAG not in tags:
+                if match.is_available:
+                    report["already_live"].append(f"id {match.id} {item.name}")
+                else:
+                    # No marker and not on sale: somebody took it off sale.
+                    report["paused_by_hand"].append(f"id {match.id} {item.name}")
+                continue
+
+            match.tags = [t for t in tags if t != UNPUBLISHED_TAG]
+            match.is_available = True
+            report["published"].append(f"id {match.id} {item.name} (Rs {match.base_price})")
+
+    return report
+
+
+def _print_publish_report(report: dict, dry_run: bool) -> None:
+    verb = "would be published" if dry_run else "published"
+    print()
+    print("Publish")
+    print(f"  {verb:<38}: {len(report['published'])}")
+    for line in report["published"]:
+        print(f"      {line}")
+    print(f"  still at the placeholder, left off sale: {len(report['still_unpriced'])}")
+    for line in report["still_unpriced"]:
+        print(f"      {line}")
+    print(f"  already live, untouched               : {len(report['already_live'])}")
+    print(f"  paused by hand, untouched             : {len(report['paused_by_hand'])}")
+    for line in report["paused_by_hand"]:
+        print(f"      {line}")
+    print(f"  protected products touched            : {len(report['protected_touched'])} (must be 0)")
+    if report["missing"]:
+        print(f"  MISSING rows (run --sync first)       : {len(report['missing'])}")
+        for line in report["missing"]:
+            print(f"      {line}")
 
 
 def _plan_options(row: Product, item: CatalogueProduct) -> list[dict]:
@@ -1147,6 +1375,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--publish", action="store_true",
+        help=(
+            "put the products that have a confirmed client price on sale. Run "
+            "after --sync, which deliberately publishes nothing. Rows still at "
+            "the placeholder price are left off sale, and a product taken off "
+            "sale by hand is not switched back on. Idempotent."
+        ),
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help=(
             "plan only. On its own it validates and reports; combined with a "
@@ -1156,10 +1393,11 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    write_modes = [args.apply, args.apply_draft, args.reconcile_draft, args.sync]
+    write_modes = [args.apply, args.apply_draft, args.reconcile_draft, args.sync,
+                   args.publish]
     if sum(bool(m) for m in write_modes) > 1:
-        print("Pick one of --sync, --apply, --apply-draft or --reconcile-draft.",
-              file=sys.stderr)
+        print("Pick one of --sync, --publish, --apply, --apply-draft or "
+              "--reconcile-draft.", file=sys.stderr)
         return 2
 
     db = SessionLocal()
@@ -1180,23 +1418,45 @@ def main() -> int:
 
         missing = _missing_prices()
 
+        if args.publish:
+            report = _publish(db, resolved)
+            _print_publish_report(report, dry_run=args.dry_run)
+
+            if report["missing"]:
+                db.rollback()
+                print()
+                print("ABORTED: the catalogue has products with no row in the "
+                      "database. Run --sync first; nothing was written.")
+                return 1
+            if report["protected_touched"]:
+                db.rollback()
+                print("\nABORTED: refused to touch a protected product.")
+                return 2
+
+            if args.dry_run:
+                db.rollback()
+                print("\nDry run - rolled back. Nothing was written.")
+                return 0
+
+            db.commit()
+            print()
+            print(f"  committed - {len(report['published'])} product(s) are now on sale.")
+            if report["still_unpriced"]:
+                print(f"  {len(report['still_unpriced'])} still at the placeholder and off "
+                      f"sale. Set a real price in the admin, which clears the")
+                print("  placeholder and lets that product be published.")
+            return 0
+
         if args.sync:
             # Create then reconcile, committed once. Two separate commands in a
             # required order is a trap for whoever runs the deploy: running only
-            # the first leaves 48 rows with no prices and no options, and
+            # the first leaves every row with no prices and no options, and
             # nothing says so. Both halves share a transaction, so a failure in
             # the second does not leave the first half applied.
             print()
             print("Syncing catalogue (create + reconcile, nothing published)")
-            created, _ = _write(db, resolved, draft=True)
-            # SessionLocal is autoflush=False, so the rows just added are
-            # invisible to the reconcile pass's queries until they are flushed.
-            # Without this the reconcile reports every new product as missing
-            # and the whole sync aborts. Flush, not commit: the two passes stay
-            # in one transaction.
-            db.flush()
+            created, report = _sync_catalogue(db, resolved)
             print(f"  {created} row(s) created")
-            report = _reconcile(db, resolved)
             _print_reconcile_report(report, dry_run=args.dry_run)
 
             if report["missing"]:

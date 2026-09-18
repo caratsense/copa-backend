@@ -1,8 +1,8 @@
 """
 Populating the catalogue when the client has not priced everything yet.
 
-Seventeen of the forty-eight products have no client price. That must not stop
-the other thirty-one, or the catalogue structure, from reaching a database: the
+Some of the products have no client price. That must not stop the priced ones,
+or the catalogue structure, from reaching a database: the
 menu has to be demonstrable and editable long before the last price arrives.
 
 So an unpriced product is still created - at the placeholder price, tagged, and
@@ -19,6 +19,15 @@ from app.models.product import Product
 from app.models.product_option import ProductOption
 
 import pytest
+
+
+# Derived from the catalogue, not written down again. The client sends a
+# revised menu every so often, and when these were literals every such revision
+# broke a dozen assertions that were not about the count at all. The one test
+# that genuinely pins the numbers states them outright, below.
+ALL_ITEMS = [p for ps in cc.CATALOGUE.values() for p in ps]
+PRICED = [p for p in ALL_ITEMS if p.base_price is not None]
+UNPRICED = [p for p in ALL_ITEMS if p.base_price is None]
 
 
 @pytest.fixture
@@ -42,11 +51,13 @@ def sections(db):
 
 
 def _sync(db):
+    # Drives the same function `--sync` does, rather than reassembling the two
+    # passes here. Wiring them together by hand meant this helper could drift
+    # from the real command and go on passing - which it did, once the create
+    # pass started telling the reconcile pass which rows it had just made.
     resolved, problems = cc._validate_sections(db)
     assert not problems, problems
-    created, _ = cc._write(db, resolved, draft=True)
-    db.flush()
-    report = cc._reconcile(db, resolved)
+    created, report = cc._sync_catalogue(db, resolved)
     db.flush()
     return created, report
 
@@ -68,23 +79,30 @@ def _by_state(db):
     return placeholder, confirmed
 
 
-# ─── THE SPLIT: 31 CONFIRMED, 17 MISSING ─────────────
+# ─── THE SPLIT ───────────────────────────────────────
 
-def test_the_catalogue_definition_splits_31_confirmed_from_17_missing():
-    priced = [p for ps in cc.CATALOGUE.values() for p in ps if p.base_price is not None]
-    unpriced = [p for ps in cc.CATALOGUE.values() for p in ps if p.base_price is None]
+def test_the_catalogue_definition_splits_confirmed_from_missing():
+    """
+    The one place the numbers are written down. As of the client's menu of
+    17/09: 51 products, 33 with a confirmed price and 18 without.
 
-    assert len(priced) == 31
-    assert len(unpriced) == 17
-    assert len(priced) + len(unpriced) == 48
+    Deliberately literal. It is the canary for an accidental edit to the
+    catalogue - a product dropped while rewording a description, or a price
+    lost in a merge - so it has to fail when the definition changes, and be
+    updated on purpose when that change was intended.
+    """
+    assert len(PRICED) == 33
+    assert len(UNPRICED) == 18
+    assert len(ALL_ITEMS) == 51
 
 
-def test_all_48_are_created_even_though_17_have_no_price(db, sections):
+def test_every_product_is_created_even_though_some_have_no_price(db, sections):
     created, report = _sync(db)
 
-    assert created == 48, "missing prices stopped the catalogue being populated"
+    assert created == len(ALL_ITEMS), "missing prices stopped the catalogue being populated"
     assert not report["missing"]
-    assert db.query(Product).filter(Product.category != "seeded").count() == 48
+    assert (db.query(Product).filter(Product.category != "seeded").count()
+            == len(ALL_ITEMS))
 
 
 # ─── MISSING PRICE -> PLACEHOLDER ────────────────────
@@ -93,7 +111,7 @@ def test_products_without_a_client_price_get_the_placeholder(db, sections):
     _sync(db)
     placeholder, _ = _by_state(db)
 
-    assert len(placeholder) == 17
+    assert len(placeholder) == len(UNPRICED)
     assert all(p.base_price == cc.PLACEHOLDER_PRICE for p in placeholder)
     assert all(p.base_price == 1.0 for p in placeholder), "the placeholder is Rs 1"
 
@@ -118,7 +136,7 @@ def test_confirmed_products_keep_their_client_price(db, sections):
     _sync(db)
     _, confirmed = _by_state(db)
 
-    assert len(confirmed) == 31
+    assert len(confirmed) == len(PRICED)
     assert all(p.base_price != cc.PLACEHOLDER_PRICE for p in confirmed)
     wanted = {p.name: p.base_price
               for ps in cc.CATALOGUE.values() for p in ps if p.base_price is not None}
@@ -156,7 +174,7 @@ def test_a_second_sync_changes_nothing(db, sections):
     assert report["repriced"] == []
     assert report["options_added"] == []
     assert report["placeholder_applied"] == []
-    assert db.query(Product).filter(Product.category != "seeded").count() == 48
+    assert db.query(Product).filter(Product.category != "seeded").count() == len(ALL_ITEMS)
     assert db.query(ProductOption).count() == 18
 
 
@@ -165,7 +183,7 @@ def test_a_third_sync_still_changes_nothing(db, sections):
     created, _ = _sync(db)
 
     assert created == 0
-    assert db.query(Product).filter(Product.category != "seeded").count() == 48
+    assert db.query(Product).filter(Product.category != "seeded").count() == len(ALL_ITEMS)
 
 
 # ─── EXISTING DATA IS NOT OVERWRITTEN ────────────────

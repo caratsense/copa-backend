@@ -14,6 +14,7 @@ gets it, and none of them has to wonder whether its input is trustworthy.
 """
 
 from app.core.phone import lookup_values, normalize_phone
+from app.models.trusted_device import TrustedDevice
 from app.models.user import User, UserRole
 from app.core.auth import hash_password
 
@@ -155,22 +156,62 @@ def test_a_second_account_cannot_take_the_same_number_in_another_spelling(client
 
 # ─── EXISTING ACCOUNTS MUST STILL LOG IN ─────────────
 
-def test_an_account_stored_before_normalization_can_still_log_in(client, db):
+def _legacy_user(db, phone="9876543210"):
+    """An account from before /auth/register normalised what it stored."""
+    user = User(name="Legacy", phone=phone, role=UserRole.CUSTOMER,
+                password_hash=hash_password("hunter2hunter2"))
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def test_an_account_stored_before_normalization_is_not_locked_out(client, db):
     """
     /auth/register used to store whatever was typed. Those rows still exist;
     validating the login input must not lock them out - the number is the only
     way into the account.
+
+    Getting past 401 is the whole assertion. /auth/login is two-step - it
+    verifies the password and then sends an OTP - so a customer on an unknown
+    device cannot reach 200 here however valid their credentials, and in this
+    suite SMS is disabled so the OTP send itself fails. Neither says anything
+    about whether the legacy row was found. 401 is the answer that would, and
+    it is the one that must not appear.
     """
-    user = User(name="Legacy", phone="9876543210", role=UserRole.CUSTOMER,
-                password_hash=hash_password("hunter2hunter2"))
-    db.add(user)
-    db.commit()
+    _legacy_user(db)
 
     res = client.post("/auth/login",
                       json={"phone": "+919876543210", "password": "hunter2hunter2"})
 
     assert res.status_code != 401, "a pre-normalisation account was locked out"
+
+
+def test_an_account_stored_before_normalization_logs_in_from_a_trusted_device(client, db):
+    """
+    The same account, all the way to a token.
+
+    A trusted device skips the OTP step, which is the only path to a completed
+    login that does not depend on an SMS this suite deliberately cannot send.
+    That makes this the test that proves a legacy row logs in, rather than
+    merely that it is not rejected.
+    """
+    user = _legacy_user(db)
+    db.add(TrustedDevice(user_id=user.id, device_fingerprint="known-device",
+                         device_name="Chrome on Windows"))
+    db.commit()
+
+    res = client.post("/auth/login", json={
+        "phone": "+919876543210",
+        "password": "hunter2hunter2",
+        "device_fingerprint": "known-device",
+    })
+
     assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["requires_otp"] is False
+    assert body["access_token"]
+    assert body["user"]["id"] == user.id
 
 
 def test_lookup_values_covers_the_spellings_that_exist_in_the_wild(client):
