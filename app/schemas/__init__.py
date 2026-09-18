@@ -236,6 +236,11 @@ class ProductRead(BaseModel):
     image_url: Optional[str]
     tags: list[str] = Field(default_factory=list)
     pricing_unit: str
+    # True when base_price is a stand-in, not a price the client has given.
+    # Such a product is shown in the catalogue so the menu can be reviewed, but
+    # is_available is false, so it cannot be ordered. Clients should render it
+    # as unpriced rather than showing base_price as a real figure.
+    is_placeholder: bool = False
     section_id: Optional[int] = None
     sort_order: int = 0
     # Empty for a product that uses the global sizes (or none at all). When it
