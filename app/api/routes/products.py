@@ -19,16 +19,14 @@ from app.schemas import (
 
 router = APIRouter(prefix="/products", tags=["Products"])
 
-# Products the client has not priced yet are created at a placeholder price
-# (see scripts/client_catalogue.py) and carry this tag. The tag - not the
-# number - is what says "this is not a real price", because a product may one
-# day genuinely cost the same as the placeholder.
-PLACEHOLDER_PRICE_TAG = "draft-no-price"
+# The tag itself lives on the model, beside the property that reads it.
+from app.models.product import PLACEHOLDER_PRICE_TAG  # noqa: E402
+
 PLACEHOLDER_PRICE = 1.0
 
 
 def _is_placeholder_priced(product: Product) -> bool:
-    return PLACEHOLDER_PRICE_TAG in (product.tags or [])
+    return product.is_placeholder
 
 
 def _clear_placeholder_tag(product: Product) -> None:
@@ -66,6 +64,7 @@ def _refuse_if_placeholder_priced(product: Product) -> None:
 def list_products(
     category: str | None = None,
     available_only: bool = True,
+    include_placeholders: bool = False,
     skip: int = Query(0, ge=0),
     limit: int | None = Query(None, ge=0),
     db: Session = Depends(get_db),
@@ -83,9 +82,20 @@ def list_products(
     Paging still works exactly as before for anyone who asks for it: pass
     `limit` (with `skip`) and you get that page, ordered deterministically by
     sort_order then id so pages cannot repeat or drop a row.
+
+    `include_placeholders` additionally returns products the client has not
+    priced yet, so the full catalogue can be reviewed before every price is in.
+    They come back with `is_placeholder: true` and `is_available: false` - the
+    flag is for display, and the availability is what stops them being ordered.
+    It is opt-in: a caller that does not ask for them sees exactly what it saw
+    before.
     """
     q = db.query(Product)
-    if available_only:
+    # Availability is NOT relaxed here. Placeholders are added back after the
+    # filter by their own flag, so "available" keeps meaning "orderable" and no
+    # other unavailable product - one the owner has paused, say - comes with
+    # them.
+    if available_only and not include_placeholders:
         q = q.filter(Product.is_available == True)
     if category:
         q = q.filter(Product.category == category)
@@ -95,6 +105,16 @@ def list_products(
     # and skip it on the next. id breaks ties so the order is total, not merely
     # grouped by sort_order.
     q = q.order_by(Product.sort_order, Product.id)
+
+    if available_only and include_placeholders:
+        # Whether a product is a placeholder is a fact about its tags, and the
+        # JSONB containment operator that would express it in SQL is
+        # PostgreSQL-only. Selecting in Python keeps one behaviour across both
+        # databases; the catalogue is ~50 rows, and this branch only runs when
+        # a caller explicitly asks for placeholders.
+        rows = [p for p in q.all() if p.is_available or p.is_placeholder]
+        end = None if limit is None else skip + limit
+        return rows[skip:end]
 
     q = q.offset(skip)
     if limit is not None:

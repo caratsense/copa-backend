@@ -44,11 +44,23 @@ class AssignProduct(BaseModel):
 # ─── PUBLIC ───────────────────────────────────────────
 
 @router.get("/menu/sections")
-def get_menu_sections(db: Session = Depends(get_db)):
+def get_menu_sections(
+    include_placeholders: bool = False,
+    db: Session = Depends(get_db),
+):
     """
     Public — returns active sections with their products.
     Used by the customer-facing menu page.
+
+    `include_placeholders` also returns products the client has not priced yet,
+    so the whole menu can be reviewed before every price is in. They carry
+    `is_placeholder: true` and `is_available: false`; a client should render
+    them as unpriced rather than showing base_price, and they cannot be ordered
+    whatever it renders. Opt-in, so a caller that does not ask for them sees
+    exactly what it saw before.
     """
+    def _shown(p) -> bool:
+        return p.is_available or (include_placeholders and p.is_placeholder)
     sections = (
         db.query(MenuSection)
         .filter(MenuSection.is_active == True)
@@ -71,6 +83,8 @@ def get_menu_sections(db: Session = Depends(get_db)):
                 "tags": p.tags or [],
                 # Tells the menu whether to show "/kg" and a size selector.
                 "pricing_unit": p.pricing_unit,
+                # base_price is a stand-in, not the client's price.
+                "is_placeholder": p.is_placeholder,
                 # When non-empty these are the ONLY sizes this product sells in;
                 # the global size list must not be offered for it.
                 "options": [
@@ -81,7 +95,7 @@ def get_menu_sections(db: Session = Depends(get_db)):
                 "sort_order": p.sort_order,
             }
             for p in sec.products
-            if p.is_available
+            if _shown(p)
         ]
         products.sort(key=lambda x: x["sort_order"])
 
@@ -97,10 +111,11 @@ def get_menu_sections(db: Session = Depends(get_db)):
     # Also include products not in any section
     orphan_products = (
         db.query(Product)
-        .filter(Product.section_id == None, Product.is_available == True)
+        .filter(Product.section_id == None)
         .order_by(Product.sort_order.asc(), Product.id.asc())
         .all()
     )
+    orphan_products = [p for p in orphan_products if _shown(p)]
     if orphan_products:
         result.append({
             "id": None,
@@ -115,6 +130,7 @@ def get_menu_sections(db: Session = Depends(get_db)):
                     "image_url": p.image_url, "is_customizable": p.is_customizable,
                     "is_available": p.is_available, "tags": p.tags or [],
                     "pricing_unit": p.pricing_unit,
+                    "is_placeholder": p.is_placeholder,
                     "options": [
                         {"id": o.id, "label": o.label, "price": o.price,
                          "multiplier": o.multiplier, "sort_order": o.sort_order}
