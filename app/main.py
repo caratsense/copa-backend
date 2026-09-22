@@ -50,6 +50,7 @@ from app.api.routes.ai import router as ai_router
 from app.api.routes.addresses import router as addresses_router
 from app.api.routes.extras import router as extras_router
 from app.api.routes.payments import router as payments_router
+from app.api.routes.build_a_cake import router as build_a_cake_router
 
 settings = get_settings()
 
@@ -163,6 +164,7 @@ app.include_router(ai_router)
 app.include_router(addresses_router)
 app.include_router(extras_router)
 app.include_router(payments_router)
+app.include_router(build_a_cake_router)
 
 
 @app.get("/health")

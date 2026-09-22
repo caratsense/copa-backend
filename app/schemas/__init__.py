@@ -253,6 +253,75 @@ class ProductRead(BaseModel):
         from_attributes = True
 
 
+# ─── BUILD A CAKE ─────────────────────────────────────
+
+# The sponge is chosen first and carries no price of its own: what it selects
+# is which base product the cake is priced from, and which flavours are on
+# offer. Constrained so a typo cannot silently return an empty flavour list.
+Sponge = Literal["vanilla", "chocolate"]
+
+class SpongeRead(BaseModel):
+    """One sponge choice, and the product its price comes from."""
+    sponge: str
+    label: str
+    product_id: int
+    # Per kg. Shown for context; the authoritative figure comes from
+    # POST /pricing/calculate once a size is chosen.
+    base_price: float
+
+class BuildFlavorRead(BaseModel):
+    id: int
+    name: str
+    extra_cost: float
+    sponge: Optional[str]
+    class Config:
+        from_attributes = True
+
+class BuildSizeRead(BaseModel):
+    id: int
+    name: str
+    multiplier: float
+    class Config:
+        from_attributes = True
+
+class BuildOptionsRead(BaseModel):
+    """Everything the builder needs to render its choices in one call."""
+    sponges: list[SpongeRead]
+    # Every flavour, each carrying its sponge, so the client filters without a
+    # second request and without guessing from the name.
+    flavors: list[BuildFlavorRead]
+    sizes: list[BuildSizeRead]
+    designs: list[DesignRuleRead]
+    addons: list[AddonRuleRead]
+    rush: list[RushRuleRead]
+    # Above this, a cake is a Contact Us request rather than a checkout.
+    max_orderable_kg: float
+
+class CakeEnquiryCreate(BaseModel):
+    contact_name: str = Field(min_length=1, max_length=120)
+    contact_phone: IndianPhone
+    sponge: Optional[Sponge] = None
+    flavor: Optional[str] = Field(default=None, max_length=120)
+    # Free text on purpose: "4.5kg", "two tiers", "shaped like a football".
+    # An enquiry exists precisely because the request did not fit the options.
+    requested_size: Optional[str] = Field(default=None, max_length=120)
+    details: Optional[str] = Field(default=None, max_length=2000)
+
+class CakeEnquiryRead(BaseModel):
+    id: int
+    contact_name: str
+    contact_phone: str
+    sponge: Optional[str]
+    flavor: Optional[str]
+    requested_size: Optional[str]
+    details: Optional[str]
+    reference_image_url: Optional[str]
+    is_handled: bool
+    created_at: datetime
+    class Config:
+        from_attributes = True
+
+
 # ─── PRICING RULES ────────────────────────────────────
 
 class SizeRuleCreate(BaseModel):
