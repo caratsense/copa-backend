@@ -20,6 +20,15 @@ class FlavorRule(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, unique=True, nullable=False)       # "vanilla", "chocolate", "red-velvet"
     extra_cost = Column(Float, nullable=False, default=0.0)
+    # Which sponge this flavour is made on: "vanilla", "chocolate", or NULL for
+    # a flavour that is not part of the sponge-first Build-a-Cake flow.
+    #
+    # Stored rather than inferred from the name, because the name does not say.
+    # "White Chocolate Raspberry Pistachio" is a VANILLA-sponge flavour and
+    # "Vanilla Orange Chocolate Crumble" is too - a rule that looked for
+    # "chocolate" in the name would get both wrong, and would do it silently,
+    # offering a customer a flavour the kitchen cannot make on that sponge.
+    sponge = Column(String, nullable=True, index=True)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
