@@ -307,6 +307,15 @@ class CakeEnquiryCreate(BaseModel):
     requested_size: Optional[str] = Field(default=None, max_length=120)
     details: Optional[str] = Field(default=None, max_length=2000)
 
+class EnquiryImageRead(BaseModel):
+    """
+    The answer to an anonymous picture upload: where the picture went, and
+    nothing else. The enquiry itself carries a name, a phone number and what
+    the customer asked for, which is not something an unauthenticated caller
+    holding only a guessable id should be handed back.
+    """
+    reference_image_url: str
+
 class CakeEnquiryRead(BaseModel):
     id: int
     contact_name: str

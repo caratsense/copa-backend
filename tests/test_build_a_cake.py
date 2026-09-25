@@ -379,3 +379,74 @@ def test_uploading_to_a_missing_enquiry_is_a_404(client, db, builder):
                       files={"file": ("ref.png", b"fake", "image/png")})
 
     assert res.status_code == 404
+
+
+# ─── THE UPLOAD IS OPEN, SO IT IS NARROW ──────────────
+#
+# Attaching a picture cannot ask who is calling: the customer may have no
+# account. That makes the enquiry id the only key, and ids are sequential, so
+# these are the limits that make a guessed id worth nothing.
+
+
+def _an_enquiry(client, name="Priya", phone="9876543210"):
+    return client.post("/build-a-cake/enquiries", json={
+        "contact_name": name, "contact_phone": phone,
+        "details": "Two tiers, gold leaf"}).json()
+
+
+def test_the_upload_reply_does_not_hand_back_the_customers_details(client, db, builder):
+    """Walking the ids must not turn into a list of names and phone numbers."""
+    created = _an_enquiry(client)
+
+    body = client.post(f"/build-a-cake/enquiries/{created['id']}/image",
+                       files={"file": ("ref.png", b"fake", "image/png")}).json()
+
+    assert body == {"reference_image_url": body["reference_image_url"]}
+    assert "9876543210" not in str(body)
+    assert "Priya" not in str(body)
+
+
+def test_a_second_picture_is_refused_rather_than_overwriting_the_first(client, admin, db, builder):
+    created = _an_enquiry(client)
+    first = client.post(f"/build-a-cake/enquiries/{created['id']}/image",
+                        files={"file": ("ref.png", b"fake", "image/png")}).json()
+
+    second = client.post(f"/build-a-cake/enquiries/{created['id']}/image",
+                         files={"file": ("other.png", b"fake2", "image/png")})
+
+    assert second.status_code == 404
+    listed = client.get("/build-a-cake/enquiries", headers=auth(admin))
+    assert listed.json()[0]["reference_image_url"] == first["reference_image_url"]
+
+
+def test_the_saved_name_comes_from_the_type_not_the_filename(client, db, builder):
+    """
+    A file the browser calls design.html, served from /media, would be a page on
+    the API's own origin. The extension follows the content type we checked.
+    """
+    created = _an_enquiry(client)
+
+    body = client.post(f"/build-a-cake/enquiries/{created['id']}/image",
+                       files={"file": ("design.html", b"<script>alert(1)</script>",
+                                       "image/png")}).json()
+
+    assert body["reference_image_url"].endswith(".png")
+    assert ".html" not in body["reference_image_url"]
+
+
+def test_the_window_closes_on_an_old_enquiry(client, db, builder):
+    """An id guessed tomorrow is not a way into someone's enquiry."""
+    from datetime import datetime, timedelta, timezone
+    from app.api.routes.build_a_cake import IMAGE_WINDOW_MINUTES
+    from app.models.cake_enquiry import CakeEnquiry
+
+    created = _an_enquiry(client)
+    row = db.query(CakeEnquiry).filter(CakeEnquiry.id == created["id"]).first()
+    row.created_at = (datetime.now(timezone.utc)
+                      - timedelta(minutes=IMAGE_WINDOW_MINUTES + 1))
+    db.commit()
+
+    res = client.post(f"/build-a-cake/enquiries/{created['id']}/image",
+                      files={"file": ("ref.png", b"fake", "image/png")})
+
+    assert res.status_code == 404

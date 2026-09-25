@@ -79,6 +79,16 @@ async def lifespan(app: FastAPI):
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp_opt_in_at TIMESTAMPTZ",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp_opt_in_source VARCHAR",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp_opt_out_at TIMESTAMPTZ",
+            # Which sponge a flavour is made on, for Build a Cake. It must be
+            # added here and not only by scripts/setup_build_a_cake.py: the app
+            # serves traffic the moment it boots, and every query that touches
+            # flavor_rules selects this column — pricing a custom cake, the
+            # WhatsApp ordering flow, the admin flavour list. Adding it after
+            # the deploy instead of before would leave all three answering 500
+            # until someone remembered to run the script. The column is left
+            # empty here; the script is still what fills it in.
+            "ALTER TABLE flavor_rules ADD COLUMN IF NOT EXISTS sponge VARCHAR",
+            "CREATE INDEX IF NOT EXISTS ix_flavor_rules_sponge ON flavor_rules (sponge)",
         ]:
             try:
                 conn.execute(text(stmt))

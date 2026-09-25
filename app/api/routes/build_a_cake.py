@@ -19,6 +19,7 @@ the failure this separation prevents.
 
 import os
 import uuid
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
@@ -32,7 +33,8 @@ from app.models.product import Product
 from app.models.user import User
 from app.schemas import (
     AddonRuleRead, BuildFlavorRead, BuildOptionsRead, BuildSizeRead,
-    CakeEnquiryCreate, CakeEnquiryRead, DesignRuleRead, RushRuleRead, SpongeRead,
+    CakeEnquiryCreate, CakeEnquiryRead, DesignRuleRead, EnquiryImageRead,
+    RushRuleRead, SpongeRead,
 )
 
 settings = get_settings()
@@ -53,6 +55,22 @@ SPONGES = (
     ("vanilla", "Vanilla Sponge", "Vanilla Base Cake"),
     ("chocolate", "Chocolate Sponge", "Chocolate Base Cake"),
 )
+
+# How long after an enquiry is created its picture may still be attached.
+#
+# This upload cannot ask who is calling - a customer may be enquiring before
+# they have an account - so the enquiry id is the only thing between a stranger
+# and someone else's request, and ids are sequential. A short window means a
+# guessed id is almost always already closed. Long enough that a customer who
+# picks a photo, thinks about it and sends it still gets through.
+IMAGE_WINDOW_MINUTES = 30
+
+# The saved extension comes from the content type we just checked, never from
+# the filename the browser sent. UPLOAD_DIR is served by StaticFiles, which
+# types a file by its extension: a "picture" called design.html would come back
+# from /media as a page on the API's own origin, and design.svg as a document
+# that can carry script. Neither is a thing a customer can be allowed to host.
+EXT_FOR_TYPE = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
 
 
 def _sponge_products(db: Session) -> list[SpongeRead]:
@@ -172,7 +190,7 @@ def create_enquiry(data: CakeEnquiryCreate, db: Session = Depends(get_db)):
     return enquiry
 
 
-@router.post("/enquiries/{enquiry_id}/image", response_model=CakeEnquiryRead)
+@router.post("/enquiries/{enquiry_id}/image", response_model=EnquiryImageRead)
 def upload_reference_image(
     enquiry_id: int,
     file: UploadFile = File(...),
@@ -184,29 +202,48 @@ def upload_reference_image(
     Same mechanism as review photos: written to UPLOAD_DIR and served from
     /media, so there is one upload path and one place images live rather than a
     second one built for this flow.
-    """
-    enquiry = db.query(CakeEnquiry).filter(CakeEnquiry.id == enquiry_id).first()
-    if not enquiry:
-        raise HTTPException(status_code=404, detail="Enquiry not found")
 
-    allowed = {"image/jpeg", "image/png", "image/webp"}
+    Open, because the enquiry that owns it is open - but an unauthenticated
+    write has to be narrow, so this one is. One picture per enquiry, within
+    half an hour of it being made, and the reply says only where the picture
+    went. It cannot be used to read an enquiry back: the customer's name, phone
+    number and request are not in the response, so walking the ids returns
+    nothing worth walking them for. A second upload is refused rather than
+    overwriting, which also stops one id being used as free storage.
+
+    An enquiry that is missing, already has its picture, or has closed its
+    window all answer the same 404, so the reply does not say which ids exist.
+    """
+    allowed = set(EXT_FOR_TYPE)
     if file.content_type not in allowed:
         raise HTTPException(status_code=400, detail="Use JPEG, PNG, or WebP")
+
+    enquiry = db.query(CakeEnquiry).filter(CakeEnquiry.id == enquiry_id).first()
+    closed = "Enquiry not found, or it is no longer accepting a picture."
+    if not enquiry or enquiry.reference_image_url:
+        raise HTTPException(status_code=404, detail=closed)
+
+    # created_at comes back timezone-aware from Postgres and naive-UTC from
+    # SQLite, so it is normalised before the arithmetic rather than assumed.
+    created = enquiry.created_at
+    if created is not None:
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) - created > timedelta(minutes=IMAGE_WINDOW_MINUTES):
+            raise HTTPException(status_code=404, detail=closed)
 
     contents = file.file.read()
     if len(contents) > settings.MAX_UPLOAD_MB * 1024 * 1024:
         raise HTTPException(status_code=400, detail=f"Max {settings.MAX_UPLOAD_MB}MB")
 
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-    ext = file.filename.split(".")[-1] if file.filename and "." in file.filename else "jpg"
-    filename = f"enquiry_{enquiry_id}_{uuid.uuid4().hex[:8]}.{ext}"
+    filename = f"enquiry_{enquiry_id}_{uuid.uuid4().hex[:8]}.{EXT_FOR_TYPE[file.content_type]}"
     with open(os.path.join(settings.UPLOAD_DIR, filename), "wb") as f:
         f.write(contents)
 
     enquiry.reference_image_url = f"/media/{filename}"
     db.commit()
-    db.refresh(enquiry)
-    return enquiry
+    return EnquiryImageRead(reference_image_url=enquiry.reference_image_url)
 
 
 @router.get("/enquiries", response_model=list[CakeEnquiryRead])
