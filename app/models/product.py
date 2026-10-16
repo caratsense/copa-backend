@@ -8,6 +8,18 @@ from app.db.base import Base
 # product's own state should not be defined in a deployment script.
 PLACEHOLDER_PRICE_TAG = "draft-no-price"
 
+# Stamped on a product that exists to carry a price, not to be bought: the
+# "Vanilla Base Cake" and "Chocolate Base Cake" rows Build a Cake quotes from,
+# and the premium rows beside them. They head a group of cakes rather than
+# being a cake, which is why they read as a stray first item on the menu.
+#
+# They cannot simply be deleted or switched off. /build-a-cake/options looks
+# the base rows up by name and refuses to serve the builder at all if either
+# is missing or unavailable, so removing them would take the whole custom-cake
+# flow down with them. Hiding them is the only safe answer, and a tag is how
+# this codebase already says "true of the product, not of the catalogue".
+PRICING_ROW_TAG = "pricing-row"
+
 
 class Product(Base):
     __tablename__ = "products"
@@ -46,6 +58,18 @@ class Product(Base):
         ordered, and the product API refuses to publish it.
         """
         return PLACEHOLDER_PRICE_TAG in (self.tags or [])
+
+    @property
+    def is_pricing_row(self) -> bool:
+        """
+        Whether this row is a price for the builder rather than a cake to buy.
+
+        Derived from the tag for the same reason as is_placeholder: one place
+        holds the answer. These rows stay available and keep their price —
+        Build a Cake depends on both — they are simply not offered as products
+        anywhere a customer is choosing something to order.
+        """
+        return PRICING_ROW_TAG in (self.tags or [])
 
     section = relationship("MenuSection", back_populates="products")
     # The sizes/shapes this particular product is sold in. Empty for most

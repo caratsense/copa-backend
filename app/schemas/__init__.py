@@ -241,6 +241,11 @@ class ProductRead(BaseModel):
     # is_available is false, so it cannot be ordered. Clients should render it
     # as unpriced rather than showing base_price as a real figure.
     is_placeholder: bool = False
+    # True for the base and premium rows Build a Cake quotes from. They are
+    # prices rather than cakes, so they are left out of the catalogue unless a
+    # caller asks for them, and a client that does ask should show them as what
+    # they are rather than as something to add to a cart.
+    is_pricing_row: bool = False
     section_id: Optional[int] = None
     sort_order: int = 0
     # Empty for a product that uses the global sizes (or none at all). When it

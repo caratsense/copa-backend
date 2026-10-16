@@ -58,8 +58,15 @@ def get_menu_sections(
     them as unpriced rather than showing base_price, and they cannot be ordered
     whatever it renders. Opt-in, so a caller that does not ask for them sees
     exactly what it saw before.
+
+    Pricing rows are never returned here, with or without that flag. They are
+    the base and premium prices Build a Cake quotes from, not cakes a customer
+    picks, and listing them put a stray "Chocolate Base Cake" at the head of a
+    category. An admin screen that needs them asks /products.
     """
     def _shown(p) -> bool:
+        if p.is_pricing_row:
+            return False
         return p.is_available or (include_placeholders and p.is_placeholder)
     sections = (
         db.query(MenuSection)
@@ -85,6 +92,9 @@ def get_menu_sections(
                 "pricing_unit": p.pricing_unit,
                 # base_price is a stand-in, not the client's price.
                 "is_placeholder": p.is_placeholder,
+                # Always false here — pricing rows are filtered out above — but
+                # sent so one product shape comes back from every endpoint.
+                "is_pricing_row": p.is_pricing_row,
                 # When non-empty these are the ONLY sizes this product sells in;
                 # the global size list must not be offered for it.
                 "options": [

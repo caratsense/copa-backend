@@ -65,6 +65,7 @@ def list_products(
     category: str | None = None,
     available_only: bool = True,
     include_placeholders: bool = False,
+    include_pricing_rows: bool = False,
     skip: int = Query(0, ge=0),
     limit: int | None = Query(None, ge=0),
     db: Session = Depends(get_db),
@@ -89,6 +90,13 @@ def list_products(
     flag is for display, and the availability is what stops them being ordered.
     It is opt-in: a caller that does not ask for them sees exactly what it saw
     before.
+
+    `include_pricing_rows` brings back the base and premium rows Build a Cake
+    quotes from. They are excluded by default because they are prices, not
+    cakes: a customer browsing the catalogue should not be offered "Chocolate
+    Base Cake" as a thing to buy. They are still available and still priced -
+    the builder needs both - so an admin screen managing the catalogue asks for
+    them explicitly.
     """
     q = db.query(Product)
     # Availability is NOT relaxed here. Placeholders are added back after the
@@ -106,13 +114,17 @@ def list_products(
     # grouped by sort_order.
     q = q.order_by(Product.sort_order, Product.id)
 
-    if available_only and include_placeholders:
-        # Whether a product is a placeholder is a fact about its tags, and the
-        # JSONB containment operator that would express it in SQL is
-        # PostgreSQL-only. Selecting in Python keeps one behaviour across both
-        # databases; the catalogue is ~50 rows, and this branch only runs when
-        # a caller explicitly asks for placeholders.
-        rows = [p for p in q.all() if p.is_available or p.is_placeholder]
+    # Both "is this a placeholder" and "is this a pricing row" are facts about
+    # a product's tags, and the JSONB containment operator that would express
+    # either in SQL is PostgreSQL-only. Selecting in Python keeps one behaviour
+    # across both databases; the catalogue is ~50 rows. Paging is applied after
+    # the filtering, so a page is never short because rows were dropped from it.
+    if include_placeholders or not include_pricing_rows:
+        rows = q.all()
+        if available_only and include_placeholders:
+            rows = [p for p in rows if p.is_available or p.is_placeholder]
+        if not include_pricing_rows:
+            rows = [p for p in rows if not p.is_pricing_row]
         end = None if limit is None else skip + limit
         return rows[skip:end]
 
