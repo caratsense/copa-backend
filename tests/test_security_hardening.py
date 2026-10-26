@@ -32,26 +32,31 @@ class _Req:
         self.client = type("C", (), {"host": peer})() if peer else None
 
 
-def test_client_ip_prefers_the_envoy_header():
-    """Railway's Envoy sets the true client and a caller cannot forge it."""
+def test_client_ip_keys_on_x_real_ip():
+    """Railway's edge sets X-Real-IP to the client and overwrites any inbound copy."""
+    # client leftmost, rotating edge node rightmost — exactly the live shape.
     r = _Req({
-        "x-envoy-external-address": "49.36.1.1",
-        # Even a plausible XFF must not win over Envoy's value.
-        "x-forwarded-for": "8.8.8.8, 100.64.0.6",
-    }, peer="100.64.0.18")
+        "x-real-ip": "223.181.62.131",
+        "x-forwarded-for": "223.181.62.131, 152.233.33.162",
+    }, peer="100.64.0.6")
+    assert ratelimit.client_ip(r) == "223.181.62.131"
+
+
+def test_client_ip_falls_back_to_leftmost_xff():
+    """Without X-Real-IP, the client is the leftmost XFF entry (edge overwrites it)."""
+    r = _Req({"x-forwarded-for": "49.36.1.1, 152.233.33.162"}, peer="100.64.0.6")
     assert ratelimit.client_ip(r) == "49.36.1.1"
 
 
-def test_forged_xff_cannot_choose_the_key():
-    """A client-supplied X-Forwarded-For must not become the rate-limit bucket."""
-    # No Envoy header; the attacker prepends a value they vary per request. We
-    # fall back to the real TCP peer instead of trusting any XFF entry.
-    r = _Req({"x-forwarded-for": "1.2.3.4, 49.36.1.1"}, peer="203.0.113.9")
-    assert ratelimit.client_ip(r) == "203.0.113.9"
+def test_client_ip_does_not_key_on_the_rotating_edge_entry():
+    """The rightmost XFF entry is the edge node and rotates; it must not be the key."""
+    r1 = _Req({"x-forwarded-for": "49.36.1.1, 152.233.33.162"}, peer="100.64.0.6")
+    r2 = _Req({"x-forwarded-for": "49.36.1.1, 152.233.33.165"}, peer="100.64.0.9")
+    assert ratelimit.client_ip(r1) == ratelimit.client_ip(r2) == "49.36.1.1"
 
 
-def test_client_ip_falls_back_to_the_tcp_peer_without_envoy():
-    """Outside Railway there is no Envoy header; key on the unspoofable peer."""
+def test_client_ip_falls_back_to_the_tcp_peer_when_no_client_header():
+    """Outside Railway there are no edge headers; key on the unspoofable peer."""
     r = _Req({}, peer="198.51.100.5")
     assert ratelimit.client_ip(r) == "198.51.100.5"
 
