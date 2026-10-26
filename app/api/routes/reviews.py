@@ -5,8 +5,6 @@ Reviews Routes
 - Admin: approve, feature, reply, delete
 """
 
-import os
-import uuid
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.orm import Session
 
@@ -15,11 +13,10 @@ from app.models.user import User
 from app.models.order import Order, OrderStatus
 from app.models.review import Review
 from app.core.auth import get_current_user, require_admin
-from app.config import get_settings
+from app.core.uploads import save_image
 from app.schemas import ReviewCreate, ReviewRead, ReviewAdminAction
 
 router = APIRouter(prefix="/reviews", tags=["Reviews"])
-settings = get_settings()
 
 
 # ─── PUBLIC ───────────────────────────────────────────
@@ -132,23 +129,7 @@ def upload_review_image(
     if review.user_id != user.id:
         raise HTTPException(status_code=403, detail="Not your review")
 
-    allowed = {"image/jpeg", "image/png", "image/webp"}
-    if file.content_type not in allowed:
-        raise HTTPException(status_code=400, detail="Use JPEG, PNG, or WebP")
-
-    contents = file.file.read()
-    if len(contents) > settings.MAX_UPLOAD_MB * 1024 * 1024:
-        raise HTTPException(status_code=400, detail=f"Max {settings.MAX_UPLOAD_MB}MB")
-
-    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-    ext = file.filename.split(".")[-1] if "." in file.filename else "jpg"
-    filename = f"review_{review_id}_{uuid.uuid4().hex[:8]}.{ext}"
-    filepath = os.path.join(settings.UPLOAD_DIR, filename)
-
-    with open(filepath, "wb") as f:
-        f.write(contents)
-
-    review.image_url = f"/media/{filename}"
+    review.image_url = save_image(file, f"review_{review_id}")
     db.commit()
     return {"image_url": review.image_url}
 

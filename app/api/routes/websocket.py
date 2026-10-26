@@ -67,12 +67,11 @@ from typing import List, Dict, Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from fastapi.encoders import jsonable_encoder
-from jose import jwt, JWTError
 from sqlalchemy.orm import Session, noload, selectinload
 from starlette.concurrency import run_in_threadpool
 
 from app.config import get_settings
-from app.core.auth import can_observe_delivery
+from app.core.auth import can_observe_delivery, session_payload
 from app.db import SessionLocal
 from app.models.order import Order, OrderStatus
 from app.models.user import User, UserRole
@@ -280,12 +279,7 @@ fleet_manager = FleetManager()
 # ─── TOKEN VALIDATION ─────────────────────────────────
 
 def _validate_ws_token(token: str | None) -> dict | None:
-    if not token:
-        return None
-    try:
-        return jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
-    except JWTError:
-        return None
+    return session_payload(token)
 
 
 def _load_user(db: Session, payload: dict) -> Optional[User]:

@@ -18,7 +18,8 @@ from typing import Optional
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from jose import jwt, JWTError
+import jwt
+from jwt import PyJWTError as JWTError
 import bcrypt
 from sqlalchemy.orm import Session
 
@@ -66,6 +67,27 @@ def decode_token(token: str) -> dict:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired token",
         )
+
+
+def session_payload(token: str | None) -> dict | None:
+    """
+    Claims of a token that may act as a session, or None.
+
+    The one place that decides it, for REST and WebSocket alike. The tracking
+    sockets used to decode tokens themselves and never learned that an
+    otp_pending token is not a session, so the token /auth/login-otp hands out
+    for a phone number alone opened them - an admin's included - with no code
+    ever entered.
+    """
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
+    except JWTError:
+        return None
+    if payload.get("role") == OTP_PENDING_ROLE:
+        return None
+    return payload
 
 
 # ─── FASTAPI DEPENDENCIES ────────────────────────────

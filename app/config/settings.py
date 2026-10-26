@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     # Admin bootstrap — /users/promote-admin is DISABLED unless this is set.
     PROMOTE_SECRET: str = ""
 
+    # /docs, /redoc and /openapi.json are served outside production only. Set
+    # this to serve them in production too, e.g. briefly while integrating.
+    EXPOSE_API_DOCS: bool = False
+
     # File uploads
     UPLOAD_DIR: str = "/code/uploads"
     MAX_UPLOAD_MB: int = 10

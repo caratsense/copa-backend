@@ -4,8 +4,6 @@ Ingredients Routes
 - Admin: full CRUD + image upload
 """
 
-import os
-import uuid
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.orm import Session
 
@@ -13,11 +11,10 @@ from app.db import get_db
 from app.models.user import User
 from app.models.ingredient import Ingredient
 from app.core.auth import require_admin
-from app.config import get_settings
+from app.core.uploads import save_image
 from app.schemas import IngredientCreate, IngredientUpdate, IngredientRead
 
 router = APIRouter(prefix="/ingredients", tags=["Ingredients"])
-settings = get_settings()
 
 
 # ─── PUBLIC ───────────────────────────────────────────
@@ -100,22 +97,6 @@ def upload_ingredient_image(
     if not item:
         raise HTTPException(status_code=404, detail="Ingredient not found")
 
-    allowed = {"image/jpeg", "image/png", "image/webp"}
-    if file.content_type not in allowed:
-        raise HTTPException(status_code=400, detail="Use JPEG, PNG, or WebP")
-
-    contents = file.file.read()
-    if len(contents) > settings.MAX_UPLOAD_MB * 1024 * 1024:
-        raise HTTPException(status_code=400, detail=f"Max {settings.MAX_UPLOAD_MB}MB")
-
-    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-    ext = file.filename.split(".")[-1] if "." in file.filename else "jpg"
-    filename = f"ingredient_{ingredient_id}_{uuid.uuid4().hex[:8]}.{ext}"
-    filepath = os.path.join(settings.UPLOAD_DIR, filename)
-
-    with open(filepath, "wb") as f:
-        f.write(contents)
-
-    item.image_url = f"/media/{filename}"
+    item.image_url = save_image(file, f"ingredient_{ingredient_id}")
     db.commit()
     return {"image_url": item.image_url}

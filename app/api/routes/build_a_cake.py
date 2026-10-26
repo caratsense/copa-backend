@@ -17,15 +17,14 @@ rule for. Both have the same problem - no price exists - and inventing one is
 the failure this separation prevents.
 """
 
-import os
-import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from sqlalchemy.orm import Session
 
-from app.config import get_settings
 from app.core.auth import get_current_user, require_admin
+from app.core.ratelimit import limiter
+from app.core.uploads import ALLOWED_TYPES, save_image
 from app.db import get_db
 from app.models.cake_enquiry import CakeEnquiry
 from app.models.pricing import AddonRule, DesignRule, FlavorRule, RushRule, SizeRule
@@ -37,7 +36,6 @@ from app.schemas import (
     RushRuleRead, SpongeRead,
 )
 
-settings = get_settings()
 router = APIRouter(prefix="/build-a-cake", tags=["Build a Cake"])
 
 # Above this a cake is quoted by a person. Kept beside the flow that enforces
@@ -65,12 +63,11 @@ SPONGES = (
 # picks a photo, thinks about it and sends it still gets through.
 IMAGE_WINDOW_MINUTES = 30
 
-# The saved extension comes from the content type we just checked, never from
-# the filename the browser sent. UPLOAD_DIR is served by StaticFiles, which
-# types a file by its extension: a "picture" called design.html would come back
-# from /media as a page on the API's own origin, and design.svg as a document
-# that can carry script. Neither is a thing a customer can be allowed to host.
-EXT_FOR_TYPE = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
+# Saving goes through app.core.uploads.save_image, which names the file from
+# what its bytes are, never from the filename the browser sent. UPLOAD_DIR is
+# served by StaticFiles, which types a file by its extension: a "picture" called
+# design.html would otherwise come back from /media as a page on the API's own
+# origin, and design.svg as a document that can carry script.
 
 
 def _sponge_products(db: Session) -> list[SpongeRead]:
@@ -163,7 +160,10 @@ def flavors_for_sponge(sponge: str, db: Session = Depends(get_db)):
 
 
 @router.post("/enquiries", response_model=CakeEnquiryRead, status_code=201)
-def create_enquiry(data: CakeEnquiryCreate, db: Session = Depends(get_db)):
+# Open to the public, and every enquiry sends each admin a WhatsApp alert -
+# a business-initiated template, which Meta charges for.
+@limiter.limit("5/minute;20/hour")
+def create_enquiry(request: Request, data: CakeEnquiryCreate, db: Session = Depends(get_db)):
     """
     Public — a cake the shop cannot price automatically.
 
@@ -191,7 +191,9 @@ def create_enquiry(data: CakeEnquiryCreate, db: Session = Depends(get_db)):
 
 
 @router.post("/enquiries/{enquiry_id}/image", response_model=EnquiryImageRead)
+@limiter.limit("5/minute")
 def upload_reference_image(
+    request: Request,
     enquiry_id: int,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
@@ -214,8 +216,7 @@ def upload_reference_image(
     An enquiry that is missing, already has its picture, or has closed its
     window all answer the same 404, so the reply does not say which ids exist.
     """
-    allowed = set(EXT_FOR_TYPE)
-    if file.content_type not in allowed:
+    if file.content_type not in ALLOWED_TYPES:
         raise HTTPException(status_code=400, detail="Use JPEG, PNG, or WebP")
 
     enquiry = db.query(CakeEnquiry).filter(CakeEnquiry.id == enquiry_id).first()
@@ -232,16 +233,7 @@ def upload_reference_image(
         if datetime.now(timezone.utc) - created > timedelta(minutes=IMAGE_WINDOW_MINUTES):
             raise HTTPException(status_code=404, detail=closed)
 
-    contents = file.file.read()
-    if len(contents) > settings.MAX_UPLOAD_MB * 1024 * 1024:
-        raise HTTPException(status_code=400, detail=f"Max {settings.MAX_UPLOAD_MB}MB")
-
-    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-    filename = f"enquiry_{enquiry_id}_{uuid.uuid4().hex[:8]}.{EXT_FOR_TYPE[file.content_type]}"
-    with open(os.path.join(settings.UPLOAD_DIR, filename), "wb") as f:
-        f.write(contents)
-
-    enquiry.reference_image_url = f"/media/{filename}"
+    enquiry.reference_image_url = save_image(file, f"enquiry_{enquiry_id}")
     db.commit()
     return EnquiryImageRead(reference_image_url=enquiry.reference_image_url)
 

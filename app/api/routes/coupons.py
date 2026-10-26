@@ -5,13 +5,14 @@ Coupon Routes
 """
 
 from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.models.user import User
 from app.models.coupon import Coupon
 from app.core.auth import require_admin
+from app.core.ratelimit import limiter
 from app.schemas import CouponCreate, CouponUpdate, CouponRead, CouponApplyRequest, CouponApplyResponse
 
 router = APIRouter(prefix="/coupons", tags=["Coupons"])
@@ -99,7 +100,10 @@ def delete_coupon(coupon_id: int, admin: User = Depends(require_admin), db: Sess
 
 
 @router.post("/validate", response_model=CouponApplyResponse)
-def validate_coupon(data: CouponApplyRequest, db: Session = Depends(get_db)):
+# Public and answers "invalid" vs "valid" for any string, so unthrottled it is
+# a way to guess codes that were only meant for some customers.
+@limiter.limit("10/minute")
+def validate_coupon(request: Request, data: CouponApplyRequest, db: Session = Depends(get_db)):
     """Public endpoint — check if a coupon is valid and preview discount."""
     coupon = db.query(Coupon).filter(
         Coupon.code == data.code.upper().strip(),

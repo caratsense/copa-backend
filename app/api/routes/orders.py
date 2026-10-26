@@ -43,7 +43,16 @@ def my_orders(skip: int = 0, limit: int = 20, user: User = Depends(get_current_u
 def track_order(order_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Customer order tracking."""
     order = get_order(db, order_id)
-    if order.user_id != user.id and user.role.value not in ("admin", "baker", "rider"):
+    # The customer, an admin, or the baker/rider actually working on it. Any
+    # baker or rider used to be let through, which by walking order ids gave
+    # every member of staff every customer's delivery address.
+    allowed = (
+        order.user_id == user.id
+        or user.role == UserRole.ADMIN
+        or (user.role == UserRole.BAKER and order.assigned_baker_id == user.id)
+        or (user.role == UserRole.RIDER and order.assigned_rider_id == user.id)
+    )
+    if not allowed:
         raise HTTPException(status_code=403, detail="You can only track your own orders")
     return order
 

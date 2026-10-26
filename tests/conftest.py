@@ -188,6 +188,20 @@ def reset_template_cache():
     wa_templates._reset_cache_for_tests()
 
 
+@pytest.fixture(autouse=True)
+def reset_rate_limits():
+    """
+    The limiter's counters are process-wide and every TestClient request comes
+    from the same address, so without this one test's requests count against
+    the next test's limits.
+    """
+    from app.core.ratelimit import limiter
+
+    limiter.reset()
+    yield
+    limiter.reset()
+
+
 @pytest.fixture
 def db():
     session = SessionLocal()

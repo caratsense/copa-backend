@@ -10,16 +10,14 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional
-import os, uuid
 
 from app.db import get_db
 from app.models.menu_section import MenuSection
 from app.models.product import Product
 from app.models.user import User
 from app.core.auth import require_admin
-from app.config import get_settings
+from app.core.uploads import save_image
 
-settings = get_settings()
 router = APIRouter(tags=["Menu Sections"])
 
 
@@ -216,19 +214,7 @@ def upload_section_image(
     if not section:
         raise HTTPException(status_code=404, detail="Section not found")
 
-    allowed = {"image/jpeg", "image/png", "image/webp"}
-    if file.content_type not in allowed:
-        raise HTTPException(status_code=400, detail="Use JPEG, PNG, or WebP")
-
-    contents = file.file.read()
-    ext = file.filename.split(".")[-1] if file.filename else "jpg"
-    filename = f"section_{section_id}_{uuid.uuid4().hex[:8]}.{ext}"
-    filepath = os.path.join(settings.UPLOAD_DIR, filename)
-    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-    with open(filepath, "wb") as f:
-        f.write(contents)
-
-    section.image_url = f"/media/{filename}"
+    section.image_url = save_image(file, f"section_{section_id}")
     db.commit()
     return {"image_url": section.image_url}
 

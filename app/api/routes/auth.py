@@ -32,8 +32,6 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from slowapi import Limiter
-from slowapi.util import get_remote_address
 
 from app.db import get_db
 from app.models.user import User, UserRole
@@ -45,13 +43,13 @@ from app.core.auth import (
 )
 from app.services.otp_service import send_otp, verify_otp
 from app.core.phone import lookup_values, normalize_phone
+from app.core.ratelimit import limiter
 from app.schemas import (
     RegisterRequest, LoginRequest, LoginResponse,
     OTPVerifyRequest, TokenResponse, UserRead,
 )
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
-limiter = Limiter(key_func=get_remote_address)
 
 
 # ─── REGISTER ─────────────────────────────────────────
@@ -103,6 +101,8 @@ def _require_otp_sent(result: dict) -> dict:
     a static OTP that was accepted anyway. Failing closed here is the whole
     point: no OTP, no login.
     """
+    if result.get("throttled"):
+        raise HTTPException(status_code=429, detail=result["message"])
     if not result.get("sent"):
         raise HTTPException(
             status_code=503,
@@ -341,5 +341,9 @@ def reset_password(request: Request, data: ResetPasswordRequest, db: Session = D
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
 
     user.password_hash = hash_password(data.new_password)
+    # A reset is what someone does when they think the account is compromised.
+    # A trusted device skips the OTP for a customer who knows the password, so
+    # every one recorded before the reset is forgotten with the old password.
+    db.query(TrustedDevice).filter(TrustedDevice.user_id == user.id).delete()
     db.commit()
     return {"message": "Password reset successfully. You can now login."}

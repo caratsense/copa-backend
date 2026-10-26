@@ -11,18 +11,16 @@ PROMOTE_SECRET is explicitly set in the environment — there is no default.
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from slowapi import Limiter
-from slowapi.util import get_remote_address
 
 from app.db import get_db
 from app.models.user import User, UserRole
 from app.schemas import UserCreate, UserRead
 from app.core.auth import require_admin, get_current_user
+from app.core.ratelimit import limiter
 from app.config import get_settings
 
 router = APIRouter(prefix="/users", tags=["Users"])
 settings = get_settings()
-limiter = Limiter(key_func=get_remote_address)
 
 
 def _normalize_phone(phone: str) -> str:

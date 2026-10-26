@@ -34,6 +34,11 @@ from fastapi import HTTPException
 
 import pytest
 
+# The leading bytes of real files: uploads are checked for what they are, not
+# only for what the browser says they are.
+PNG = bytes([0x89]) + b"PNG" + bytes([0x0D, 0x0A, 0x1A, 0x0A]) + bytes(16)
+JPEG = bytes([0xFF, 0xD8, 0xFF, 0xE0]) + bytes(16)
+
 
 VANILLA_PER_KG = 2000.0
 CHOCOLATE_PER_KG = 2200.0
@@ -359,7 +364,7 @@ def test_a_reference_image_uses_the_existing_media_path(client, db, builder):
         "contact_name": "Priya", "contact_phone": "9876543210"}).json()
 
     url = client.post(f"/build-a-cake/enquiries/{created['id']}/image",
-                      files={"file": ("ref.jpg", b"fake", "image/jpeg")}).json()
+                      files={"file": ("ref.jpg", JPEG, "image/jpeg")}).json()
 
     assert url["reference_image_url"].startswith("/media/")
 
@@ -376,7 +381,7 @@ def test_a_non_image_upload_is_rejected(client, db, builder):
 
 def test_uploading_to_a_missing_enquiry_is_a_404(client, db, builder):
     res = client.post("/build-a-cake/enquiries/99999/image",
-                      files={"file": ("ref.png", b"fake", "image/png")})
+                      files={"file": ("ref.png", PNG, "image/png")})
 
     assert res.status_code == 404
 
@@ -399,7 +404,7 @@ def test_the_upload_reply_does_not_hand_back_the_customers_details(client, db, b
     created = _an_enquiry(client)
 
     body = client.post(f"/build-a-cake/enquiries/{created['id']}/image",
-                       files={"file": ("ref.png", b"fake", "image/png")}).json()
+                       files={"file": ("ref.png", PNG, "image/png")}).json()
 
     assert body == {"reference_image_url": body["reference_image_url"]}
     assert "9876543210" not in str(body)
@@ -409,29 +414,39 @@ def test_the_upload_reply_does_not_hand_back_the_customers_details(client, db, b
 def test_a_second_picture_is_refused_rather_than_overwriting_the_first(client, admin, db, builder):
     created = _an_enquiry(client)
     first = client.post(f"/build-a-cake/enquiries/{created['id']}/image",
-                        files={"file": ("ref.png", b"fake", "image/png")}).json()
+                        files={"file": ("ref.png", PNG, "image/png")}).json()
 
     second = client.post(f"/build-a-cake/enquiries/{created['id']}/image",
-                         files={"file": ("other.png", b"fake2", "image/png")})
+                         files={"file": ("other.png", PNG + b"2", "image/png")})
 
     assert second.status_code == 404
     listed = client.get("/build-a-cake/enquiries", headers=auth(admin))
     assert listed.json()[0]["reference_image_url"] == first["reference_image_url"]
 
 
-def test_the_saved_name_comes_from_the_type_not_the_filename(client, db, builder):
+def test_the_saved_name_comes_from_the_bytes_not_the_filename(client, db, builder):
     """
     A file the browser calls design.html, served from /media, would be a page on
-    the API's own origin. The extension follows the content type we checked.
+    the API's own origin. The extension follows what the file actually is.
     """
     created = _an_enquiry(client)
 
     body = client.post(f"/build-a-cake/enquiries/{created['id']}/image",
-                       files={"file": ("design.html", b"<script>alert(1)</script>",
-                                       "image/png")}).json()
+                       files={"file": ("design.html", PNG, "image/png")}).json()
 
     assert body["reference_image_url"].endswith(".png")
     assert ".html" not in body["reference_image_url"]
+
+
+def test_markup_labelled_as_an_image_is_refused(client, db, builder):
+    """The Content-Type header is the browser's claim; the bytes are the file."""
+    created = _an_enquiry(client)
+
+    res = client.post(f"/build-a-cake/enquiries/{created['id']}/image",
+                      files={"file": ("design.png", b"<html><body>hi</body></html>",
+                                      "image/png")})
+
+    assert res.status_code == 400
 
 
 def test_the_window_closes_on_an_old_enquiry(client, db, builder):
@@ -447,6 +462,6 @@ def test_the_window_closes_on_an_old_enquiry(client, db, builder):
     db.commit()
 
     res = client.post(f"/build-a-cake/enquiries/{created['id']}/image",
-                      files={"file": ("ref.png", b"fake", "image/png")})
+                      files={"file": ("ref.png", PNG, "image/png")})
 
     assert res.status_code == 404

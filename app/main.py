@@ -17,13 +17,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
 from slowapi.middleware import SlowAPIMiddleware
 
 from app.config import get_settings
 from app.core.broadcast import set_main_loop
+from app.core.ratelimit import limiter
+from app.core.request_limits import BodySizeLimitMiddleware, MediaHeadersMiddleware
 from app.db import Base, engine
 
 # Import all route modules
@@ -54,8 +55,10 @@ from app.api.routes.build_a_cake import router as build_a_cake_router
 
 settings = get_settings()
 
-# Rate limiter
-limiter = Limiter(key_func=get_remote_address, default_limits=["100/minute"])
+# The interactive docs and the schema behind them are a complete map of the
+# API, including every admin route and its parameters. Useful in development;
+# in production they only help someone looking for a way in.
+_docs = settings.EXPOSE_API_DOCS or not settings.is_production
 
 
 @asynccontextmanager
@@ -124,6 +127,9 @@ app = FastAPI(
     ),
     version="2.0.0",
     lifespan=lifespan,
+    docs_url="/docs" if _docs else None,
+    redoc_url="/redoc" if _docs else None,
+    openapi_url="/openapi.json" if _docs else None,
 )
 
 # ─── CORS ─────────────────────────────────────────────
@@ -146,7 +152,24 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 
+# ─── REQUEST HARDENING ────────────────────────────────
+# Uploads are parsed (and spooled to disk) before any handler can look at their
+# size, and one of the upload routes is open to the public. Cap the body first.
+app.add_middleware(BodySizeLimitMiddleware, max_bytes=(settings.MAX_UPLOAD_MB + 1) * 1024 * 1024)
+app.add_middleware(MediaHeadersMiddleware)
+
 # ─── STATIC FILES (uploaded images) ──────────────────
+# StaticFiles types a file from the OS mimetypes table, which has no entry for
+# webp on the slim Python image (guess_type returns None) — so an uploaded
+# .webp went out as text/plain. The browser used to sniff past that and show it
+# anyway; the nosniff header added above correctly forbids that, which means
+# the type has to be right at the source. Register it (and avif, next in line)
+# before the mount. The client uploads webp product photos, so without this the
+# first one silently fails to render.
+import mimetypes
+mimetypes.add_type("image/webp", ".webp")
+mimetypes.add_type("image/avif", ".avif")
+
 os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
 app.mount("/media", StaticFiles(directory=settings.UPLOAD_DIR), name="media")
 
@@ -187,6 +210,6 @@ def root():
     return {
         "app": settings.APP_NAME,
         "version": "3.0.0",
-        "docs": "/docs",
+        "docs": "/docs" if _docs else None,
         "health": "/health",
     }
