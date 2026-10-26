@@ -140,14 +140,24 @@ def business_info() -> str:
     and POST /payments/create-order refuses any method but ONLINE. The prompt
     used to offer COD, so the assistant promised customers a way to pay that
     the API would then reject.
+
+    There is deliberately NO phone number here. It used to carry the shop's
+    line, which meant the assistant would recite it to anyone who asked, and
+    the client's instruction is that the owner's number goes only to the
+    queries that need her. A model cannot keep that rule — it is one prompt
+    away from reciting whatever it was given — so the number is not given to
+    it at all, and app/services/wa_escalation.py decides in code when it goes
+    out.
     """
     return f"""- Founded by Shriya Mahendru
 - 40+ flavors, premium handcrafted cakes
 - Delivery across Lucknow
 - Orders require minimum 24 hours advance notice
 - Website: {SITE}
-- Phone: +91 955 444 4462
-- Payment: Online (UPI/Card), in advance"""
+- Payment: Online (UPI/Card), in advance
+- You do NOT have a phone number to give out. If someone asks for a number,
+  or to speak to a person, say that you will pass it on and keep helping.
+  Never invent one."""
 
 
 def _groq_parse(message: str, role: str, context: dict) -> dict:

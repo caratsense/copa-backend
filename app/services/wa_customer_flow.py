@@ -4,6 +4,7 @@ Customer WhatsApp Flow — Professional, Conversational
 
 import json
 import logging
+import time
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -16,10 +17,14 @@ from app.models.order import Order
 from app.services.gemini_parser import parse_message
 from app.schemas import ItemCustomization
 from app.services.pricing_engine import calculate_item_price
+from app.services import wa_escalation
 from app.config import get_settings
 settings = get_settings()
 logger = logging.getLogger(__name__)
 _memory: dict = {}
+# Who has already been given the owner's contact, when there is no Redis.
+# Timestamps rather than flags, so the window still expires in a bare process.
+_escalated_memory: dict = {}
 SITE = settings.WHATSAPP_TRACKING_BASE_URL.replace("/track", "") if settings.WHATSAPP_TRACKING_BASE_URL else "cakeoclock.co.in"
 
 
@@ -189,7 +194,46 @@ def _quote(db, product: dict, size: Optional[dict], flavor: dict, quantity: int 
     )
 
 
+def _escalation_already_sent(phone: str) -> bool:
+    """Whether this person has already been given the contact recently."""
+    r = _get_redis()
+    if r:
+        return bool(r.get(f"wa:esc:{phone}"))
+    sent_at = _escalated_memory.get(phone)
+    if sent_at is None:
+        return False
+    return (time.time() - sent_at) < wa_escalation.REPEAT_AFTER_SECONDS
+
+
+def _mark_escalation_sent(phone: str) -> None:
+    r = _get_redis()
+    if r:
+        r.setex(f"wa:esc:{phone}", wa_escalation.REPEAT_AFTER_SECONDS, "1")
+    else:
+        _escalated_memory[phone] = time.time()
+
+
 def handle_customer_message(phone: str, message: str, user: Optional[User]) -> str:
+    """
+    The reply, plus the owner's contact when the question has earned it.
+
+    The decision is made here, around the whole conversation rather than
+    inside one of its branches, so a customer asking about a 5kg cake gets the
+    same answer whether they asked in passing, mid-order, or while the bot was
+    waiting for a delivery date.
+    """
+    reply = _reply_to_customer(phone, message, user)
+    db = SessionLocal()
+    try:
+        return wa_escalation.augment(
+            phone, message, reply, db,
+            _escalation_already_sent, _mark_escalation_sent,
+        )
+    finally:
+        db.close()
+
+
+def _reply_to_customer(phone: str, message: str, user: Optional[User]) -> str:
     state = _get_state(phone)
     step = state.get("step", "IDLE")
     db = SessionLocal()
