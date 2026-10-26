@@ -27,23 +27,33 @@ from app.models.user import UserRole
 # ─── RATE LIMIT KEY ───────────────────────────────────
 
 class _Req:
-    def __init__(self, xff):
-        self.headers = {"x-forwarded-for": xff}
-        self.client = None
+    def __init__(self, headers, peer=None):
+        self.headers = headers
+        self.client = type("C", (), {"host": peer})() if peer else None
 
 
-def test_client_ip_prefers_the_edge_entry_over_internal_hops():
-    """The rightmost PUBLIC address, not Railway's internal proxy."""
-    # client, then two internal hops appended by the edge. The client's own
-    # address is the public one; the 100.64/10 and 10/8 hops are skipped.
-    assert ratelimit.client_ip(_Req("49.36.1.1, 100.64.0.1, 10.1.2.3")) == "49.36.1.1"
+def test_client_ip_prefers_the_envoy_header():
+    """Railway's Envoy sets the true client and a caller cannot forge it."""
+    r = _Req({
+        "x-envoy-external-address": "49.36.1.1",
+        # Even a plausible XFF must not win over Envoy's value.
+        "x-forwarded-for": "8.8.8.8, 100.64.0.6",
+    }, peer="100.64.0.18")
+    assert ratelimit.client_ip(r) == "49.36.1.1"
 
 
-def test_client_ip_ignores_a_spoofed_leading_value():
-    """A caller putting a fake IP on the left cannot choose its own bucket."""
-    # "8.8.8.8" is the attacker's injected value; the edge appended the real
-    # client address after it. We key on the real one.
-    assert ratelimit.client_ip(_Req("8.8.8.8, 49.36.1.7")) == "49.36.1.7"
+def test_forged_xff_cannot_choose_the_key():
+    """A client-supplied X-Forwarded-For must not become the rate-limit bucket."""
+    # No Envoy header; the attacker prepends a value they vary per request. We
+    # fall back to the real TCP peer instead of trusting any XFF entry.
+    r = _Req({"x-forwarded-for": "1.2.3.4, 49.36.1.1"}, peer="203.0.113.9")
+    assert ratelimit.client_ip(r) == "203.0.113.9"
+
+
+def test_client_ip_falls_back_to_the_tcp_peer_without_envoy():
+    """Outside Railway there is no Envoy header; key on the unspoofable peer."""
+    r = _Req({}, peer="198.51.100.5")
+    assert ratelimit.client_ip(r) == "198.51.100.5"
 
 
 def test_login_rate_limit_actually_trips(client, db):
