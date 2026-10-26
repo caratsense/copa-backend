@@ -144,6 +144,59 @@ def parse(text: str, role: UserRole) -> Optional[Command]:
     return None
 
 
+_HELP_WORDS = {"HELP", "COMMANDS", "COMMAND", "OPTIONS", "?", "HELP?"}
+
+_GREETINGS = {
+    "HI", "HII", "HIII", "HELLO", "HEY", "HEYY", "YO", "HOLA",
+    "NAMASTE", "NAMASKAR", "SALAAM", "HI THERE", "GOOD MORNING",
+    "GOOD AFTERNOON", "GOOD EVENING", "START",
+}
+
+
+def is_help_request(text: str) -> bool:
+    """Whether a staff member is asking what they can type."""
+    if not text:
+        return False
+    return text.strip().upper().strip(".,!:;") in _HELP_WORDS
+
+
+def is_greeting(text: str) -> bool:
+    """A bare hello, rather than a question or a command."""
+    if not text:
+        return False
+    return text.strip().upper().strip(".,!:;") in _GREETINGS
+
+
+def looks_like_command(text: str, role: UserRole) -> bool:
+    """
+    Whether this message was *trying* to be a command, though it did not parse.
+
+    The difference matters now that an unrecognised staff message is answered
+    by the assistant rather than by the command list. "DONE 2 cakes for order
+    145" must not become a chat about cakes — it is a command typed wrongly,
+    and the honest reply is the grammar. "Do you have anything under 2kg?" is
+    a question, and belongs to the assistant.
+
+    The test is the first word, which is where parse() looks for the verb.
+
+    Deliberately checks EVERY role's verbs, not just this sender's. An admin
+    typing "DONE 145" is reaching for a command — the baker's one, which is not
+    theirs to use — and the honest answer is the list of commands they do have,
+    not a conversation about cakes.
+    """
+    if not role_key(role) or not text:
+        return False
+    tokens = text.strip().split()
+    if not tokens:
+        return False
+    verb = tokens[0].upper().strip(".,!:;#")
+    for table in (_VERBS, _QUERIES):
+        for verbs in table.values():
+            if verb in verbs:
+                return True
+    return False
+
+
 def help_text(role: UserRole) -> str:
     """The reply sent when a message is not a recognised command."""
     key = role_key(role)
@@ -165,3 +218,28 @@ def help_text(role: UserRole) -> str:
                 "DELIVERED <order no>\n"
                 "QUEUE — your deliveries")
     return "Command not recognised."
+
+
+# Appended wherever staff are shown the command list, because the list used to
+# be the ONLY thing they ever got: every message that was not a command came
+# back as this, including "hi". Saying that the assistant is there is what
+# stops the number looking broken to the people who run the shop.
+ALSO_ASK = "\n\nOr just ask me anything — prices, flavours, delivery, or an order you want to place."
+
+
+def staff_help(role: UserRole) -> str:
+    """The command list, plus the fact that ordinary questions work too."""
+    return help_text(role) + ALSO_ASK
+
+
+def staff_greeting(role: UserRole, name: str | None = None) -> str:
+    """
+    The reply to a staff member saying hello.
+
+    Not the customer welcome, which would tell the person who runs the bakery
+    how to browse it, and not a bare command dump either.
+    """
+    who = (name or "").strip().split(" ")[0]
+    opener = f"Hi {who} — you're signed in as {role_key(role)}." if who \
+        else f"You're signed in as {role_key(role)}."
+    return f"{opener}\n\n{staff_help(role)}"

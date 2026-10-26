@@ -325,7 +325,7 @@ def _process_message(msg: dict) -> str:
             # Staff commands are parsed deterministically - never by the language
             # model. An inferred "APPROVE 145" is indistinguishable from a typed
             # one by the time it reaches the order service.
-            reply = _handle_staff(db, user, text)
+            reply = _handle_staff(db, user, text, sender)
         elif user:
             reply = handle_customer_message(sender, text, user)
         else:
@@ -347,11 +347,31 @@ def _mask(phone: str) -> str:
     return f"***{digits[-4:]}" if len(digits) >= 4 else "***"
 
 
-def _handle_staff(db, user, text: str) -> str:
-    """Route a deterministic staff command to the matching handler."""
+def _handle_staff(db, user, text: str, phone: str) -> str:
+    """
+    Route a deterministic staff command — or, when it is not one, answer the
+    message like any other.
+
+    Staff used to get the command list back for EVERYTHING that was not a
+    command, so the people who run the shop saw a wall of APPROVE/REJECT/PAID
+    in reply to "hi", and to any real question. The commands still parse
+    exactly as before, and nothing about an order moves on an inferred
+    instruction; what changed is the fallback.
+
+    Three cases, in the order they are tested:
+
+      a mistyped command   ("DONE 2 cakes for order 145")  -> the grammar
+      a greeting or "help"                                 -> who they are
+                                                              + the commands
+      anything else        ("do you have 5kg cakes?")      -> the assistant
+    """
     command = wa_commands.parse(text, user.role)
     if command is None:
-        return wa_commands.help_text(user.role)
+        if wa_commands.looks_like_command(text, user.role):
+            return wa_commands.help_text(user.role)
+        if wa_commands.is_greeting(text) or wa_commands.is_help_request(text):
+            return wa_commands.staff_greeting(user.role, user.name)
+        return handle_customer_message(phone, text, user)
 
     if user.role == UserRole.ADMIN:
         return _handle_admin(db, user, command)

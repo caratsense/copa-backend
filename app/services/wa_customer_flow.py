@@ -223,6 +223,15 @@ def handle_customer_message(phone: str, message: str, user: Optional[User]) -> s
     waiting for a delivery date.
     """
     reply = _reply_to_customer(phone, message, user)
+
+    # Staff reach this path too, now that a message which is not a command is
+    # answered rather than met with the command list. They must not be handed
+    # the owner's number: they are the shop, and for Shriya herself it would be
+    # her own number coming back.
+    from app.models.user import UserRole
+    if user is not None and user.role in (UserRole.ADMIN, UserRole.BAKER, UserRole.RIDER):
+        return reply
+
     db = SessionLocal()
     try:
         return wa_escalation.augment(
