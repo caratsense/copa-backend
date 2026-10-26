@@ -53,6 +53,35 @@ REPEAT_AFTER_SECONDS = 6 * 60 * 60
 # rather than matched as a word, so 1kg does not escalate and 12kg does.
 _WEIGHT = re.compile(r"(\d+(?:[.,]\d+)?)\s*(?:kg|kgs|kilo|kilos|किलो)\b", re.I)
 
+# "Cake above 3.5 kg" — the phrasing the client themselves used — names the
+# ceiling, not a number above it, so a plain `> 3.5` test misses it. These say
+# the customer means MORE than whatever number follows.
+_MORE_THAN = re.compile(
+    r"(above|over|more than|greater than|bigger than|larger than|heavier than|"
+    r"upwards of|at least|minimum|plus|\+|se\s*zyada|se\s*jyada|se\s*upar)",
+    re.I,
+)
+
+
+def _oversize_reason(text: str) -> Optional[str]:
+    """
+    Whether this message is about a cake the shop cannot price online.
+
+    Two ways to be over the line: a number above the ceiling ("5kg"), or the
+    ceiling itself with a word that means more than it ("above 3.5kg"). The
+    second is how people actually ask, and reading it as exactly 3.5kg — an
+    orderable size — is how a request for a big cake became a 1kg quote.
+    """
+    comparative = bool(_MORE_THAN.search(text))
+    for match in _WEIGHT.finditer(text):
+        try:
+            kg = float(match.group(1).replace(",", "."))
+        except ValueError:
+            continue
+        if kg > MAX_ORDERABLE_KG or (comparative and kg >= MAX_ORDERABLE_KG):
+            return f"a cake over {MAX_ORDERABLE_KG:g}kg"
+    return None
+
 # Phrases that mean a person is needed, in the English, Hindi and Hinglish
 # customers actually write. Matched on word boundaries so "scale" does not
 # trigger "cal", and kept here rather than in the prompt so the list can be
@@ -142,13 +171,9 @@ def reason_to_escalate(message: str, db: Session) -> Optional[str]:
         return None
     text = message.lower()
 
-    for match in _WEIGHT.finditer(text):
-        try:
-            kg = float(match.group(1).replace(",", "."))
-        except ValueError:
-            continue
-        if kg > MAX_ORDERABLE_KG:
-            return f"a cake over {MAX_ORDERABLE_KG:g}kg"
+    oversize = _oversize_reason(text)
+    if oversize:
+        return oversize
 
     for reason, phrases in _TRIGGERS:
         for phrase in phrases:
@@ -162,6 +187,42 @@ def reason_to_escalate(message: str, db: Session) -> Optional[str]:
         if name and name in text:
             return "one of our festive boxes"
 
+    return None
+
+
+# The triggers that must be answered even in the middle of an order, because
+# the step they land on would otherwise eat them. Deliberately NOT the whole
+# list: a customer part-way through ordering may well type "Full House" or
+# "hamper" as an answer, and intercepting those would stop them buying one.
+# These two cannot be an answer to any question the bot asks.
+_INTERRUPT_REASONS = ("a problem with an order", "a request to speak to someone")
+
+
+def reason_to_interrupt(message: str) -> Optional[str]:
+    """
+    Why this message must be answered now, even mid-order — or None.
+
+    A cake over the ceiling, a complaint, or someone asking for a person. The
+    bot's steps consume free text verbatim: the delivery-address step took
+    "cake above 3.5kg" as the address and printed it on the order. Whatever
+    else happens, those three must never become data.
+
+    Needs no database, so it can run before anything else in the flow.
+    """
+    if not message:
+        return None
+    text = message.lower()
+
+    oversize = _oversize_reason(text)
+    if oversize:
+        return oversize
+
+    for reason, phrases in _TRIGGERS:
+        if reason not in _INTERRUPT_REASONS:
+            continue
+        for phrase in phrases:
+            if re.search(rf"(?<![a-z]){re.escape(phrase)}(?![a-z])", text):
+                return reason
     return None
 
 

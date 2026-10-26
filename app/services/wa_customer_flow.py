@@ -61,6 +61,9 @@ def _get_state(phone):
     return _memory.get(phone, {"step": "IDLE"})
 
 def _set_state(phone, state):
+    # Stamped on every write so the next message can tell a conversation that
+    # is still going from one abandoned twenty minutes ago. See _is_stale.
+    state = {**state, "touched_at": time.time()}
     r = _get_redis()
     if r: r.setex(f"wa:{phone}", 3600, json.dumps(state))
     else: _memory[phone] = state
@@ -194,6 +197,69 @@ def _quote(db, product: dict, size: Optional[dict], flavor: dict, quantity: int 
     )
 
 
+# How long a half-finished order stays resumable. Long enough to find your
+# address or ask someone what to write on the cake; short enough that a
+# question hours later is not read as the next answer in it.
+STALE_AFTER_SECONDS = 20 * 60
+
+
+def _is_stale(state: dict) -> bool:
+    """Whether this conversation has been sitting unanswered too long."""
+    touched = state.get("touched_at")
+    if not touched:
+        # Written before this field existed. Treat as current: one resumed
+        # order is a smaller harm than dropping a live one.
+        return False
+    return (time.time() - touched) > STALE_AFTER_SECONDS
+
+
+# What the bot is waiting for at each step, for when something interrupts and
+# the customer needs putting back where they were.
+_STEP_QUESTION = {
+    "SELECT_PRODUCT": "which cake you would like",
+    "SELECT_SIZE": "the size",
+    "SELECT_FLAVOR": "the flavour",
+    "CAKE_MESSAGE": "the message for the cake (or *skip*)",
+    "DELIVERY_ADDRESS": "your delivery address",
+    "SELECT_AREA": "your area, by number",
+    "SELECT_DATE": "the delivery date, by number",
+    "SELECT_TIME": "the delivery time, by number",
+    "CONFIRM": "*confirm* to place the order",
+    "AWAITING_STATUS_ID": "your order number",
+}
+
+
+def _answer_without_losing_the_order(db, phone: str, state: dict, step: str,
+                                     reason: str, user: Optional[User]) -> str:
+    """
+    Answer something that needs a person, mid-order, without eating the answer
+    the step was waiting for and without throwing the order away.
+    """
+    if reason.startswith("a cake over"):
+        head = (f"A cake that size is quoted by hand rather than priced online, "
+                f"so I'll pass this on and someone will come back to you.")
+    elif reason == "a problem with an order":
+        head = "I'm sorry — I'll pass this to someone who can sort it out."
+    else:
+        head = "Of course — I'll pass this on and someone will get back to you."
+
+    # Staff are the people this would be passed to; see handle_customer_message.
+    from app.models.user import UserRole
+    is_staff = user is not None and user.role in (
+        UserRole.ADMIN, UserRole.BAKER, UserRole.RIDER)
+    if not is_staff:
+        line = wa_escalation.contact_line(db, reason)
+        if line and not _escalation_already_sent(phone):
+            _mark_escalation_sent(phone)
+            head += line
+
+    waiting_for = _STEP_QUESTION.get(step)
+    if waiting_for:
+        head += (f"\n\nYour order is still here — I was waiting for "
+                 f"{waiting_for}. Reply *cancel* to start again.")
+    return head
+
+
 def _escalation_already_sent(phone: str) -> bool:
     """Whether this person has already been given the contact recently."""
     r = _get_redis()
@@ -245,9 +311,28 @@ def handle_customer_message(phone: str, message: str, user: Optional[User]) -> s
 def _reply_to_customer(phone: str, message: str, user: Optional[User]) -> str:
     state = _get_state(phone)
     step = state.get("step", "IDLE")
+
+    # An order someone walked away from is not a conversation they are still
+    # having. The state used to live a full hour and simply resume, so a
+    # question asked later was answered as though it were the next thing in a
+    # half-finished order — the delivery-address step took "cake above 3.5kg"
+    # as the address and put it on the order.
+    if step != "IDLE" and _is_stale(state):
+        _clear_state(phone)
+        state, step = {"step": "IDLE"}, "IDLE"
+
     db = SessionLocal()
 
     try:
+        # Three things must be answered even mid-order, because the step they
+        # land on would otherwise swallow them as data: a cake over the size
+        # the shop can price, a complaint, and someone asking for a person.
+        # Checked in code, before the model and before any step, so it holds
+        # whatever the model makes of the sentence.
+        interrupt = wa_escalation.reason_to_interrupt(message)
+        if interrupt and step != "IDLE":
+            return _answer_without_losing_the_order(db, phone, state, step, interrupt, user)
+
         products = [{"id": p.id, "name": p.name, "base_price": p.base_price,
                      "pricing_unit": p.pricing_unit,
                      "options": [{"label": o.label, "price": o.price}
@@ -274,7 +359,16 @@ def _reply_to_customer(phone: str, message: str, user: Optional[User]) -> str:
         # ─── CONVERSATIONAL (AI answered a question) ───
         if act == "CONVERSATIONAL":
             reply = action.get("reply", "")
-            if reply: return reply
+            if reply:
+                # Answering a question mid-order used to leave the customer
+                # with no idea the order was still open, or what it was
+                # waiting for — the next thing they typed went into whatever
+                # step they had forgotten they were on.
+                waiting_for = _STEP_QUESTION.get(step)
+                if waiting_for:
+                    reply += (f"\n\nBack to your order — I was waiting for "
+                              f"{waiting_for}. Reply *cancel* to start again.")
+                return reply
 
         # ─── VIEW MENU ───────────────────────
         if act == "VIEW_MENU":
@@ -414,6 +508,12 @@ def _reply_to_customer(phone: str, message: str, user: Optional[User]) -> str:
         if step == "DELIVERY_ADDRESS":
             addr = message.strip()
             is_pickup = addr.upper() in ("PICKUP", "SELF PICKUP")
+
+            # A question is never an address: this step takes whatever arrives,
+            # which is how "cake above 3.5kg" became the delivery address and
+            # reached the order summary as one. Questions are caught earlier —
+            # the CONVERSATIONAL branch answers them and re-asks — and anything
+            # the shop cannot price is caught before that, in code.
             if is_pickup:
                 _set_state(phone, {**state, "step": "SELECT_DATE", "address": "Self Pickup"})
                 return DATE_PROMPT
