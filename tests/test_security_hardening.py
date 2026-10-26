@@ -57,8 +57,25 @@ def test_client_ip_does_not_key_on_the_rotating_edge_entry():
 
 def test_client_ip_falls_back_to_the_tcp_peer_when_no_client_header():
     """Outside Railway there are no edge headers; key on the unspoofable peer."""
-    r = _Req({}, peer="198.51.100.5")
-    assert ratelimit.client_ip(r) == "198.51.100.5"
+    r = _Req({}, peer="49.36.1.5")
+    assert ratelimit.client_ip(r) == "49.36.1.5"
+
+
+def test_internal_healthcheck_does_not_log_degraded(caplog):
+    """Railway's headerless healthcheck (CGNAT peer) must not trip the warning."""
+    import logging
+    with caplog.at_level(logging.WARNING, logger="app.core.ratelimit"):
+        key = ratelimit.client_ip(_Req({}, peer="100.64.0.1"))
+    assert key == "100.64.0.1"
+    assert "DEGRADED" not in caplog.text
+
+
+def test_degraded_warning_still_fires_for_a_public_direct_peer(caplog):
+    """A real client reaching the peer branch (public peer) is the case to warn on."""
+    import logging
+    with caplog.at_level(logging.WARNING, logger="app.core.ratelimit"):
+        ratelimit.client_ip(_Req({}, peer="49.36.1.5"))
+    assert "DEGRADED" in caplog.text
 
 
 def test_login_rate_limit_actually_trips(client, db):

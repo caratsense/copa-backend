@@ -70,6 +70,24 @@ def _leftmost_xff(xff: str) -> str | None:
     return None
 
 
+# Railway's internal network: the private mesh and the CGNAT range it uses, plus
+# loopback for local/dev. Traffic whose peer is one of these and which carries no
+# edge headers is internal — the platform healthcheck hitting the container
+# directly — not a client, so the degraded-key warning would only be noise.
+_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _is_internal_peer(peer: str | None) -> bool:
+    if not peer:
+        return True
+    try:
+        ip = ipaddress.ip_address(peer)
+    except ValueError:
+        return False
+    return (ip.is_private or ip.is_loopback or ip.is_link_local
+            or (ip.version == 4 and ip in _CGNAT))
+
+
 def client_ip(request: Request) -> str:
     """The real client address as Railway's edge reports it."""
     real_ip = request.headers.get("x-real-ip", "").strip()
@@ -83,14 +101,17 @@ def client_ip(request: Request) -> str:
         chosen = left
     else:
         chosen = peer or "127.0.0.1"
-        # Both client headers gone. On Railway the peer rotates, so the limits
-        # are now several-fold weaker, not stricter — alarm on every such
-        # request, not once. Loopback is local/dev, where the peer is stable and
-        # this is expected, so stay quiet there.
-        if peer not in ("127.0.0.1", "::1", None):
+        # Both client headers gone. Railway's own healthcheck reaches the
+        # container directly over the private network with no edge headers and
+        # an internal peer, and would otherwise trip this warning on every probe
+        # forever — a warning that fires routinely is one nobody reads. A real
+        # client that reached this branch would have a PUBLIC peer (a direct
+        # connection, i.e. not behind Railway's edge), which is the genuinely
+        # degraded case worth shouting about, so warn only then.
+        if not _is_internal_peer(peer):
             logger.warning(
                 "[RATELIMIT] no x-real-ip or usable x-forwarded-for; keyed on peer=%s, "
-                "which rotates on Railway — per-IP limits are DEGRADED. x-forwarded-for=%r",
+                "which may rotate — per-IP limits are DEGRADED. x-forwarded-for=%r",
                 chosen, xff,
             )
         return chosen
