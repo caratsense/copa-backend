@@ -22,6 +22,8 @@ SITE SETTINGS USED:
 from datetime import datetime, time, timedelta, timezone, date
 import json
 
+from fastapi import HTTPException
+
 import redis
 from sqlalchemy.orm import Session
 
@@ -161,6 +163,43 @@ def get_next_available_time(db: Session) -> datetime:
         # After closing — schedule for tomorrow's opening
         tomorrow = now_ist + timedelta(days=1)
         return tomorrow.replace(hour=open_time.hour, minute=open_time.minute, second=0, microsecond=0)
+
+
+# Nothing is delivered on the day it is ordered. Every cake is baked and
+# decorated to order, so the earliest a customer may ask for is tomorrow.
+#
+# Before this, a requested time in the past was not refused — it was silently
+# moved to the next available slot. Choosing "today, 2 PM" at 6 PM produced an
+# order confirmed for a time the customer never picked, and the checkout page
+# had already shown them 2 PM.
+MIN_LEAD_DAYS = 1
+
+
+def earliest_delivery_date(now: datetime | None = None):
+    """The first date a customer may choose, in IST."""
+    base = (now or datetime.now(IST)).astimezone(IST)
+    return (base + timedelta(days=MIN_LEAD_DAYS)).date()
+
+
+def check_delivery_lead_time(requested: datetime | None) -> None:
+    """
+    Refuse a delivery date the kitchen cannot meet.
+
+    Raises rather than adjusting: moving someone's delivery date without
+    telling them is worse than refusing it, because they find out when the
+    cake does not arrive.
+    """
+    if requested is None:
+        return
+    moment = requested if requested.tzinfo else requested.replace(tzinfo=IST)
+    if moment.astimezone(IST).date() < earliest_delivery_date():
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "We bake every cake to order, so the earliest we can deliver "
+                "is tomorrow. Please choose another date."
+            ),
+        )
 
 
 def schedule_order_delivery(db: Session, requested_delivery_time: datetime | None) -> dict:

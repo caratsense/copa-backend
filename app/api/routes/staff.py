@@ -9,17 +9,25 @@ Admin Staff Management Routes
 - Reassign orders
 """
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, or_
 
 from app.db import get_db
+from app.models.address import Address
+from app.models.cake_enquiry import CakeEnquiry
+from app.models.review import Review
+from app.models.trusted_device import TrustedDevice
 from app.models.user import User, UserRole
 from app.models.order import Order, OrderStatus
 from app.core.auth import require_admin, hash_password
 from app.core.phone import normalize_phone
 from app.schemas import StaffCreate, StaffRead, StaffUpdate, DutyToggle, OrderRead
 from app.services.assignment_engine import admin_assign_baker
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin/staff", tags=["Admin — Staff Management"])
 
@@ -180,6 +188,88 @@ def toggle_staff_active(
     db.commit()
     db.refresh(user)
     return _staff_with_count(db, user)
+
+
+@router.delete("/{staff_id}", status_code=204)
+def delete_staff(
+    staff_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Remove a staff account for good.
+
+    This exists for the accounts that should never have been created: a
+    duplicate, a typo, somebody added to the wrong role, an account whose
+    phone column got an email address autofilled into it. The admin screen had
+    no way to get rid of any of them, so the list only ever grew.
+
+    It is NOT the way to remove someone who has left. Deleting a person who has
+    worked on orders would take their name off that work — the order history
+    would no longer say who baked it or who delivered it — so a staff member
+    with any order against their name is refused here and must be deactivated
+    instead. Deactivating already does everything leaving requires: they cannot
+    log in, they take no new assignments, and they disappear from the duty
+    roster.
+
+    What does go with the account is what belongs to it alone and means nothing
+    without it: saved addresses and remembered devices.
+    """
+    user = db.query(User).filter(
+        User.id == staff_id,
+        User.role.in_([UserRole.BAKER, UserRole.RIDER]),
+    ).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Staff member not found")
+
+    # Every order they have ever touched, in any of the three roles an order
+    # can reference a user in — not just the open ones. A finished order still
+    # has to be able to say who made it.
+    orders = db.query(func.count(Order.id)).filter(
+        or_(
+            Order.assigned_baker_id == staff_id,
+            Order.assigned_rider_id == staff_id,
+            Order.user_id == staff_id,
+        )
+    ).scalar() or 0
+    if orders:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{user.name} is on {orders} order{'s' if orders != 1 else ''}. "
+                "Deleting the account would take their name off that work, so "
+                "it is kept. Use Deactivate instead — they cannot log in and "
+                "take no new orders."
+            ),
+        )
+
+    reviews = db.query(func.count(Review.id)).filter(Review.user_id == staff_id).scalar() or 0
+    if reviews:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{user.name} has written {reviews} review"
+                f"{'s' if reviews != 1 else ''} on the site. Use Deactivate instead."
+            ),
+        )
+
+    # Records that exist only to serve this account. An enquiry is a customer's,
+    # not the account's, so it is kept and merely unlinked.
+    db.query(TrustedDevice).filter(TrustedDevice.user_id == staff_id).delete(synchronize_session=False)
+    db.query(Address).filter(Address.user_id == staff_id).delete(synchronize_session=False)
+    db.query(CakeEnquiry).filter(CakeEnquiry.user_id == staff_id).update(
+        {CakeEnquiry.user_id: None}, synchronize_session=False
+    )
+
+    # Worth a line in the log: this is the one action on this screen that
+    # cannot be undone, and it is the only record that it happened.
+    logger.warning(
+        "[STAFF] admin %s deleted %s account %s (%s)",
+        admin.id, user.role.value, user.id, user.name,
+    )
+
+    db.delete(user)
+    db.commit()
 
 
 @router.get("/{staff_id}/queue", response_model=list[OrderRead])

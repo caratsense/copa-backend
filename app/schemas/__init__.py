@@ -4,7 +4,7 @@ Organized by domain — add new schemas at the bottom of each section.
 """
 
 from __future__ import annotations
-from datetime import datetime
+from datetime import date as _date, datetime
 from typing import Annotated, Literal, Optional
 from fastapi import HTTPException
 from pydantic import BaseModel, BeforeValidator, Field, model_validator
@@ -44,14 +44,75 @@ OptionalEmail = Annotated[
 ]
 
 
+# The youngest someone may be and hold an account of their own, and the oldest
+# anyone plausibly is. The birthday is optional — it is there so the bakery can
+# send a birthday offer — but when it is given it has to be a real one.
+MIN_SIGNUP_AGE = 13
+_MAX_PLAUSIBLE_AGE = 120
+
+
+def _validate_dob(value):
+    """
+    A date of birth that could belong to a person.
+
+    The browser's `max` attribute only constrains the date picker, so a typed
+    or pasted value reached the API untouched and a customer was registered
+    with a birthday five days earlier. Checked here as well as in the form,
+    because the form is not the only way in.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        born = _date.fromisoformat(text)
+    except ValueError:
+        raise ValueError("Enter the date of birth as YYYY-MM-DD.") from None
+
+    today = _date.today()
+    if born > today:
+        raise ValueError("A date of birth cannot be in the future.")
+
+    age = today.year - born.year - ((today.month, today.day) < (born.month, born.day))
+    if age < MIN_SIGNUP_AGE:
+        raise ValueError(
+            f"You need to be at least {MIN_SIGNUP_AGE} to have an account."
+        )
+    if age > _MAX_PLAUSIBLE_AGE:
+        raise ValueError("Please check the year of birth.")
+    return text
+
+
+# A real birthday, or nothing at all.
+OptionalDOB = Annotated[Optional[str], BeforeValidator(_validate_dob)]
+
+
+# A person's name: not blank, not a paragraph. Trimmed, because a name is not
+# different for having been pasted with a space on the end.
+def _validate_name(value):
+    text = str(value or "").strip()
+    if len(text) < 2:
+        raise ValueError("Enter your name.")
+    if len(text) > 80:
+        raise ValueError("That name is too long.")
+    return text
+
+
+PersonName = Annotated[str, BeforeValidator(_validate_name)]
+
+
 # ─── AUTH ─────────────────────────────────────────────
 
 class RegisterRequest(BaseModel):
-    name: str
+    name: PersonName
     phone: IndianPhone
-    password: str
+    # Short passwords were accepted by the API even though the form asked for
+    # six characters, so anything that did not go through the form could use
+    # one character.
+    password: str = Field(min_length=6, max_length=128)
     email: OptionalEmail = None
-    date_of_birth: Optional[str] = None  # "YYYY-MM-DD"
+    date_of_birth: OptionalDOB = None  # "YYYY-MM-DD"
     role: str = "customer"
     # WhatsApp order updates. Must be an explicit, unticked-by-default choice —
     # WhatsApp policy does not accept implied consent, and we must be able to
@@ -480,6 +541,12 @@ class ItemCustomization(BaseModel):
     design: str = ""
     addons: list[str] = Field(default_factory=list)
     rush: str = ""
+    # What to write on this cake. It belongs to the line, not the order: an
+    # order of three cakes for three people has three messages, and the one
+    # box at checkout could only carry one. It reaches the baker through the
+    # customization snapshot on the order item, and costs nothing, so the
+    # pricing engine ignores it.
+    message: str = Field(default="", max_length=60)
 
 class PricingRequest(BaseModel):
     product_id: int

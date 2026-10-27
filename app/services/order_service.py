@@ -98,12 +98,32 @@ def create_order(db: Session, data: OrderCreate) -> Order:
             delivery_zone_id = zone.id
 
     # ── Schedule delivery based on store hours ──
+    # Refused here, not adjusted. schedule_order_delivery quietly moves a time
+    # in the past to the next available slot, which is how an order placed at
+    # 6 PM for "today, 2 PM" was accepted and confirmed for a time nobody
+    # chose. Every cake is baked to order; tomorrow is the earliest.
+    from app.services.store_hours import check_delivery_lead_time
+    check_delivery_lead_time(data.delivery_time)
+
     schedule = schedule_order_delivery(db, data.delivery_time)
 
-    # ── Create order shell — always auto-confirmed ──
+    # ── Create order shell ──
+    #
+    # RECEIVED, not CONFIRMED. The order is written before the customer has
+    # been anywhere near the payment page, and "CONFIRMED" is a promise to
+    # both sides: the customer reads it as "we are making your cake" and the
+    # bakery reads it as a sale. Abandoning checkout left a row saying exactly
+    # that, with "Payment: Pending" beside it — the account page showed two
+    # orders marked CONFIRMED that nobody had paid for and nobody was baking.
+    #
+    # Nothing downstream moved on those orders (is_payable already gated the
+    # baker, the notifications and the ASSIGNED transition), so this is the
+    # label catching up with the behaviour. It becomes CONFIRMED the moment
+    # the money lands — below for an order that is already payable, and in
+    # payments._release_for_production for one that settles later.
     order = Order(
         user_id=data.user_id,
-        status=OrderStatus.CONFIRMED,    # auto-confirmed always
+        status=OrderStatus.RECEIVED,
         total_price=0.0,
         subtotal=0.0,
         discount=0.0,
@@ -233,6 +253,11 @@ def create_order(db: Session, data: OrderCreate) -> Order:
     # dispatching afterwards would read the new status and send the baker a
     # second copy.
     if is_payable(order):
+        # Payable at creation means a legacy COD row: there is nothing to wait
+        # for, so it is confirmed here rather than from the payment callback.
+        order.status = OrderStatus.CONFIRMED
+        db.commit()
+        db.refresh(order)
         try:
             from app.services.wa_notifications import dispatch_notifications
             dispatch_notifications(db, order, OrderStatus.CONFIRMED.value)

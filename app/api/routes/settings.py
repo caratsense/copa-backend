@@ -23,6 +23,28 @@ from app.services.store_hours import is_store_open
 router = APIRouter(prefix="/settings", tags=["Site Settings"])
 
 
+# The only settings an unauthenticated caller may read.
+#
+# /settings/public returned every row in the table. That table holds
+# `brand_phone` — the owner's personal number, the one the WhatsApp bot was
+# deliberately changed to withhold unless a message earns it — along with
+# `brand_owner` and the payment rules. All of it was one unauthenticated GET
+# away, while the frontend reads exactly two of these keys.
+#
+# An allow-list rather than a deny-list, so a setting added next month is
+# private until somebody decides otherwise.
+PUBLIC_KEYS = frozenset({
+    "active_theme",
+    "announcement",
+    "announcement_enabled",
+    "store_open",
+    "store_hours_open",
+    "store_hours_close",
+    "brand_name",
+    "brand_tagline",
+})
+
+
 # ─── PUBLIC ───────────────────────────────────────────
 
 @router.get("/store-hours")
@@ -39,18 +61,29 @@ def get_store_hours(db: Session = Depends(get_db)):
 @router.get("/public", response_model=list[SiteSettingRead])
 def get_public_settings(db: Session = Depends(get_db)):
     """
-    Public — frontend fetches this on load to get:
-    - active_theme
-    - announcement
-    - store_open
+    Public — what the website needs before anyone has signed in: the theme and
+    the announcement banner. See PUBLIC_KEYS for the whole list, and for why
+    it is a list rather than everything in the table.
     """
-    return db.query(SiteSettings).all()
+    return (
+        db.query(SiteSettings)
+        .filter(SiteSettings.key.in_(PUBLIC_KEYS))
+        .all()
+    )
 
 
 @router.get("/public/{key}", response_model=SiteSettingRead)
 def get_setting(key: str, db: Session = Depends(get_db)):
-    """Get a single setting by key."""
-    setting = db.query(SiteSettings).filter(SiteSettings.key == key).first()
+    """
+    One public setting by key.
+
+    A key that is not public answers exactly as a key that does not exist
+    does, so this cannot be used to find out which settings are configured.
+    """
+    setting = (
+        db.query(SiteSettings).filter(SiteSettings.key == key).first()
+        if key in PUBLIC_KEYS else None
+    )
     if not setting:
         raise HTTPException(status_code=404, detail=f"Setting '{key}' not found")
     return setting

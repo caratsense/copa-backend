@@ -53,10 +53,22 @@ def _get_redis():
     except Exception:
         return None
 
-def _get_state(phone): 
+# Bumped whenever the shape of a conversation changes. The key carries it, so
+# a deploy leaves old conversations unreachable rather than resuming them
+# against code that no longer understands them. The October category-first
+# flow shipped without this, and anyone mid-order kept being served the old
+# sixty-two-item list out of Redis for the next hour.
+_STATE_VERSION = "v2"
+
+
+def _state_key(phone: str) -> str:
+    return f"wa:{_STATE_VERSION}:{phone}"
+
+
+def _get_state(phone):
     r = _get_redis()
     if r:
-        raw = r.get(f"wa:{phone}")
+        raw = r.get(_state_key(phone))
         return json.loads(raw) if raw else {"step": "IDLE"}
     return _memory.get(phone, {"step": "IDLE"})
 
@@ -65,12 +77,12 @@ def _set_state(phone, state):
     # is still going from one abandoned twenty minutes ago. See _is_stale.
     state = {**state, "touched_at": time.time()}
     r = _get_redis()
-    if r: r.setex(f"wa:{phone}", 3600, json.dumps(state))
+    if r: r.setex(_state_key(phone), 3600, json.dumps(state))
     else: _memory[phone] = state
 
 def _clear_state(phone):
     r = _get_redis()
-    if r: r.delete(f"wa:{phone}")
+    if r: r.delete(_state_key(phone))
     else: _memory.pop(phone, None)
 
 
@@ -224,6 +236,13 @@ def _catalogue(db) -> list[dict]:
         if p.is_pricing_row or p.is_placeholder:
             continue
         section = p.section
+        # A category hidden on the website is hidden here too. When Chocolate
+        # Celebration Cakes was switched off in the admin, the site stopped
+        # showing its six cakes and the bot carried on selling them — the two
+        # disagreed about what was on the menu, which is exactly what "the bot
+        # is not synchronised with the site" means.
+        if section is not None and not section.is_active:
+            continue
         out.append({
             "id": p.id, "name": p.name, "base_price": p.base_price,
             "pricing_unit": p.pricing_unit,
@@ -611,7 +630,15 @@ def _reply_to_customer(phone: str, message: str, user: Optional[User]) -> str:
 
         # ─── SELECT PRODUCT ──────────────────
         if step == "SELECT_PRODUCT":
-            prods = state.get("products", products)
+            # Rebuilt from the catalogue as it is right now, not from the copy
+            # saved into the conversation when the list was printed. A cake
+            # taken off sale, repriced or moved mid-conversation would
+            # otherwise still be orderable at its old price for the hour the
+            # state lives. The saved copy is the fallback for a category that
+            # no longer exists.
+            category = state.get("category")
+            live = dict(_by_section(products)).get(category) if category else None
+            prods = live if live else state.get("products", products)
             typed = message.strip()
 
             # Back to the categories. The list the customer is looking at is

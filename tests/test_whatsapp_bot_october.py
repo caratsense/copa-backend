@@ -272,6 +272,64 @@ def test_a_pricing_row_is_not_offered_for_sale(db):
     assert "Tiramisu Cake" in names
 
 
+def test_a_hidden_category_is_not_sold_by_the_bot(db):
+    """
+    The website hides a category by deactivating its section. The bot read
+    products directly and kept selling them, so the two disagreed about what
+    was on the menu.
+    """
+    from app.models.menu_section import MenuSection
+
+    _catalogue(db)
+    cakes = db.query(MenuSection).filter(
+        MenuSection.name == "Chocolate Celebration Cakes").first()
+    assert "Tiramisu Cake" in [p["name"] for p in flow._catalogue(db)]
+
+    cakes.is_active = False
+    db.commit()
+
+    names = [p["name"] for p in flow._catalogue(db)]
+    assert "Tiramisu Cake" not in names
+    assert "Pav" in names, "an unrelated category went with it"
+
+
+def test_a_conversation_cannot_outlive_the_menu_it_started_with(db):
+    """
+    The product list used to be cached inside the conversation, which lives
+    an hour. A cake repriced mid-conversation was still orderable at the old
+    price; a deploy that changed the menu kept serving the old one.
+    """
+    rows = _catalogue(db)
+    tiramisu = next(r for r in rows if r.name == "Tiramisu Cake")
+    flow._set_state(PHONE, {
+        "step": "SELECT_PRODUCT",
+        "category": "Chocolate Celebration Cakes",
+        "products": [{"id": tiramisu.id, "name": "Tiramisu Cake", "base_price": 1.0,
+                      "pricing_unit": "kg", "options": []}],
+    })
+
+    tiramisu.base_price = 2500.0
+    db.commit()
+
+    with patch.object(flow, "parse_message", return_value={"action": "UNKNOWN"}):
+        reply = flow._reply_to_customer(PHONE, "Tiramisu Cake", None)
+
+    # The live price, not the Rs 1 frozen into the conversation.
+    assert "2,500" in reply
+
+    # And "1" reaches the live category, which holds both cakes, rather than
+    # the single-item list the conversation was carrying.
+    flow._set_state(PHONE, {
+        "step": "SELECT_PRODUCT",
+        "category": "Chocolate Celebration Cakes",
+        "products": [{"id": tiramisu.id, "name": "Tiramisu Cake", "base_price": 1.0,
+                      "pricing_unit": "kg", "options": []}],
+    })
+    with patch.object(flow, "parse_message", return_value={"action": "UNKNOWN"}):
+        by_number = flow._reply_to_customer(PHONE, "1", None)
+    assert "Belgian Chocolate Cake" in by_number
+
+
 def test_a_product_with_no_price_yet_is_not_offered_either(db):
     from app.models.product import PLACEHOLDER_PRICE_TAG
     _catalogue(db)

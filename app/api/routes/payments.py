@@ -128,7 +128,17 @@ def _release_for_production(db: Session, order_id: int) -> None:
     order is genuinely payable, and goes through the normal engine so the baker
     is notified exactly as they would be from the dashboard.
     """
+    from app.models.order import OrderStatus
     from app.services.assignment_engine import auto_assign_baker
+
+    # An order waits at RECEIVED until it is paid for. This is the moment it
+    # becomes a real order, so promote it before handing it over — the
+    # assignment engine only picks up CONFIRMED work, and the customer's
+    # order list should stop saying "awaiting payment" the instant it is not.
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if order is not None and order.status == OrderStatus.RECEIVED:
+        order.status = OrderStatus.CONFIRMED
+        db.commit()
 
     try:
         auto_assign_baker(db, order_id)
@@ -266,7 +276,7 @@ async def payu_callback(request: Request, db: Session = Depends(get_db)):
         # exists and is payable, so the useful thing is a Retry button next to
         # it. `payment=failed` used to land on /checkout with no explanation at
         # all, which is why a cancelled payment looked like nothing happened.
-        target = (f"{front}/orders?order_id={order_id}&payment=failed"
+        target = (f"{front}/orders/{order_id}?placed=1&payment=failed"
                   if order_id else f"{front}/orders?payment=failed")
         return RedirectResponse(url=target, status_code=303)
 
@@ -300,7 +310,7 @@ async def payu_callback(request: Request, db: Session = Depends(get_db)):
     # Already settled — treat a repeat as success without touching anything.
     if order.payment_status == PaymentStatus.PAID:
         logger.info("[PAYU] Duplicate callback for already-paid order %s ignored", order_id)
-        return RedirectResponse(url=f"{front}/orders?success={order_id}", status_code=303)
+        return RedirectResponse(url=f"{front}/orders/{order_id}?placed=1", status_code=303)
 
     # The txnid must be the one this service issued for this order. Kept strict:
     # it is a real barrier against anyone who holds the merchant salt but cannot
@@ -333,7 +343,7 @@ async def payu_callback(request: Request, db: Session = Depends(get_db)):
     # while assignment moves it to ASSIGNED and sends the baker their own copy.
     _confirm_to_customer_and_admin(db, order_id)
     _release_for_production(db, order_id)
-    return RedirectResponse(url=f"{front}/orders?success={order_id}", status_code=303)
+    return RedirectResponse(url=f"{front}/orders/{order_id}?placed=1", status_code=303)
 
 
 @router.get("/status/{order_id}")

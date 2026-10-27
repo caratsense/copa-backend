@@ -196,7 +196,12 @@ def test_whatsapp_order_does_not_enter_production_unpaid(db, catalogue, wa_secre
 
     order = db.query(Order).order_by(Order.id.desc()).first()
     assert order.payment_status == PaymentStatus.PENDING
-    assert order.status == OrderStatus.CONFIRMED
+    # RECEIVED, not CONFIRMED. Nothing about the order moved while it was
+    # unpaid — that was already true and is asserted below — but the status
+    # said CONFIRMED, which the customer's order list printed as a badge
+    # beside "Payment: Pending". "Confirmed" is a promise; it is made when
+    # the money arrives, in payments._release_for_production.
+    assert order.status == OrderStatus.RECEIVED
     assert order.assigned_baker_id is None, "unpaid WhatsApp order went to a baker"
 
 
