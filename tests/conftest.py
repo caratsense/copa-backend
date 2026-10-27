@@ -91,6 +91,11 @@ def fake_redis(monkeypatch):
         fakeredis.FakeStrictRedis(server=fakeredis.FakeServer(), decode_responses=True),
     )
     monkeypatch.setattr(wa_customer_flow, "_memory", {})
+    monkeypatch.setattr(wa_customer_flow, "_escalated_memory", {})
+    # And the signup's own no-Redis fallback, for the same reason: a half
+    # finished signup left in it would make the next test's first message
+    # arrive as the answer to a question nobody asked.
+    monkeypatch.setattr(webhook_routes, "_signup_memory", {})
 
     yield client
 

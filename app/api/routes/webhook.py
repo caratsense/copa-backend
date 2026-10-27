@@ -15,6 +15,12 @@ import hashlib
 import hmac
 import json
 import logging
+import random
+import re
+import string
+import time
+from typing import Optional
+
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
@@ -588,74 +594,213 @@ def _maps_url(address: str) -> str:
     return f"https://www.google.com/maps/search/?api=1&query={quote_plus(address)}"
 
 
-def _handle_new_user(db, phone, text):
-    from app.core.auth import hash_password
-    import json, random, string
+# How long a half-finished signup waits for the next reply, in seconds.
+_SIGNUP_TTL = 600
 
-    # Check if they are in the consent confirmation step. This is the same
-    # per-phone conversation store the customer flow uses, so share its
-    # accessor rather than opening a second unpatchable connection to db 2.
+# Where it lives when there is no Redis. The signup is two messages long, and
+# without somewhere to keep the first one the second was read as a fresh
+# start: "YES" became the customer's name.
+_signup_memory: dict = {}
+
+
+def _signup_get(phone: str) -> Optional[dict]:
     from app.services.wa_customer_flow import _get_redis
     r = _get_redis()
+    if r:
+        raw = r.get(f"wa:pending_signup:{phone}")
+        return json.loads(raw) if raw else None
+    entry = _signup_memory.get(phone)
+    if entry and time.time() - entry.get("_at", 0) > _SIGNUP_TTL:
+        _signup_memory.pop(phone, None)
+        return None
+    return entry
 
-    pending_key = f"wa:pending_signup:{phone}"
-    pending_raw = r.get(pending_key) if r else None
-    pending = json.loads(pending_raw) if pending_raw else None
 
-    # Step 2: They replied YES to consent → create account
-    if pending and text.strip().upper() in ("YES", "Y", "AGREE", "OK", "HAAN", "HA"):
-        from datetime import datetime, timezone as _tz
+def _signup_set(phone: str, data: dict) -> None:
+    from app.services.wa_customer_flow import _get_redis
+    r = _get_redis()
+    if r:
+        r.setex(f"wa:pending_signup:{phone}", _SIGNUP_TTL, json.dumps(data))
+    else:
+        _signup_memory[phone] = {**data, "_at": time.time()}
 
-        name = pending.get("name", "Customer")
-        phone_with_plus = f"+{phone}" if not phone.startswith("+") else phone
-        pwd = "".join(random.choices(string.ascii_letters + string.digits, k=12))
-        # This YES *is* the WhatsApp opt-in — record it so we can demonstrate
-        # consent later, and so dispatch_notifications is allowed to message them.
-        new_user = User(
-            name=name,
-            phone=phone_with_plus,
-            password_hash=hash_password(pwd),
-            role=UserRole.CUSTOMER,
-            is_active=True,
-            whatsapp_opt_in=True,
-            whatsapp_opt_in_at=datetime.now(_tz.utc),
-            whatsapp_opt_in_source="whatsapp_reply",
-        )
-        db.add(new_user)
-        db.commit()
-        if r:
-            r.delete(pending_key)
-        return (
-            f"Welcome, {name}! Your account has been created.\n\n"
-            f"How can I assist you?\n"
-            f"1. Place an order\n"
-            f"2. Track an order\n"
-            f"3. View our menu\n\n"
-            f"{SITE}"
-        )
 
-    # Step 2 alt: They replied NO → clear and exit
-    if pending and text.strip().upper() in ("NO", "N", "NAHI", "NAH"):
-        if r:
-            r.delete(pending_key)
-        return "No problem! You can visit us online anytime at " + SITE
+def _signup_clear(phone: str) -> None:
+    from app.services.wa_customer_flow import _get_redis
+    r = _get_redis()
+    if r:
+        r.delete(f"wa:pending_signup:{phone}")
+    else:
+        _signup_memory.pop(phone, None)
 
-    # Step 1: They sent their name → ask for consent before creating account
-    if len(text) > 1 and not text.isdigit() and len(text) < 50:
-        name = text.strip().title()
-        if r:
-            r.setex(pending_key, 600, json.dumps({"name": name}))
-        return (
-            f"Hi {name}! Welcome to Cake O' Clock.\n\n"
-            f"To place orders and track deliveries, we'll create a free account for you using your WhatsApp number.\n\n"
-            f"By replying *YES* you agree to:\n"
-            f"• Receive order updates on WhatsApp\n"
-            f"• Your name and phone number being stored securely\n\n"
-            f"Reply *YES* to continue or *NO* to cancel."
-        )
 
+# Things a name is not. Every link on the website opens WhatsApp with a
+# sentence already typed - "Hi Cake O' Clock, I'd like to ask about Wedding." -
+# so the first message from a new number is usually an enquiry, not a name.
+_NOT_A_NAME = re.compile(
+    r"[?!@#%*/\\<>]|\d"
+    r"|\b(hi|hello|hey|hola|namaste|good|morning|evening|order|cake|cakes|price"
+    r"|prices|pricing|menu|delivery|deliver|want|need|please|kg|wedding|grazing"
+    r"|table|about|info|information|enquiry|inquiry|query|help|yes|no|ok|okay"
+    r"|thanks|thank|available|book|booking|birthday|anniversary)\b",
+    re.I,
+)
+
+# What a name may be made of: letters (including accented ones), spaces, and
+# the apostrophes, dots and hyphens that real names carry.
+_NAME_SHAPE = re.compile(r"[A-Za-z\u00C0-\u024F][A-Za-z\u00C0-\u024F'\u2019.\- ]*$")
+
+
+def _looks_like_a_name(text: str) -> bool:
+    """
+    Whether this message is plausibly somebody's name.
+
+    Deliberately strict. Getting it wrong in one direction costs one extra
+    question; getting it wrong in the other writes a sentence into the name on
+    the account, onto every order, and into the greeting the shop sends back -
+    which is exactly what happened to the first customer who used the link on
+    the website.
+    """
+    t = (text or "").strip().strip(".")
+    if not (2 <= len(t) <= 40):
+        return False
+    if len(t.split()) > 4:
+        return False
+    if _NOT_A_NAME.search(t):
+        return False
+    return bool(_NAME_SHAPE.fullmatch(t))
+
+
+def _consent_prompt(name: str) -> str:
     return (
-        f"Welcome to Cake O' Clock.\n\n"
-        f"We offer premium handcrafted cakes, delivered across Lucknow.\n\n"
-        f"To get started, please share your name."
+        f"Thanks, {name}.\n\n"
+        f"To place orders and track deliveries, we'll create a free account "
+        f"for you using your WhatsApp number.\n\n"
+        f"By replying *YES* you agree to:\n"
+        f"\u2022 Receive order updates on WhatsApp\n"
+        f"\u2022 Your name and phone number being stored securely\n\n"
+        f"Reply *YES* to continue or *NO* to cancel."
     )
+
+
+def _handle_new_user(db, phone, text):
+    """
+    The two-message signup for a number we have never seen.
+
+    It used to be one message: whatever arrived first, if it was between 2 and
+    49 characters, became the customer's name. Every WhatsApp link on the
+    website opens with a sentence already in the box, so the first real
+    customer through it was registered as
+
+        "Hi Cake O'Clock - I'D Like To Ask About Wedding."
+
+    and greeted by that name for the rest of the conversation. Now the bot
+    says hello, asks for the name, and only then reads one. What they came to
+    ask is kept and answered once they are through the door, rather than being
+    spent on the greeting.
+    """
+    from app.core.auth import hash_password
+    from app.services.wa_customer_flow import (
+        _escalation_already_sent, _mark_escalation_sent, handle_customer_message,
+    )
+    from app.services import wa_escalation
+
+    def escalated(reply: str, about: str) -> str:
+        """Add the owner's contact when what they asked about earns it."""
+        return wa_escalation.augment(
+            phone, about or "", reply, db,
+            _escalation_already_sent, _mark_escalation_sent,
+        )
+
+    pending = _signup_get(phone)
+
+    # ── First contact: say hello and ask, rather than assume ──
+    if not pending:
+        _signup_set(phone, {"step": "NAME", "asked": (text or "")[:300], "tries": 0})
+        return escalated(
+            "Welcome to Cake O' Clock.\n\n"
+            "We bake cakes, breads and desserts in Lucknow, and put together "
+            "grazing tables for events.\n\n"
+            "Before we go on \u2014 what should we call you? Your name is enough.",
+            text,
+        )
+
+    step = pending.get("step", "NAME")
+
+    # ── Step 2: consent ──
+    if step == "CONSENT":
+        answer = (text or "").strip().upper()
+        if answer in ("YES", "Y", "AGREE", "OK", "HAAN", "HA"):
+            from datetime import datetime, timezone as _tz
+
+            name = pending.get("name") or "Customer"
+            phone_with_plus = f"+{phone}" if not phone.startswith("+") else phone
+            pwd = "".join(random.choices(string.ascii_letters + string.digits, k=12))
+            # This YES *is* the WhatsApp opt-in - record it so we can
+            # demonstrate consent later, and so dispatch_notifications is
+            # allowed to message them.
+            new_user = User(
+                name=name,
+                phone=phone_with_plus,
+                password_hash=hash_password(pwd),
+                role=UserRole.CUSTOMER,
+                is_active=True,
+                whatsapp_opt_in=True,
+                whatsapp_opt_in_at=datetime.now(_tz.utc),
+                whatsapp_opt_in_source="whatsapp_reply",
+            )
+            db.add(new_user)
+            db.commit()
+            _signup_clear(phone)
+
+            reply = (
+                f"Welcome, {name}! Your account has been created.\n\n"
+                f"How can I assist you?\n"
+                f"1. Place an order\n"
+                f"2. Track an order\n"
+                f"3. View our menu\n\n"
+                f"{SITE}"
+            )
+
+            # Answer what they came for. They asked it two messages ago and
+            # have been doing paperwork ever since; making them type it again
+            # is the kind of thing that loses the enquiry.
+            asked = (pending.get("asked") or "").strip()
+            if asked and not _looks_like_a_name(asked):
+                try:
+                    answer_to_first = handle_customer_message(phone, asked, new_user)
+                    if answer_to_first:
+                        reply += f"\n\n\u2014\n\n{answer_to_first}"
+                except Exception as exc:  # never fail a signup over this
+                    logger.error("[WA] could not answer the opening message: %s", exc)
+            return reply
+
+        if answer in ("NO", "N", "NAHI", "NAH"):
+            _signup_clear(phone)
+            return "No problem! You can visit us online anytime at " + SITE
+
+        return _consent_prompt(pending.get("name") or "there")
+
+    # ── Step 1: the name ──
+    tries = int(pending.get("tries", 0))
+    typed = (text or "").strip()
+
+    if typed.lower() in ("skip", "later"):
+        name = "WhatsApp Customer"
+    elif _looks_like_a_name(typed):
+        name = typed.strip(".").title()
+    elif tries >= 1:
+        # Two goes is enough. Being stuck on "what is your name" is worse than
+        # an account the shop renames later, and the question they actually
+        # came with is still waiting behind this.
+        name = "WhatsApp Customer"
+    else:
+        _signup_set(phone, {**pending, "tries": tries + 1})
+        return escalated(
+            "Sorry \u2014 just your name, so we know who we are talking to "
+            "(for example *Priya*). Reply *skip* if you would rather not.",
+            typed,
+        )
+
+    _signup_set(phone, {"step": "CONSENT", "name": name, "asked": pending.get("asked")})
+    return _consent_prompt(name)

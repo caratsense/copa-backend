@@ -197,6 +197,134 @@ def _quote(db, product: dict, size: Optional[dict], flavor: dict, quantity: int 
     )
 
 
+def _catalogue(db) -> list[dict]:
+    """
+    Everything a customer can actually order, in menu order.
+
+    Two kinds of row are deliberately left out, because neither is a thing
+    anyone can buy:
+
+      pricing rows  — "Vanilla Base Cake", "Chocolate Premium Cake" and the
+                      other two. They are the per-kg rates the Build a Cake
+                      page quotes from, hidden from the website since October,
+                      and the bot was still offering all four at the top of
+                      its order list. A customer who picked one was buying a
+                      price band.
+      placeholders  — a product the kitchen has added but not priced. The ₹1
+                      it sits at is an internal stand-in, and quoting it is
+                      worse than not offering it.
+
+    The section each product belongs to comes with it, because the order flow
+    asks which part of the menu first; a flat list of fifty-eight cakes is not
+    a question anyone can answer on a phone.
+    """
+    rows = db.query(Product).filter(Product.is_available == True).all()
+    out = []
+    for p in rows:
+        if p.is_pricing_row or p.is_placeholder:
+            continue
+        section = p.section
+        out.append({
+            "id": p.id, "name": p.name, "base_price": p.base_price,
+            "pricing_unit": p.pricing_unit,
+            "options": [{"label": o.label, "price": o.price}
+                        for o in p.options if o.is_active],
+            "section": section.name if section else "More",
+            "section_sort": section.sort_order if section else 999,
+        })
+    out.sort(key=lambda p: (p["section_sort"], p["section"], p["name"]))
+    return out
+
+
+def _by_section(products: list[dict]) -> list[tuple[str, list[dict]]]:
+    """The catalogue grouped into the categories the menu already uses."""
+    grouped: dict[str, list[dict]] = {}
+    for p in products:
+        grouped.setdefault(p["section"], []).append(p)
+    return list(grouped.items())
+
+
+def _category_prompt(products: list[dict]) -> tuple[str, list[str]]:
+    """
+    The question that starts an order, and the categories it offers.
+
+    WhatsApp got the whole catalogue as one numbered list — sixty-two lines,
+    which is four screens of scrolling before the first question. The menu is
+    category-first on the website for the same reason it should be here: a
+    dozen choices is a question, sixty is a document.
+    """
+    groups = _by_section(products)
+    lines = ["*What are you looking for?*\n"]
+    for i, (name, items) in enumerate(groups, 1):
+        lines.append(f"{i}. {name} ({len(items)})")
+    lines.append("\nReply with a number — or just type the cake you want.")
+    return "\n".join(lines), [name for name, _ in groups]
+
+
+def _product_prompt(phone: str, state: dict, category: str,
+                    items: list[dict]) -> str:
+    """List one category's products and wait for a choice."""
+    lines = [f"*{category}*\n"]
+    for i, p in enumerate(items, 1):
+        lines.append(f"{i}. {p['name']} — {_price_label(p)}")
+    lines.append("\nReply with the number or the name. *0* goes back.")
+    _set_state(phone, {**state, "step": "SELECT_PRODUCT",
+                       "products": items, "category": category})
+    return "\n".join(lines)
+
+
+def _match_product(products: list[dict], text: str) -> Optional[dict]:
+    """
+    The product this text names, or None.
+
+    Exact name first, then a whole-name containment, so "biscoff cookie" does
+    not land on "Biscoff Cheesecake" just because it was earlier in the list.
+    """
+    wanted = (text or "").strip().lower()
+    if len(wanted) < 3:
+        return None
+    for p in products:
+        if p["name"].lower() == wanted:
+            return p
+    for p in products:
+        if wanted in p["name"].lower():
+            return p
+    return None
+
+
+def _choose_product(db, phone: str, state: dict, selected: dict) -> str:
+    """
+    Take a chosen product and ask the next question about it.
+
+    Reached from the product list and from someone naming a cake at the
+    category step, which is why it is a function rather than the tail of one
+    branch: the two routes have to put the conversation in the same place.
+    """
+    # This product sells in its own sizes. Offer those and nothing else - the
+    # global list is not consulted for it, which is how a cake that is not
+    # sold under 1kg stops offering 500g.
+    if _options(selected):
+        return _ask_for_size(phone, state, selected)
+
+    # A fixed-price product with no options has no size to ask about -
+    # base_price is its price - so it goes straight to the flavour step.
+    # Asking a customer whether they want 500g or 5kg of a pack of six buns is
+    # a question with no answer.
+    if not _is_per_kg(selected):
+        return _ask_for_flavor(
+            db, phone, {**state, "product": selected, "size": None},
+            header=f"*{selected['name']}* — {_price_label(selected)}",
+        )
+
+    sizes = [{"id": s.id, "name": s.name, "multiplier": s.multiplier}
+             for s in db.query(SizeRule).filter(SizeRule.is_active == True).all()]
+    lines = [f"*{selected['name']}* — {_price_label(selected)}\n\n*Select size:*\n"]
+    for i, s in enumerate(sizes, 1):
+        lines.append(f"{i}. {s['name']}")
+    _set_state(phone, {**state, "step": "SELECT_SIZE", "product": selected, "sizes": sizes})
+    return "\n".join(lines)
+
+
 # How long a half-finished order stays resumable. Long enough to find your
 # address or ask someone what to write on the cake; short enough that a
 # question hours later is not read as the next answer in it.
@@ -216,6 +344,7 @@ def _is_stale(state: dict) -> bool:
 # What the bot is waiting for at each step, for when something interrupts and
 # the customer needs putting back where they were.
 _STEP_QUESTION = {
+    "SELECT_CATEGORY": "which part of the menu you are after",
     "SELECT_PRODUCT": "which cake you would like",
     "SELECT_SIZE": "the size",
     "SELECT_FLAVOR": "the flavour",
@@ -257,6 +386,10 @@ def _answer_without_losing_the_order(db, phone: str, state: dict, step: str,
     if waiting_for:
         head += (f"\n\nYour order is still here — I was waiting for "
                  f"{waiting_for}. Reply *cancel* to start again.")
+    else:
+        # Nothing in progress, so there is nothing to put them back into.
+        # Somewhere to go beats a dead end while they wait for a call.
+        head += f"\n\nIn the meantime, everything we bake is at {SITE}/menu."
     return head
 
 
@@ -324,23 +457,38 @@ def _reply_to_customer(phone: str, message: str, user: Optional[User]) -> str:
     db = SessionLocal()
 
     try:
-        # Three things must be answered even mid-order, because the step they
-        # land on would otherwise swallow them as data: a cake over the size
-        # the shop can price, a complaint, and someone asking for a person.
-        # Checked in code, before the model and before any step, so it holds
-        # whatever the model makes of the sentence.
+        # Three things are answered before anything else, because whatever
+        # they land on would otherwise swallow them: a cake over the size the
+        # shop can price, a complaint, and someone asking for a person.
+        #
+        # This used to be skipped at IDLE, on the reasoning that there was no
+        # step to protect. There is something worse. "cake above 3.5kg" sent
+        # to an idle conversation was read by the model as "they want to
+        # order", and the bot answered a question it cannot answer with the
+        # whole catalogue and its prices - useless, and the opposite of
+        # passing it to a person. Checked in code, before the model, so it
+        # holds whatever the model makes of the sentence.
         interrupt = wa_escalation.reason_to_interrupt(message)
-        if interrupt and step != "IDLE":
+        if interrupt:
             return _answer_without_losing_the_order(db, phone, state, step, interrupt, user)
 
-        products = [{"id": p.id, "name": p.name, "base_price": p.base_price,
-                     "pricing_unit": p.pricing_unit,
-                     "options": [{"label": o.label, "price": o.price}
-                                 for o in p.options if o.is_active]}
-                    for p in db.query(Product).filter(Product.is_available == True).all()]
+        products = _catalogue(db)
         context = {"step": step, "products": products}
         action = parse_message(message, "customer", context)
         act = action.get("action", "UNKNOWN")
+
+        # ─── CANCEL ──────────────────────────
+        # Before the steps, not after them. Every step that cannot read what
+        # the customer typed answers "pick one of these" — including when what
+        # they typed was *cancel*, which is the word the bot itself tells them
+        # to use to get out. It sat at the bottom of this function where only a
+        # step that had already fallen through could reach it.
+        if act == "CANCEL_ORDER":
+            had_order = step != "IDLE"
+            _clear_state(phone)
+            return ("Order cancelled. You can start a new order anytime."
+                    if had_order else
+                    "Nothing to cancel — reply *1* whenever you would like to order.")
 
         # ─── WELCOME ─────────────────────────
         if act == "WELCOME" or (step == "IDLE" and act == "UNKNOWN"):
@@ -372,11 +520,14 @@ def _reply_to_customer(phone: str, message: str, user: Optional[User]) -> str:
 
         # ─── VIEW MENU ───────────────────────
         if act == "VIEW_MENU":
+            # The categories and how much is in each, not every product. The
+            # whole catalogue printed into a chat window is something nobody
+            # reads; the website renders it properly, and the link is here.
             lines = ["*Our Menu*\n"]
-            for p in products:
-                lines.append(f"· {p['name']} — {_price_label(p)}")
-            lines.append(f"\nFull menu with customization options: {SITE}/menu")
-            lines.append(f"\nWould you like to place an order?")
+            for name, items in _by_section(products):
+                lines.append(f"· {name} ({len(items)})")
+            lines.append(f"\nSee it all, with photographs: {SITE}/menu")
+            lines.append("\nReply *order* to start, or name a category to see what is in it.")
             return "\n".join(lines)
 
         # ─── CHECK STATUS ────────────────────
@@ -419,50 +570,76 @@ def _reply_to_customer(phone: str, message: str, user: Optional[User]) -> str:
 
         # ─── START ORDER ─────────────────────
         if act == "START_ORDER":
-            lines = ["*Select a cake:*\n"]
-            for i, p in enumerate(products, 1):
-                lines.append(f"{i}. {p['name']} — {_price_label(p)}")
-            lines.append(f"\nYou can type the number or the cake name.")
-            _set_state(phone, {"step": "SELECT_PRODUCT", "products": products})
-            return "\n".join(lines)
+            prompt, categories = _category_prompt(products)
+            _set_state(phone, {"step": "SELECT_CATEGORY", "categories": categories})
+            return prompt
+
+        # ─── SELECT CATEGORY ─────────────────
+        if step == "SELECT_CATEGORY":
+            categories = state.get("categories") or []
+            groups = dict(_by_section(products))
+            typed = message.strip()
+
+            # The number, read straight from the message. This step only picks
+            # which part of the menu to show, but reading "3" out of a language
+            # model when the digit is right there is a dependency with nothing
+            # to gain from it.
+            choice = int(typed) if typed.isdigit() else (
+                action.get("value") if act == "SELECT_OPTION" else None)
+            chosen = None
+            if isinstance(choice, int) and 1 <= choice <= len(categories):
+                chosen = categories[choice - 1]
+            if chosen is None:
+                for name in categories:
+                    if name.lower() == typed.lower():
+                        chosen = name
+                        break
+            if chosen is not None:
+                return _product_prompt(phone, state, chosen, groups.get(chosen, []))
+
+            # Somebody who already knows what they want types the cake, not
+            # the category it lives in. Both the model's reading and the raw
+            # text are tried, so "tiramisu cake" works whether or not the
+            # model classified it as a product name.
+            named = (action.get("name") if act == "SELECT_PRODUCT_BY_NAME" else None) or typed
+            direct = _match_product(products, named)
+            if direct is not None:
+                return _choose_product(db, phone, state, direct)
+
+            prompt, _ = _category_prompt(products)
+            return "Sorry, I did not catch that.\n\n" + prompt
 
         # ─── SELECT PRODUCT ──────────────────
         if step == "SELECT_PRODUCT":
             prods = state.get("products", products)
+            typed = message.strip()
+
+            # Back to the categories. The list the customer is looking at is
+            # one of a dozen, and without this the only way out of the wrong
+            # one is to cancel the order.
+            if typed == "0" or typed.lower() in ("back", "menu", "categories"):
+                prompt, categories = _category_prompt(products)
+                _set_state(phone, {"step": "SELECT_CATEGORY", "categories": categories})
+                return prompt
+
             selected = None
-            if act == "SELECT_OPTION":
+            # The digit first, for the same reason as the category step.
+            if typed.isdigit() and 1 <= int(typed) <= len(prods):
+                selected = prods[int(typed) - 1]
+            elif act == "SELECT_OPTION":
                 idx = action.get("value", 0) - 1
                 if 0 <= idx < len(prods): selected = prods[idx]
-            elif act == "SELECT_PRODUCT_BY_NAME":
-                name = action.get("name", "").lower()
-                for p in prods:
-                    if name in p["name"].lower(): selected = p; break
+            if selected is None:
+                name = action.get("name", "") if act == "SELECT_PRODUCT_BY_NAME" else typed
+                # Within this category first, then the whole catalogue: asking
+                # for a brownie while looking at the breads is a customer who
+                # knows what they want, not a mistake.
+                selected = _match_product(prods, name) or _match_product(products, name)
             if not selected:
-                return f"Please select a valid option (1 to {len(prods)}) or type the cake name."
+                return (f"Please pick one of 1 to {len(prods)}, or type the cake's name. "
+                        f"*0* goes back to the categories.")
 
-            # This product sells in its own sizes. Offer those and nothing
-            # else - the global list is not consulted for it, which is how a
-            # cake that is not sold under 1kg stops offering 500g.
-            if _options(selected):
-                return _ask_for_size(phone, state, selected)
-
-            # A fixed-price product with no options has no size to ask about -
-            # base_price is its price - so it goes straight to the flavour
-            # step. Asking a customer whether they want 500g or 5kg of a pack
-            # of six buns is a question with no answer.
-            if not _is_per_kg(selected):
-                return _ask_for_flavor(
-                    db, phone, {**state, "product": selected, "size": None},
-                    header=f"*{selected['name']}* — {_price_label(selected)}",
-                )
-
-            sizes = [{"id": s.id, "name": s.name, "multiplier": s.multiplier}
-                     for s in db.query(SizeRule).filter(SizeRule.is_active == True).all()]
-            lines = [f"*{selected['name']}* — {_price_label(selected)}\n\n*Select size:*\n"]
-            for i, s in enumerate(sizes, 1):
-                lines.append(f"{i}. {s['name']}")
-            _set_state(phone, {**state, "step": "SELECT_SIZE", "product": selected, "sizes": sizes})
-            return "\n".join(lines)
+            return _choose_product(db, phone, state, selected)
 
         # ─── SELECT SIZE ─────────────────────
         if step == "SELECT_SIZE":
@@ -697,11 +874,6 @@ def _reply_to_customer(phone: str, message: str, user: Optional[User]) -> str:
                 logger.error(f"[WA ORDER] Failed: {e}")
                 _clear_state(phone)
                 return f"We couldn't process your order at the moment. Please try again or order online at {SITE}"
-
-        # ─── CANCEL ──────────────────────────
-        if act == "CANCEL_ORDER":
-            _clear_state(phone)
-            return "Order cancelled. You can start a new order anytime."
 
         # ─── UNKNOWN ─────────────────────────
         reply = action.get("reply", "")

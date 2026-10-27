@@ -86,7 +86,8 @@ def _quick_match(message: str, role: str, context: dict) -> dict | None:
                 if num == 3: return {"action": "VIEW_MENU"}
             elif step == "AWAITING_STATUS_ID":
                 return {"action": "STATUS_ORDER_ID", "order_id": num}
-            elif step in ("SELECT_PRODUCT", "SELECT_SIZE", "SELECT_FLAVOR", "SELECT_DATE", "SELECT_TIME"):
+            elif step in ("SELECT_CATEGORY", "SELECT_PRODUCT", "SELECT_SIZE",
+                          "SELECT_FLAVOR", "SELECT_DATE", "SELECT_TIME"):
                 return {"action": "SELECT_OPTION", "value": num}
 
     # Customer greetings → always use welcome template

@@ -247,8 +247,16 @@ def brownie(db):
     return product
 
 
-def test_menu_shows_per_kg_only_for_per_kg_products(db, catalogue, brownie):
-    reply = handle_customer_message("919222222222", "menu", None)
+def test_the_product_list_shows_per_kg_only_for_per_kg_products(db, catalogue, brownie):
+    """
+    Read off the product list rather than off "menu": since October the menu
+    command answers with the categories and how much is in each, because the
+    whole catalogue in one message was four screens of scrolling. The prices
+    are printed where a customer chooses between them.
+    """
+    phone = "919222222222"
+    handle_customer_message(phone, "order", None)
+    reply = handle_customer_message(phone, "1", None)   # the only category
 
     assert "Premium Cake — ₹1,000/kg" in reply
     assert "Chocolate Walnut Brownie — ₹400" in reply
@@ -257,16 +265,17 @@ def test_menu_shows_per_kg_only_for_per_kg_products(db, catalogue, brownie):
 
 def _choose(phone: str, product) -> str:
     """
-    Start an order and pick `product` from the numbered list.
+    Start an order and pick `product`.
 
-    By number rather than by name: name matching is the language model's job
-    and it is stubbed out here, so the deterministic parser only understands
-    the option number.
+    The flow asks which part of the menu first, so the number that used to
+    reach a cake now reaches a category. Naming the cake is the other way
+    through that step, and it is matched in code — exact name first — rather
+    than by the language model, which is stubbed out here; so this stays as
+    deterministic as picking a number was.
     """
     handle_customer_message(phone, "order", None)
-    listed = wcf._get_state(phone)["products"]
-    index = next(i for i, p in enumerate(listed, 1) if p["id"] == product.id)
-    return handle_customer_message(phone, str(index), None)
+    assert wcf._get_state(phone)["step"] == "SELECT_CATEGORY"
+    return handle_customer_message(phone, product.name, None)
 
 
 def test_selecting_a_per_kg_cake_still_asks_for_a_size(db, catalogue, brownie):
