@@ -100,6 +100,26 @@ FESTIVE_FROM = "Seasonal"
 FESTIVE_TO = "Gifting Collection"
 
 
+_OLD_NAME = {new: old for old, new in RENAMES.items()}
+
+
+def _find(db, name: str) -> Product | None:
+    """
+    The product called `name`, whether or not the rename has happened yet.
+
+    Inspecting writes nothing, so a product due to be renamed is still under
+    its old name when the price lookup reaches it. Without this the dry run
+    reported "no product named 'Chocolate Brookie'" and refused — which is a
+    lie about what applying would do, and the dry run is the thing a person
+    reads before letting it touch the catalogue.
+    """
+    row = db.query(Product).filter(Product.name == name).first()
+    if row is not None:
+        return row
+    old = _OLD_NAME.get(name)
+    return db.query(Product).filter(Product.name == old).first() if old else None
+
+
 def _clear_placeholder(product: Product) -> None:
     """Drop the tag that marks a price as a stand-in."""
     tags = [t for t in (product.tags or []) if t != PLACEHOLDER_PRICE_TAG]
@@ -135,7 +155,7 @@ def main() -> int:
         # ─── 2. SIMPLE PRICES ───
         print("\nprices")
         for name, (price, unit) in SIMPLE_PRICES.items():
-            row = db.query(Product).filter(Product.name == name).first()
+            row = _find(db, name)
             if row is None:
                 problems.append(f"no product named {name!r}")
                 continue
@@ -156,7 +176,7 @@ def main() -> int:
         # ─── 3. THE ONES SOLD IN WEIGHTS ───
         print("\nsizes")
         for name, options in OPTION_PRICES.items():
-            row = db.query(Product).filter(Product.name == name).first()
+            row = _find(db, name)
             if row is None:
                 problems.append(f"no product named {name!r}")
                 continue
@@ -196,7 +216,7 @@ def main() -> int:
             problems.append(f"no {FESTIVE_TO!r} category to move the festive boxes into")
         else:
             for name in FESTIVE:
-                row = db.query(Product).filter(Product.name == name).first()
+                row = _find(db, name)
                 if row is None:
                     problems.append(f"no product named {name!r} to move")
                     continue
@@ -243,7 +263,7 @@ def main() -> int:
         # A product with options must have at least one, or it cannot be
         # ordered in any size at all.
         for name in OPTION_PRICES:
-            row = db.query(Product).filter(Product.name == name).first()
+            row = _find(db, name)
             active = [o for o in row.options if o.is_active] if row else []
             if not active:
                 print(f"  VERIFICATION FAILED: {name} has no sizes to order")
