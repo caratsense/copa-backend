@@ -153,45 +153,62 @@ def test_a_message_longer_than_a_cake_is_refused(db):
 # ─── NOTHING IS DELIVERED THE DAY IT IS ORDERED ───────
 
 
-def test_a_same_day_delivery_is_refused(db, cake):
-    """
-    Choosing a time that has already passed used to be accepted and quietly
-    moved to the next available slot, so an order placed at 6 PM for "today,
-    2 PM" was confirmed for a time the customer never picked — after the
-    checkout page had shown them 2 PM.
-    """
-    from fastapi import HTTPException
-
-    user = make_user(db, "Priya", UserRole.CUSTOMER, phone="+919222222227")
-    today_at_two = datetime.now().replace(hour=14, minute=0, second=0, microsecond=0)
-
-    with pytest.raises(HTTPException) as caught:
-        create_order(db, OrderCreate(
-            user_id=user.id,
-            items=[OrderItemCreate(
-                product_id=cake.id, quantity=1,
-                customization=ItemCustomization(size="1kg", flavor="Belgian Chocolate"),
-            )],
-            delivery_address="Flat 1, Gomti Nagar, Lucknow",
-            delivery_time=today_at_two,
-        ))
-    assert caught.value.status_code == 422
-    assert "tomorrow" in str(caught.value.detail).lower()
-
-
-def test_tomorrow_is_accepted(db, cake):
-    user = make_user(db, "Priya", UserRole.CUSTOMER, phone="+919222222228")
-    tomorrow = (datetime.now() + timedelta(days=1)).replace(hour=14, minute=0, second=0, microsecond=0)
-
-    order = create_order(db, OrderCreate(
+def _order_for(db, user, cake, when):
+    return create_order(db, OrderCreate(
         user_id=user.id,
         items=[OrderItemCreate(
             product_id=cake.id, quantity=1,
             customization=ItemCustomization(size="1kg", flavor="Belgian Chocolate"),
         )],
         delivery_address="Flat 1, Gomti Nagar, Lucknow",
-        delivery_time=tomorrow,
+        delivery_time=when,
     ))
+
+
+def test_a_delivery_time_in_the_past_is_refused(db, cake):
+    """
+    It used to be accepted and quietly moved to the next available slot, so an
+    order placed at 6 PM for "today, 2 PM" was confirmed for a time the
+    customer never picked — after checkout had shown them 2 PM.
+    """
+    from fastapi import HTTPException
+
+    user = make_user(db, "Priya", UserRole.CUSTOMER, phone="+919222222227")
+
+    with pytest.raises(HTTPException) as caught:
+        _order_for(db, user, cake, datetime.now() - timedelta(hours=3))
+    assert caught.value.status_code == 422
+
+
+def test_a_delivery_time_too_soon_is_refused(db, cake):
+    """An hour from now is not enough to bake and decorate a cake."""
+    from fastapi import HTTPException
+
+    user = make_user(db, "Priya", UserRole.CUSTOMER, phone="+919222222230")
+
+    with pytest.raises(HTTPException) as caught:
+        _order_for(db, user, cake, datetime.now() + timedelta(hours=1))
+    assert caught.value.status_code == 422
+    assert "hours" in str(caught.value.detail).lower()
+
+
+def test_same_day_with_enough_notice_is_accepted(db, cake):
+    """
+    A cake off the menu can go out the same day. Refusing these was my own
+    misreading of the rule and it turned away orders the shop can fulfil:
+    ordered at 2 PM, Shriya delivers from 7 PM.
+    """
+    user = make_user(db, "Priya", UserRole.CUSTOMER, phone="+919222222228")
+
+    order = _order_for(db, user, cake, datetime.now() + timedelta(hours=6))
+    assert order.id is not None
+
+
+def test_tomorrow_is_accepted(db, cake):
+    user = make_user(db, "Priya", UserRole.CUSTOMER, phone="+919222222231")
+    tomorrow = (datetime.now() + timedelta(days=1)).replace(hour=14, minute=0, second=0, microsecond=0)
+
+    order = _order_for(db, user, cake, tomorrow)
     assert order.id is not None
 
 

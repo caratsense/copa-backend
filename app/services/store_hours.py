@@ -165,39 +165,38 @@ def get_next_available_time(db: Session) -> datetime:
         return tomorrow.replace(hour=open_time.hour, minute=open_time.minute, second=0, microsecond=0)
 
 
-# Nothing is delivered on the day it is ordered. Every cake is baked and
-# decorated to order, so the earliest a customer may ask for is tomorrow.
+# The least notice the kitchen will take for anything at all.
 #
-# Before this, a requested time in the past was not refused — it was silently
-# moved to the next available slot. Choosing "today, 2 PM" at 6 PM produced an
-# order confirmed for a time the customer never picked, and the checkout page
-# had already shown them 2 PM.
-MIN_LEAD_DAYS = 1
+# A cake off the menu can go out the same day — Shriya's example: ordered at
+# 2 PM, deliverable from 7 PM. A custom cake needs longer, and the checkout
+# page enforces that separately, because only the client knows which lines are
+# custom. This is the floor that applies to every order however it arrives,
+# and its job is to refuse a delivery time in the past or minutes away.
+#
+# It refuses rather than adjusts. schedule_order_delivery used to silently
+# move a past time to the next available slot, so "today, 2 PM" chosen at 6 PM
+# became an order confirmed for a time the customer never picked — after the
+# checkout page had shown them 2 PM.
+MIN_LEAD_HOURS = 5
 
 
-def earliest_delivery_date(now: datetime | None = None):
-    """The first date a customer may choose, in IST."""
+def earliest_delivery_time(now: datetime | None = None) -> datetime:
+    """The soonest a customer may ask for, in IST."""
     base = (now or datetime.now(IST)).astimezone(IST)
-    return (base + timedelta(days=MIN_LEAD_DAYS)).date()
+    return base + timedelta(hours=MIN_LEAD_HOURS)
 
 
 def check_delivery_lead_time(requested: datetime | None) -> None:
-    """
-    Refuse a delivery date the kitchen cannot meet.
-
-    Raises rather than adjusting: moving someone's delivery date without
-    telling them is worse than refusing it, because they find out when the
-    cake does not arrive.
-    """
+    """Refuse a delivery time the kitchen cannot meet."""
     if requested is None:
         return
     moment = requested if requested.tzinfo else requested.replace(tzinfo=IST)
-    if moment.astimezone(IST).date() < earliest_delivery_date():
+    if moment.astimezone(IST) < earliest_delivery_time():
         raise HTTPException(
             status_code=422,
             detail=(
-                "We bake every cake to order, so the earliest we can deliver "
-                "is tomorrow. Please choose another date."
+                f"We need about {MIN_LEAD_HOURS} hours to bake and decorate. "
+                "Please choose a later delivery time."
             ),
         )
 
