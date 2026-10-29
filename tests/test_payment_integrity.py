@@ -54,7 +54,7 @@ def payu_hash(status, email, firstname, productinfo, amount, txnid,
     ]).encode()).hexdigest()
 
 
-def callback(client, order, txnid, amount, status="success", **over):
+def callback(client, order, txnid, amount, status="success", accept: str = "text/html", **over):
     payload = {
         "status": status, "txnid": txnid, "amount": amount,
         "email": "a@b.c", "firstname": "A", "productinfo": "p",
@@ -62,7 +62,14 @@ def callback(client, order, txnid, amount, status="success", **over):
     payload.update(over)
     payload.setdefault("hash", payu_hash(status, payload["email"], payload["firstname"],
                                          payload["productinfo"], amount, txnid))
-    return client.post("/payments/payu-callback", data=payload, follow_redirects=False)
+    # Accept: text/html is what makes this the browser's return from PayU
+    # rather than PayU's server-to-server webhook. The endpoint serves both,
+    # and answers each in the shape it expects — a redirect for the customer,
+    # a 200 for the webhook. Callers that want the webhook path pass
+    # accept=None.
+    headers = {"Accept": accept} if accept else {}
+    return client.post("/payments/payu-callback", data=payload,
+                       headers=headers, follow_redirects=False)
 
 
 def online_order(db, customer, total=5000.0, **kw):
@@ -396,3 +403,64 @@ def test_a_foreign_txnid_still_cannot_settle_this_order(client, db, customer, pa
 
     db.refresh(order)
     assert order.payment_status == PaymentStatus.PENDING
+
+
+# ─── PAYU'S WEBHOOK, NOT THE CUSTOMER'S BROWSER ───────
+#
+# Two callers reach /payments/payu-callback. The surl/furl is the customer's
+# own browser and must be sent somewhere to look at. The webhook is a server
+# calling a server: it wants a 2xx and retries anything else, so answering it
+# with a 303 would make a perfectly settled payment look like a failing
+# endpoint and eventually get the webhook switched off at PayU's end.
+#
+# The webhook matters on its own: it is what settles an order when the
+# customer pays and then closes the tab before the browser redirect runs.
+
+
+def test_the_webhook_settles_the_order_and_gets_a_200(client, db, customer, payu, catalogue):
+    order = online_order(db, customer, total=1.0)
+    order.payment_id = f"CO{order.id}-hook"
+    db.commit()
+
+    res = callback(client, order, order.payment_id, "1.00", accept=None)
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["settled"] is True
+    assert body["order_id"] == order.id
+    db.refresh(order)
+    assert order.payment_status == PaymentStatus.PAID
+
+
+def test_a_rejected_webhook_still_gets_a_200(client, db, customer, payu, catalogue):
+    """
+    Our verdict on the payment is not a transport failure. Retrying a bad
+    hash will not make it good, and a non-2xx would have PayU retry it until
+    it gave up on the endpoint.
+    """
+    order = online_order(db, customer, total=5000.0)
+    order.payment_id = f"CO{order.id}-hook"
+    db.commit()
+
+    res = callback(client, order, order.payment_id, "5000.00", accept=None, hash="rubbish")
+
+    assert res.status_code == 200
+    assert res.json()["settled"] is False
+    db.refresh(order)
+    assert order.payment_status == PaymentStatus.PENDING
+
+
+def test_browser_then_webhook_for_the_same_payment_is_safe(client, db, customer, payu, catalogue):
+    """PayU sends both. The second must not double-settle or error."""
+    order = online_order(db, customer, total=1.0)
+    order.payment_id = f"CO{order.id}-hook"
+    db.commit()
+
+    first = callback(client, order, order.payment_id, "1.00")                 # the browser
+    second = callback(client, order, order.payment_id, "1.00", accept=None)   # the webhook
+
+    assert first.status_code == 303
+    assert second.status_code == 200
+    assert second.json()["settled"] is True
+    db.refresh(order)
+    assert order.payment_status == PaymentStatus.PAID

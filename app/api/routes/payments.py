@@ -24,7 +24,7 @@ import logging
 import secrets
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -265,10 +265,40 @@ async def payu_callback(request: Request, db: Session = Depends(get_db)):
     """
     form = await request.form()
     d = {k: str(v) for k, v in form.items()}
+    # A webhook may send JSON where the browser redirect sends a form. Falling
+    # back keeps one endpoint correct for both.
+    if not d:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                d = {k: str(v) for k, v in body.items()}
+        except Exception:
+            d = {}
     status = d.get("status", "")
     txnid = d.get("txnid", "")
     order_id = _order_id_from_txnid(txnid)
     front = _frontend_base()
+
+    # Two kinds of caller reach this one URL, and they want different answers.
+    #
+    # PayU's surl/furl is a browser navigation: the customer's own browser
+    # POSTs here and must be sent somewhere to look at. PayU's webhook is a
+    # server calling a server; it wants a 2xx and will keep retrying anything
+    # else, so answering a webhook with a 303 makes a settled payment look
+    # like a failing endpoint and eventually gets the webhook disabled.
+    #
+    # Told apart by what the caller says it accepts, which is the honest
+    # signal: a browser form POST asks for text/html, a webhook does not.
+    wants_html = "text/html" in (request.headers.get("accept") or "").lower()
+
+    def _answer(ok: bool, target: str, reason: str = ""):
+        if wants_html:
+            return RedirectResponse(url=target, status_code=303)
+        return JSONResponse(
+            status_code=200,
+            content={"received": True, "settled": ok, "order_id": order_id,
+                     **({"reason": reason} if reason else {})},
+        )
 
     def _fail(reason: str, **extra):
         logger.warning("[PAYU] Callback rejected (%s) txnid=%s %s", reason, txnid, extra or "")
@@ -278,7 +308,10 @@ async def payu_callback(request: Request, db: Session = Depends(get_db)):
         # all, which is why a cancelled payment looked like nothing happened.
         target = (f"{front}/orders/{order_id}?placed=1&payment=failed"
                   if order_id else f"{front}/orders?payment=failed")
-        return RedirectResponse(url=target, status_code=303)
+        # 200 to a webhook even when we reject it: the rejection is our
+        # verdict on the payment, not a transport failure, and retrying will
+        # not change it.
+        return _answer(False, target, reason)
 
     # Without a salt the reverse hash proves nothing: an attacker knows every
     # input and can compute it themselves.
@@ -310,7 +343,7 @@ async def payu_callback(request: Request, db: Session = Depends(get_db)):
     # Already settled — treat a repeat as success without touching anything.
     if order.payment_status == PaymentStatus.PAID:
         logger.info("[PAYU] Duplicate callback for already-paid order %s ignored", order_id)
-        return RedirectResponse(url=f"{front}/orders/{order_id}?placed=1", status_code=303)
+        return _answer(True, f"{front}/orders/{order_id}?placed=1")
 
     # The txnid must be the one this service issued for this order. Kept strict:
     # it is a real barrier against anyone who holds the merchant salt but cannot
@@ -343,7 +376,7 @@ async def payu_callback(request: Request, db: Session = Depends(get_db)):
     # while assignment moves it to ASSIGNED and sends the baker their own copy.
     _confirm_to_customer_and_admin(db, order_id)
     _release_for_production(db, order_id)
-    return RedirectResponse(url=f"{front}/orders/{order_id}?placed=1", status_code=303)
+    return _answer(True, f"{front}/orders/{order_id}?placed=1")
 
 
 @router.get("/status/{order_id}")
