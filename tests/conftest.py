@@ -11,6 +11,7 @@ Environment is configured before any app module is imported, because
 
 import os
 import tempfile
+from datetime import datetime, timezone
 
 _TMP = tempfile.mkdtemp(prefix="copa-tests-")
 
@@ -247,16 +248,33 @@ def make_user(db, name, role, phone=None, on_duty=True, is_active=True):
 
 
 def make_order(db, customer, status=OrderStatus.OUT_FOR_DELIVERY, rider=None,
-               address="12 Hazratganj, Lucknow", baker=None):
+               address="12 Hazratganj, Lucknow", baker=None,
+               fulfilment="DELIVERY", with_proof=True):
+    """
+    An order to test something else with.
+
+    `with_proof` defaults to True because the pipeline now refuses to advance
+    an order that has not been photographed, and almost every test here is
+    about something other than photographs — delivery tracking, WhatsApp
+    commands, notifications. Without it, each of those would have to stage
+    three images to get an order as far as the thing it actually tests.
+
+    Pass with_proof=False to test the gates themselves.
+    """
+    now = datetime.now(timezone.utc)
     order = Order(
         user_id=customer.id,
         status=status,
         subtotal=1000.0,
         total_price=1000.0,
-        delivery_address=address,
+        fulfilment=fulfilment,
+        delivery_address=None if fulfilment == "PICKUP" else address,
         assigned_rider_id=rider.id if rider else None,
         assigned_baker_id=baker.id if baker else None,
         payment_method="COD",
+        proof_image="/media/test_bake.jpg" if with_proof else None,
+        proof_verified_at=now if with_proof else None,
+        handover_image="/media/test_handover.jpg" if with_proof else None,
     )
     db.add(order)
     db.commit()

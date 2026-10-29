@@ -57,6 +57,13 @@ _VERBS: dict[str, dict[str, str]] = {
         "WAPAS": "ADMIN_REJECT",
         "PAID": "ADMIN_PAID",
         "CANCEL": "ADMIN_CANCEL",
+        # Collection. The shop closes a self pickup from behind the counter,
+        # and had no way to say so from the channel it actually uses.
+        "READY": "STAFF_READY",
+        "COLLECTED": "STAFF_COLLECTED",
+        "PICKEDUP": "STAFF_COLLECTED",
+        "NOTCOLLECTED": "STAFF_NOT_COLLECTED",
+        "NOSHOW": "STAFF_NOT_COLLECTED",
     },
     "baker": {
         "START": "BAKER_START",

@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session, noload, selectinload
 
 from app.config import get_settings
 from app.models.address import Address
-from app.models.order import Order, OrderStatus
+from app.models.order import Fulfilment, Order, OrderStatus
 from app.models.user import User, UserRole
 from app.services.delivery_tracking import STALE_AFTER_SECONDS, get_locations_bulk, is_stale
 
@@ -61,6 +61,11 @@ def get_active_deliveries(db: Session) -> list[dict]:
             noload(Order.baker),
         )
         .filter(Order.status.in_(FLEET_STATUSES))
+        # A collection is not a delivery and has no business on this board.
+        # Self-pickup orders were being listed as undelivered jobs — a cake
+        # sitting on the counter, shown with a rider and a route, which is how
+        # the board came to show deliveries that were never going anywhere.
+        .filter(Order.fulfilment != Fulfilment.PICKUP.value)
         .order_by(Order.delivery_time.asc().nullslast(), Order.created_at.asc())
         .all()
     )

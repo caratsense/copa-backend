@@ -140,6 +140,29 @@ def notify_baker_assigned(db: Session, order: Order) -> None:
     )
 
 
+def notify_admin_proof_ready(db: Session, order: Order) -> None:
+    """
+    Tell the shop a finished cake is waiting to be looked at.
+
+    Sent when the photo is uploaded rather than when the order reaches
+    AWAITING_APPROVAL, because the photo is the thing being checked and it is
+    now what gates the approval. The two usually happen seconds apart; when
+    they do not, this is the one that matters.
+    """
+    _enrich_order(order)
+    # proof_image is a /media path served by the API, not by the website, so
+    # it is the backend's origin that makes it openable from a phone.
+    base = (settings.BACKEND_BASE_URL or "").rstrip("/")
+    photo = f"{base}{order.proof_image}" if (order.proof_image and base) else (order.proof_image or "")
+    for admin in _consenting_admins(db):
+        _send(
+            db, order, "admin_proof_ready", admin.phone,
+            [str(order.id), _items_str(order), photo],
+            "BAKE_PROOF_UPLOADED", "admin",
+            bool(admin.phone),
+        )
+
+
 def notify_rider_assigned(db: Session, order: Order) -> None:
     """
     Tell a rider a delivery is theirs.
@@ -229,6 +252,41 @@ def dispatch_notifications(db: Session, order: Order, new_status: str, rework: b
                   [order.customer_name or "Customer", str(order.id),
                    order.rider_name or "Your rider", _tracking_link(order)],
                   new_status, "customer", customer_ok)
+
+        # ─── READY_FOR_PICKUP → customer ─────────────
+        # The collection equivalent of "out for delivery", and the message that
+        # was missing entirely: a customer who chose to collect was told their
+        # cake was on its way to them, by a rider, to an address they had never
+        # given. This one tells them where to come and until when.
+        elif new_status == OrderStatus.READY_FOR_PICKUP.value:
+            from app.services.store_hours import pickup_details
+            details = pickup_details(db)
+            _send(db, order, "order_ready_for_pickup", customer_phone,
+                  [order.customer_name or "Customer", str(order.id),
+                   details["line"], _delivery_str(order)],
+                  new_status, "customer", customer_ok)
+
+        # ─── COLLECTED → customer ────────────────────
+        elif new_status == OrderStatus.COLLECTED.value:
+            _send(db, order, "order_collected", customer_phone,
+                  [order.customer_name or "Customer", str(order.id)],
+                  new_status, "customer", customer_ok)
+
+        # ─── NOT_COLLECTED → customer + admin ────────
+        # The slot passed and the cake is still here. Nobody was told anything
+        # before, because the state did not exist: a pickup that nobody came
+        # for simply sat in the kitchen looking like an open delivery.
+        elif new_status == OrderStatus.NOT_COLLECTED.value:
+            from app.services.store_hours import pickup_details
+            details = pickup_details(db)
+            _send(db, order, "order_not_collected", customer_phone,
+                  [order.customer_name or "Customer", str(order.id), details["line"]],
+                  new_status, "customer", customer_ok)
+            for admin in _consenting_admins(db):
+                _send(db, order, "order_not_collected_admin", admin.phone,
+                      [str(order.id), order.customer_name or "Customer",
+                       order.user.phone if order.user else ""],
+                      new_status, "admin", True)
 
         # ─── DELIVERED → customer + admin ────────────
         elif new_status == OrderStatus.DELIVERED.value:

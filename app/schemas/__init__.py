@@ -591,6 +591,10 @@ class OrderCreate(BaseModel):
     # An order with no lines was accepted, auto-assigned to a baker and burned
     # a coupon redemption for nothing.
     items: list[OrderItemCreate] = Field(min_length=1)
+    # DELIVERY or PICKUP. Said outright rather than inferred from a missing
+    # address, which is how self pickup used to be expressed and why it was
+    # indistinguishable from a delivery that lost its address.
+    fulfilment: Literal["DELIVERY", "PICKUP"] = "DELIVERY"
     delivery_address: Optional[str] = None
     delivery_time: Optional[datetime] = None
     delivery_zone: Optional[str] = None
@@ -628,11 +632,17 @@ class OrderRead(BaseModel):
     discount: float
     total_price: float
     coupon_code: Optional[str]
+    fulfilment: str = "DELIVERY"
     delivery_address: Optional[str]
     delivery_time: Optional[datetime]
     delivery_zone_id: Optional[int]
     payment_status: str
     payment_method: Optional[str] = "ONLINE"
+    # The photographs the pipeline now insists on, so every screen that shows
+    # an order can show whether it has been seen and by whom.
+    proof_image: Optional[str] = None
+    proof_verified_at: Optional[datetime] = None
+    handover_image: Optional[str] = None
     assigned_baker_id: Optional[int]
     assigned_rider_id: Optional[int]
     baker_name: Optional[str] = None

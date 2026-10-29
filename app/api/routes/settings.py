@@ -42,6 +42,11 @@ PUBLIC_KEYS = frozenset({
     "store_hours_close",
     "brand_name",
     "brand_tagline",
+    # Where to collect a self-pickup order. Public by design: the customer who
+    # chose to collect has to be told where to come, on the order page and in
+    # their WhatsApp confirmation. Unlike brand_phone this is a shop front, not
+    # a private line.
+    "pickup_address",
 })
 
 

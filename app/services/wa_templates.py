@@ -88,6 +88,45 @@ TEMPLATES: dict[str, Template] = {
             trigger="Baker finishes; order reaches AWAITING_APPROVAL (quality check)",
             variables=("order_id", "items", "total_amount"),
         ),
+        # ── Self pickup ──
+        # The collection half of the lifecycle. None of these existed, which is
+        # why a customer collecting an order was sent the delivery messages:
+        # out for delivery, then delivered, both untrue.
+        Template(
+            key="order_ready_for_pickup",
+            default_name="order_ready_for_pickup",
+            recipient="customer",
+            trigger="Pickup order is packed and waiting (PACKAGED -> READY_FOR_PICKUP)",
+            variables=("customer_name", "order_id", "pickup_details", "slot"),
+        ),
+        Template(
+            key="order_collected",
+            default_name="order_collected",
+            recipient="customer",
+            trigger="Customer collected the order (READY_FOR_PICKUP -> COLLECTED)",
+            variables=("customer_name", "order_id"),
+        ),
+        Template(
+            key="order_not_collected",
+            default_name="order_not_collected",
+            recipient="customer",
+            trigger="Pickup slot passed with the cake still on the counter",
+            variables=("customer_name", "order_id", "pickup_details"),
+        ),
+        Template(
+            key="order_not_collected_admin",
+            default_name="order_not_collected_admin",
+            recipient="admin",
+            trigger="A pickup nobody came for — the shop has to chase it",
+            variables=("order_id", "customer_name", "customer_phone"),
+        ),
+        Template(
+            key="admin_proof_ready",
+            default_name="admin_proof_ready",
+            recipient="admin",
+            trigger="Baker photographs the finished cake; the photo is waiting to be checked",
+            variables=("order_id", "items", "photo_url"),
+        ),
         Template(
             key="order_rework",
             default_name="order_rework",

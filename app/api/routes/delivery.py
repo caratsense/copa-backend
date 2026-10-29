@@ -157,6 +157,29 @@ def stop_tracking(
     order_id: int,
     admin: User = Depends(require_admin),
 ):
-    """Stop tracking for a delivery. Called when order is DELIVERED."""
+    """
+    Stop tracking for a delivery. Called when order is DELIVERED, and by the
+    admin board to clear a delivery whose GPS has died.
+
+    It clears the Redis position and then SAYS SO. The board's list comes from
+    order status, not from Redis, so clearing the position alone changed
+    nothing an operator could see: the row stayed exactly where it was, which
+    made the button look broken. The broadcast is what refreshes it.
+
+    The order itself is untouched on purpose. A delivery whose rider's phone
+    has died is still a delivery, and closing it here would record an arrival
+    that nobody witnessed. Use Delivered or Could not deliver to close it.
+    """
     stop_delivery_tracking(order_id)
-    return {"message": "Tracking stopped", "order_id": order_id}
+    try:
+        from app.core.broadcast import fleet_broadcast_sync
+        fleet_broadcast_sync({"type": "fleet_changed", "order_id": order_id})
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error("[Tracking] stop broadcast failed for %s: %s", order_id, e)
+    return {
+        "message": "Tracking stopped", "order_id": order_id,
+        # So the UI can tell the operator what did and did not happen, rather
+        # than a bare "Tracking stopped." next to an unchanged row.
+        "order_changed": False,
+    }

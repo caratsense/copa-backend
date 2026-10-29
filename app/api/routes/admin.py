@@ -211,6 +211,16 @@ def admin_assign_rider(
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
+    # Nobody carries a collection. The admin table no longer offers the button
+    # for one, but the rule belongs here too: hiding a control is not enforcing
+    # a rule, and this endpoint is reachable without the table.
+    if order.is_pickup:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Order #{order.id} is a self pickup — the customer is collecting it. "
+                    "It does not need a rider."),
+        )
+
     if data and data.staff_id:
         from app.models.user import UserRole
         rider = db.query(User).filter(User.id == data.staff_id, User.role == UserRole.RIDER, User.is_active == True).first()

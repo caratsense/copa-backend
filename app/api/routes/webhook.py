@@ -490,6 +490,24 @@ def _handle_admin(db, user, command):
             err = None
         if err:
             return err
+        # Approving here IS the check. The admin was sent the baker's photo
+        # when it was uploaded, so replying APPROVE is them having looked at
+        # it — record that, or the packing gate below refuses their own
+        # approval for want of a verification that only the website could set.
+        if order.proof_image and not order.proof_verified_at:
+            from datetime import datetime, timezone
+            order.proof_verified_at = datetime.now(timezone.utc)
+            order.proof_verified_by = user.id
+            db.commit()
+
+        if order.is_pickup:
+            # A collection is not dispatched and gets no rider. It goes onto
+            # the counter, and the customer is told where to come for it.
+            update_order_status(db, order.id, StatusUpdate(status="PACKAGED"))
+            update_order_status(db, order.id, StatusUpdate(status="READY_FOR_PICKUP"))
+            return (f"Order #{order.id} approved. It is a self pickup — "
+                    f"the customer has been told it is ready to collect.")
+
         update_order_status(db, order.id, StatusUpdate(status="PACKAGED"))
         try:
             auto_assign_rider(db, order.id, force=True)
@@ -564,6 +582,14 @@ def _handle_baker(db, user, command):
                                      [OrderStatus.IN_PRODUCTION], Order.assigned_baker_id)
         if err:
             return err
+        # A finished cake has to be photographed, and a WhatsApp reply cannot
+        # carry that photo. Saying so beats the bare "400: upload a photo"
+        # this would otherwise raise, which tells a baker nothing about where
+        # to go — and leaves them replying DONE again.
+        if not order.proof_image:
+            return (f"Order #{order.id} needs a photo of the finished cake before it can "
+                    f"go for approval.\n\nTake it here: {SITE}/baker\n"
+                    f"The cake is marked complete as soon as the photo is in.")
         update_order_status(db, order.id, StatusUpdate(status="AWAITING_APPROVAL"))
         return f"Order #{order.id} - marked complete. Awaiting approval."
 
@@ -607,8 +633,51 @@ def _handle_rider(db, user, command):
                                      [OrderStatus.OUT_FOR_DELIVERY], Order.assigned_rider_id)
         if err:
             return err
+        if not order.handover_image:
+            return (f"Order #{order.id} needs a photo of the handover before it can be "
+                    f"closed. Take it in the rider app: {SITE}/rider")
         update_order_status(db, order.id, StatusUpdate(status="DELIVERED"))
         return f"Order #{order.id} - delivered successfully."
+
+    # ── Collection ──
+    # The counter's half of the lifecycle. Without these, a self-pickup order
+    # could only be closed from the website, so the shop's quickest channel
+    # had no way to say "they came and took it".
+    if act == "STAFF_COLLECTED":
+        order = db.query(Order).filter(Order.id == command.order_id).first()
+        if not order:
+            return f"Order #{command.order_id} not found."
+        if not order.is_pickup:
+            return (f"Order #{order.id} is a delivery, not a collection. "
+                    f"Use DELIVERED once it has been handed over.")
+        if order.status != OrderStatus.READY_FOR_PICKUP:
+            return f"Order #{order.id} is {order.status.value}. Only an order waiting to be collected can be closed this way."
+        if not order.handover_image:
+            return (f"Order #{order.id} needs a photo of the handover first. "
+                    f"Take it here: {SITE}/admin/orders")
+        update_order_status(db, order.id, StatusUpdate(status="COLLECTED"))
+        return f"Order #{order.id} - collected. The customer has been thanked."
+
+    if act == "STAFF_NOT_COLLECTED":
+        order = db.query(Order).filter(Order.id == command.order_id).first()
+        if not order:
+            return f"Order #{command.order_id} not found."
+        if not order.is_pickup or order.status != OrderStatus.READY_FOR_PICKUP:
+            return f"Order #{command.order_id} is not waiting to be collected."
+        update_order_status(db, order.id, StatusUpdate(status="NOT_COLLECTED"))
+        return (f"Order #{order.id} - recorded as not collected. The customer has been "
+                f"reminded. Reply READY {order.id} when they come for it.")
+
+    if act == "STAFF_READY":
+        order = db.query(Order).filter(Order.id == command.order_id).first()
+        if not order:
+            return f"Order #{command.order_id} not found."
+        if not order.is_pickup:
+            return f"Order #{order.id} is a delivery. Use APPROVE to send it out."
+        if order.status not in (OrderStatus.PACKAGED, OrderStatus.NOT_COLLECTED):
+            return f"Order #{order.id} is {order.status.value}."
+        update_order_status(db, order.id, StatusUpdate(status="READY_FOR_PICKUP"))
+        return f"Order #{order.id} - the customer has been told it is ready to collect."
 
     return wa_commands.help_text(user.role)
 

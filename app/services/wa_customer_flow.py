@@ -168,7 +168,25 @@ def _ask_for_flavor(db, phone: str, state: dict, header: str) -> str:
     Shared because two steps now arrive here: a per-kg cake after its size, and
     a fixed-price product straight from the product list, which has no size to
     choose.
+
+    Both routes pass through the guard below, which is why it lives here
+    rather than at either call site.
     """
+    # A product the kitchen does not make to order has no flavour to pick.
+    # The bot offered all ten anyway — to a pack of buns, to a brownie, and to
+    # the rupee test cake, which is where this was finally seen. Worse than
+    # noise: several of those flavours carry a surcharge, so it invited the
+    # customer to add ₹250 to something nobody would flavour, and the kitchen
+    # would receive an instruction it cannot honour. Nothing to write on it
+    # either, so the message step goes with it.
+    product = state.get("product") or {}
+    if not product.get("is_customizable", True):
+        _set_state(phone, {**state, "step": "DELIVERY_ADDRESS",
+                           "flavor": {}, "cake_message": ""})
+        return (f"{header}\n\n"
+                "Please share your delivery address with a landmark.\n"
+                "For self-pickup, reply *pickup*.")
+
     flavors = [{"id": f.id, "name": f.name, "extra_cost": f.extra_cost}
                for f in db.query(FlavorRule).filter(FlavorRule.is_active == True).all()][:10]
     lines = [f"{header}\n\n*Select flavor:*\n"]
@@ -246,6 +264,9 @@ def _catalogue(db) -> list[dict]:
         out.append({
             "id": p.id, "name": p.name, "base_price": p.base_price,
             "pricing_unit": p.pricing_unit,
+            # Carried so the flow can stop offering a flavour list for
+            # something the kitchen does not flavour to order.
+            "is_customizable": bool(p.is_customizable),
             "options": [{"label": o.label, "price": o.price}
                         for o in p.options if o.is_active],
             "section": section.name if section else "More",
@@ -870,6 +891,13 @@ def _reply_to_customer(phone: str, message: str, user: Optional[User]) -> str:
                             # priced the same as "not selected" but broke
                             # outright on any deployment missing those rules.
                             "design": "", "addons": [], "rush": ""})],
+                    # Recorded as what it is. The address was simply dropped
+                    # before, which left the order indistinguishable from a
+                    # delivery whose address had failed to save — so the
+                    # kitchen packed it, a rider was assigned, and the customer
+                    # was told their cake was out for delivery when they were
+                    # the one coming to fetch it.
+                    fulfilment="PICKUP" if addr == "Self Pickup" else "DELIVERY",
                     delivery_address=addr if addr != "Self Pickup" else None,
                     delivery_time=f"{ddate}T{time_hours:02d}:00:00",
                     notes=cake_msg or None,
@@ -888,10 +916,21 @@ def _reply_to_customer(phone: str, message: str, user: Optional[User]) -> str:
                 # nothing had been collected and no payment link existed. Hand
                 # off to the existing web checkout instead of pretending
                 # WhatsApp can take money.
+                # A collection has to say where to collect from. The bot used
+                # to take "pickup" and then never mention it again — the
+                # customer was given a payment link and left to guess where
+                # the shop was.
+                if order.is_pickup:
+                    from app.services.store_hours import pickup_details
+                    how = f"Collection: {pickup_details(db)['line']}\n"
+                else:
+                    how = f"Delivery to: {addr}\n"
+
                 return (
                     f"*Order #{order.id} created*\n\n"
                     f"Amount: Rs {amount:,.2f}\n"
-                    f"Payment: pending\n\n"
+                    f"Payment: pending\n"
+                    f"{how}\n"
                     f"Complete your payment to confirm the order:\n"
                     f"{SITE}/orders?order_id={order.id}\n\n"
                     f"We'll start baking once payment is received. "

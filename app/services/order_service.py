@@ -127,9 +127,13 @@ def create_order(db: Session, data: OrderCreate) -> Order:
         total_price=0.0,
         subtotal=0.0,
         discount=0.0,
+        fulfilment=data.fulfilment,
         delivery_address=data.delivery_address,
         delivery_time=schedule["delivery_time"],
-        delivery_zone_id=delivery_zone_id,
+        # A cake being collected has no zone and no delivery to charge for.
+        # Forced here rather than trusted from the caller: a PICKUP order that
+        # arrived carrying a zone used to be charged for a delivery nobody made.
+        delivery_zone_id=None if data.fulfilment == "PICKUP" else delivery_zone_id,
         notes=data.notes,
     )
     db.add(order)
@@ -329,6 +333,48 @@ def update_order_status(db: Session, order_id: int, data: StatusUpdate, rework: 
                    f"Allowed: {[s.value for s in allowed]}"
         )
 
+    # ── The two branches out of PACKAGED do not cross ──
+    # VALID_TRANSITIONS allows both because it describes the status graph, not
+    # this order. Which one *this* order may take is decided by how it is being
+    # fulfilled, and getting it wrong is what sent a self-pickup cake out with
+    # a rider and told the customer it was on its way.
+    if new_status == OrderStatus.OUT_FOR_DELIVERY and order.is_pickup:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Order #{order.id} is a self pickup — the customer is collecting it. "
+                    "Mark it ready for pickup instead."),
+        )
+    if new_status == OrderStatus.READY_FOR_PICKUP and not order.is_pickup:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Order #{order.id} is a delivery to {order.delivery_address or 'the customer'}. "
+                    "Send it out with a rider instead."),
+        )
+
+    # ── Proof of work ──
+    # A cake cannot be offered for approval unseen, cannot be packed until
+    # somebody has looked at that photo, and cannot be closed out without a
+    # handover shot. Enforced here rather than in the routes because the
+    # website, the admin table and the WhatsApp commands all land on this one
+    # function, and a rule that only one of them honours is not a rule.
+    if new_status == OrderStatus.AWAITING_APPROVAL and not order.proof_image:
+        raise HTTPException(
+            status_code=400,
+            detail="Upload a photo of the finished cake before sending it for approval.",
+        )
+    if new_status == OrderStatus.PACKAGED and not order.proof_verified_at:
+        raise HTTPException(
+            status_code=400,
+            detail=("This cake has not been checked yet. It needs to be approved "
+                    "from the photo before it can be packed."),
+        )
+    if new_status in (OrderStatus.DELIVERED, OrderStatus.COLLECTED) and not order.handover_image:
+        what = "handing it over" if order.is_pickup else "the delivery"
+        raise HTTPException(
+            status_code=400,
+            detail=f"Upload a photo of {what} before closing this order.",
+        )
+
     # Nothing can go out for delivery without someone carrying it. This lived
     # only in /retry-delivery, so the fleet board enforced it and a plain status
     # PATCH from the admin orders table did not -- and _begin_delivery_tracking
@@ -380,7 +426,13 @@ def update_order_status(db: Session, order_id: int, data: StatusUpdate, rework: 
             pass  # no bakers available — admin can assign manually later
 
     # ── Auto-assign rider when PACKAGED ──
-    if new_status == OrderStatus.PACKAGED and not order.assigned_rider_id:
+    # Not for a collection. A rider was being given every packed order, self
+    # pickup included, so a cake the customer was walking in for was assigned
+    # to Anshul, put on the live delivery map, and announced to the customer as
+    # out for delivery. Nobody was taking it anywhere.
+    if (new_status == OrderStatus.PACKAGED
+            and not order.is_pickup
+            and not order.assigned_rider_id):
         try:
             from app.services.assignment_engine import auto_assign_rider
             order = auto_assign_rider(db, order.id)
@@ -403,10 +455,19 @@ def update_order_status(db: Session, order_id: int, data: StatusUpdate, rework: 
         # map showing a live position. Sending it out again starts tracking
         # afresh via the OUT_FOR_DELIVERY branch above.
         _end_delivery_tracking(order)
-    elif new_status == OrderStatus.PACKAGED:
+    elif new_status in (OrderStatus.COLLECTED, OrderStatus.NOT_COLLECTED):
+        # Nothing was ever tracked for a collection, but say so anyway: a
+        # pickup that was wrongly dispatched before this release may still have
+        # a live entry, and closing it should clear it.
+        _end_delivery_tracking(order)
+    elif new_status == OrderStatus.PACKAGED and not order.is_pickup:
         # The order joins the fleet view as "assigned, not collected". It has no
         # position by definition, so there is nothing to stream — the dashboard
         # just needs to know its list is out of date.
+        #
+        # A collection never joins the fleet at all. It is not going anywhere,
+        # and listing it as an undelivered job is what made Live Deliveries
+        # show cakes that were sitting on the counter waiting to be picked up.
         from app.core.broadcast import fleet_broadcast_sync
         fleet_broadcast_sync({"type": "fleet_changed", "order_id": order.id})
 

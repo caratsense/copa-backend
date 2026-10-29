@@ -292,13 +292,23 @@ def test_selecting_a_per_kg_cake_still_asks_for_a_size(db, catalogue, brownie):
     assert wcf._get_state("919222222222")["step"] == "SELECT_SIZE"
 
 
-def test_selecting_a_fixed_price_product_skips_the_size_step(db, catalogue, brownie):
+def test_selecting_a_fixed_price_product_skips_size_and_flavour(db, catalogue, brownie):
+    """
+    A brownie has no kilos and no flavour to pick.
+
+    This used to assert "Select flavor:" was offered, which pinned the bug it
+    was meant to guard: the bot read out all ten flavour rules for a Chocolate
+    Walnut Brownie, several of them carrying a +Rs 250 surcharge. The website
+    has never asked - its product page sends flavor:"" with the note that the
+    cake IS the product - so the two disagreed, which is what "the bot is not
+    synchronised" meant in practice.
+    """
     reply = _choose("919222222222", brownie)
 
     assert "Select size:" not in reply, "asked how many kilos of brownie"
-    assert "Select flavor:" in reply
+    assert "Select flavor:" not in reply, "offered flavours for a brownie"
     state = wcf._get_state("919222222222")
-    assert state["step"] == "SELECT_FLAVOR"
+    assert state["step"] == "DELIVERY_ADDRESS"
     assert state["size"] is None
     assert "/kg" not in reply
 
@@ -526,7 +536,9 @@ def test_picking_an_option_carries_its_label_into_the_conversation(db, catalogue
 
     assert "Size: *700g*" in reply
     assert wcf._get_state(PHONE)["size"]["name"] == "700g"
-    assert wcf._get_state(PHONE)["step"] == "SELECT_FLAVOR"
+    # Size is the only thing a named menu cake is asked. The flavour is the
+    # cake, so the conversation goes straight on to where it is going.
+    assert wcf._get_state(PHONE)["step"] == "DELIVERY_ADDRESS"
 
 
 def test_an_unmatched_size_is_refused_rather_than_defaulted(db, catalogue, blueberry):
@@ -553,7 +565,7 @@ def test_a_fixed_product_with_no_options_still_skips_the_size_step(db, catalogue
     reply = _choose(PHONE, brownie)
 
     assert "Select size:" not in reply
-    assert "Select flavor:" in reply
+    assert "Select flavor:" not in reply
     assert wcf._get_state(PHONE)["size"] is None
 
 

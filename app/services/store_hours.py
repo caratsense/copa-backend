@@ -250,3 +250,38 @@ def schedule_order_delivery(db: Session, requested_delivery_time: datetime | Non
             "is_off_hours": True,
             "message": f"Order received! It will be confirmed tomorrow at {next_open.strftime('%I:%M %p')}.",
         }
+
+
+# ── Where to collect a self-pickup order ──────────────
+#
+# Not a hardcoded address. The shop's own address is the shop's to set, it is
+# the kind of thing that changes, and a wrong address printed confidently on a
+# collection slip is worse than no address at all. So it is a site setting,
+# editable in the admin panel, and every caller degrades to the phone number
+# when it has not been filled in yet.
+PICKUP_ADDRESS_KEYS = ("pickup_address", "store_address", "brand_address")
+
+
+def pickup_details(db: Session) -> dict:
+    """
+    What a customer collecting an order needs to be told.
+
+    Returns the address (or None), the hours they can come in, and a phone
+    number to call. `line` is the ready-made sentence for WhatsApp and for the
+    order page, so the two cannot drift apart.
+    """
+    address = _setting(db, PICKUP_ADDRESS_KEYS)
+    phone = _setting(db, ("brand_phone",))
+    opens, closes = _get_hours(db)
+    hours = f"{opens.strftime('%I:%M %p').lstrip('0')} to {closes.strftime('%I:%M %p').lstrip('0')}"
+
+    if address:
+        line = f"Collect from {address} — open {hours}."
+    elif phone:
+        # No address on file. Say so plainly and give them a human, rather
+        # than inventing a location or pretending there is nothing to collect.
+        line = f"Please call {phone} for directions to the shop — open {hours}."
+    else:
+        line = f"The shop is open {hours}."
+
+    return {"address": address, "phone": phone, "hours": hours, "line": line}

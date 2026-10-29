@@ -2,10 +2,13 @@
 Order Routes — complete with auth, payments, tracking, rider self-service.
 """
 
-from fastapi import APIRouter, Depends, HTTPException
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app.core.uploads import save_image
 from app.db import get_db
 from app.models.user import User, UserRole
 from app.models.order import Order, OrderStatus, PaymentStatus
@@ -221,3 +224,165 @@ def retry_delivery(
     return update_order_status(db, order_id, StatusUpdate(status="OUT_FOR_DELIVERY"))
 
 
+
+
+# ─── PROOF OF WORK ────────────────────────────────────
+#
+# "Baked" and "delivered" used to be buttons. Anyone holding the role could
+# advance an order by pressing one, and the shop's only record that a cake had
+# been made, checked, or handed to anybody was that somebody had pressed it.
+#
+# Three photographs close that gap, and the gates that require them live in
+# update_order_status so every caller - website, admin table, WhatsApp - meets
+# the same rule:
+#
+#   proof_image      the baker's shot of the finished cake. Required before
+#                    the cake can be offered for approval.
+#   proof_verified   Shriya looking at that shot and saying yes. Required
+#                    before the cake can be packed.
+#   handover_image   the doorstep, or the counter. Required before the order
+#                    can be closed as delivered or collected.
+
+
+@router.post("/{order_id}/proof", response_model=OrderRead)
+def upload_bake_proof(
+    order_id: int,
+    file: UploadFile = File(...),
+    user: User = Depends(require_role(UserRole.BAKER, UserRole.ADMIN)),
+    db: Session = Depends(get_db),
+):
+    """
+    The baker photographs the finished cake.
+
+    Re-uploading is allowed and deliberately clears any previous approval: if
+    the photo changes, the thing Shriya approved is not the thing in the box,
+    and the cake has to be looked at again.
+    """
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.assigned_baker_id != user.id and user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Not assigned to you")
+    if order.status in (OrderStatus.DELIVERED, OrderStatus.COLLECTED, OrderStatus.CANCELLED):
+        raise HTTPException(status_code=400, detail="This order is closed")
+
+    order.proof_image = save_image(file, prefix=f"bake_{order_id}")
+    order.proof_verified_at = None
+    order.proof_verified_by = None
+    db.add(OrderEvent(order_id=order.id, event_type="BAKE_PROOF_UPLOADED",
+                      description=f"{user.name or 'Baker'} photographed the finished cake"))
+    db.commit()
+    db.refresh(order)
+
+    # Tell the shop there is something to look at. Best effort: the photo is
+    # saved either way, and a messaging outage must not lose it.
+    try:
+        from app.services.wa_notifications import notify_admin_proof_ready
+        notify_admin_proof_ready(db, order)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"[WA] proof-ready notify failed for {order_id}: {e}")
+
+    _enrich_order(order)
+    return order
+
+
+@router.post("/{order_id}/verify-proof", response_model=OrderRead)
+def verify_bake_proof(
+    order_id: int,
+    user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Shriya has looked at the photo and is happy. The cake may now be packed."""
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if not order.proof_image:
+        raise HTTPException(status_code=400, detail="There is no photo to check yet")
+
+    order.proof_verified_at = datetime.now(timezone.utc)
+    order.proof_verified_by = user.id
+    db.add(OrderEvent(order_id=order.id, event_type="BAKE_PROOF_VERIFIED",
+                      description=f"{user.name or 'Admin'} checked the photo and approved the cake"))
+    db.commit()
+    db.refresh(order)
+    _enrich_order(order)
+    return order
+
+
+class ProofRejection(BaseModel):
+    """What was wrong with the cake, in the baker's words rather than a code."""
+    reason: str = Field(min_length=1, max_length=300)
+
+
+@router.post("/{order_id}/reject-proof", response_model=OrderRead)
+def reject_bake_proof(
+    order_id: int,
+    data: ProofRejection,
+    user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Shriya is not happy with the cake. It goes back to the kitchen.
+
+    The photo is cleared along with the approval, because the next thing the
+    baker does is make it right and photograph it again - and leaving the old
+    picture in place would let the cake through on a shot of the rejected one.
+    """
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    order.proof_image = None
+    order.proof_verified_at = None
+    order.proof_verified_by = None
+    db.add(OrderEvent(order_id=order.id, event_type="BAKE_PROOF_REJECTED",
+                      description=f"Sent back by {user.name or 'Admin'}: {data.reason}"))
+    db.commit()
+
+    # Back to the bench if it had already been offered for approval. If it is
+    # still in production there is nothing to move - the baker simply has no
+    # approved photo to advance with.
+    if order.status == OrderStatus.AWAITING_APPROVAL:
+        return update_order_status(
+            db, order_id, StatusUpdate(status="IN_PRODUCTION", reason=data.reason), rework=True
+        )
+    db.refresh(order)
+    _enrich_order(order)
+    return order
+
+
+@router.post("/{order_id}/handover", response_model=OrderRead)
+def upload_handover_proof(
+    order_id: int,
+    file: UploadFile = File(...),
+    user: User = Depends(require_role(UserRole.RIDER, UserRole.BAKER, UserRole.ADMIN)),
+    db: Session = Depends(get_db),
+):
+    """
+    The handover shot - the doorstep for a delivery, the counter for a pickup.
+
+    A rider may only do this for their own delivery. A collection has no rider,
+    so whoever is behind the counter takes it, which is why a baker and an
+    admin can too.
+    """
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if (not order.is_pickup
+            and user.role == UserRole.RIDER
+            and order.assigned_rider_id != user.id):
+        raise HTTPException(status_code=403, detail="Not assigned to you")
+    if order.status in (OrderStatus.DELIVERED, OrderStatus.COLLECTED, OrderStatus.CANCELLED):
+        raise HTTPException(status_code=400, detail="This order is closed")
+
+    order.handover_image = save_image(file, prefix=f"handover_{order_id}")
+    db.add(OrderEvent(
+        order_id=order.id, event_type="HANDOVER_PHOTOGRAPHED",
+        description=("Photographed at the counter" if order.is_pickup
+                     else f"Photographed at the door by {user.name or 'the rider'}"),
+    ))
+    db.commit()
+    db.refresh(order)
+    _enrich_order(order)
+    return order
