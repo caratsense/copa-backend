@@ -364,14 +364,39 @@ def _handle_staff(db, user, text: str, phone: str) -> str:
     exactly as before, and nothing about an order moves on an inferred
     instruction; what changed is the fallback.
 
-    Three cases, in the order they are tested:
+    Four cases, in the order they are tested:
 
+      a real command       ("APPROVE 145")                 -> it runs
+      mid-order, anything else                             -> the order flow
       a mistyped command   ("DONE 2 cakes for order 145")  -> the grammar
       a greeting or "help"                                 -> who they are
                                                               + the commands
       anything else        ("do you have 5kg cakes?")      -> the assistant
+
+    The second case exists because staff order cakes too, and several staff
+    verbs are also ordinary words. An admin half way through buying a cake
+    typed "Cancel" and got "Include the order number, e.g. APPROVE 145" — the
+    admin grammar for CANCEL 145 — while their order sat there uncancelled.
+    A command that parses completely still wins, because "APPROVE 145" is
+    never small talk; it is the bare verbs that have to give way.
     """
     command = wa_commands.parse(text, user.role)
+
+    # A conversation in progress outranks a bare verb.
+    #
+    # "Cancel" on its own parses as the admin's CANCEL with needs_order_id —
+    # a complete command missing its number — so it never reached a check
+    # that only looked at command is None. What has to give way is any verb
+    # that did not name an order: "APPROVE 145" is never small talk, but
+    # "Cancel" from someone half way through buying a cake plainly is.
+    #
+    # _get_state is the same store the customer flow uses, so "in progress"
+    # means exactly what it means there.
+    from app.services.wa_customer_flow import _get_state
+    ambiguous = command is None or getattr(command, "needs_order_id", False)
+    if ambiguous and _get_state(phone).get("step", "IDLE") != "IDLE":
+        return handle_customer_message(phone, text, user)
+
     if command is None:
         if wa_commands.looks_like_command(text, user.role):
             return wa_commands.help_text(user.role)

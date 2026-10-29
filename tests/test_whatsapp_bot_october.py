@@ -339,3 +339,56 @@ def test_a_product_with_no_price_yet_is_not_offered_either(db):
     db.commit()
 
     assert "Mystery Cake" not in [p["name"] for p in flow._catalogue(db)]
+
+
+# ─── STAFF ORDER CAKES TOO ────────────────────────────
+
+
+def _admin(db):
+    from app.models.user import UserRole as R
+    from tests.conftest import make_user as mk
+    return mk(db, "Shriya", R.ADMIN, phone=f"+{PHONE}")
+
+
+def test_an_admin_mid_order_can_cancel_their_own_order(db):
+    """
+    From a live test on the owner's phone. Half way through buying a cake she
+    typed "Cancel" and got "Include the order number, e.g. APPROVE 145" — the
+    admin grammar for CANCEL 145 — while the order stayed open. Several staff
+    verbs are also ordinary words, and the staff parser saw them first.
+    """
+    _catalogue(db)
+    admin = _admin(db)
+    flow._set_state(PHONE, {"step": "SELECT_CATEGORY",
+                            "categories": ["Chocolate Celebration Cakes"]})
+
+    reply = webhook._handle_staff(db, admin, "Cancel", PHONE)
+
+    assert "cancelled" in reply.lower()
+    assert "APPROVE" not in reply
+    assert flow._get_state(PHONE)["step"] == "IDLE"
+
+
+def test_a_real_command_still_wins_mid_order(db):
+    """"APPROVE 145" is never small talk, whatever else is going on."""
+    _catalogue(db)
+    admin = _admin(db)
+    flow._set_state(PHONE, {"step": "SELECT_CATEGORY", "categories": ["Cookies"]})
+
+    reply = webhook._handle_staff(db, admin, "APPROVE 4321", PHONE)
+
+    # It reached the admin handler: it is talking about an order id, not about
+    # which part of the menu they are after.
+    assert "4321" in reply
+    assert "What are you looking for" not in reply
+
+
+def test_the_grammar_still_comes_back_when_nothing_is_in_progress(db):
+    """An idle admin typing a bare verb is reaching for a command."""
+    _catalogue(db)
+    admin = _admin(db)
+    flow._clear_state(PHONE)
+
+    reply = webhook._handle_staff(db, admin, "Cancel", PHONE)
+
+    assert "order number" in reply.lower()
