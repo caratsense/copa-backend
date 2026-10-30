@@ -172,3 +172,105 @@ def test_the_customer_tracking_view_defaults_to_delivery(db, client, customer):
     res = client.get(f"/orders/track/{order.id}", headers=auth(customer))
 
     assert res.json()["fulfilment"] == "DELIVERY"
+
+
+# ─── CLOSING A COLLECTION NEEDS NO PHOTOGRAPH ─────────
+
+def test_the_status_route_closes_a_collection_with_no_handover_photo(db, client, customer, admin):
+    """
+    The gate that made every pickup order permanent.
+
+    Closing an order as DELIVERED or COLLECTED required a handover photo. The
+    only camera for one lives on the rider screen, and a collection never gets
+    a rider, so there was no screen in the product that could satisfy it:
+    orders #30 and #32 sat at READY FOR PICKUP with the button greyed out and
+    reading "Photo needed", and nothing a human could press would change it.
+
+    A rider is away from the shop and unobserved, so a delivery still needs
+    the shot. A collection is handed across the counter by the staff, in front
+    of the customer, and needs nothing.
+    """
+    from tests.conftest import auth
+
+    order = make_order(db, customer, status=OrderStatus.READY_FOR_PICKUP,
+                       fulfilment=Fulfilment.PICKUP.value, with_proof=False)
+    assert order.handover_image is None
+
+    res = client.patch(f"/orders/{order.id}/status",
+                       json={"status": "COLLECTED"}, headers=auth(admin))
+
+    assert res.status_code == 200, res.text
+    db.refresh(order)
+    assert order.status == OrderStatus.COLLECTED
+
+
+def test_the_status_route_still_refuses_a_delivery_with_no_handover_photo(db, client, customer, rider, admin):
+    """The rule is not gone, it is confined to the case it was written for."""
+    from tests.conftest import auth
+
+    order = make_order(db, customer, status=OrderStatus.OUT_FOR_DELIVERY,
+                       rider=rider, with_proof=False)
+    order.proof_image = "/media/bake_1.jpg"
+    db.commit()
+
+    res = client.patch(f"/orders/{order.id}/status",
+                       json={"status": "DELIVERED"}, headers=auth(admin))
+
+    assert res.status_code == 400, res.text
+    assert "photo" in res.json()["detail"].lower()
+    db.refresh(order)
+    assert order.status == OrderStatus.OUT_FOR_DELIVERY
+
+
+def test_the_owner_can_close_a_collection_over_whatsapp(db, customer):
+    """
+    COLLECTED / READY / NOTCOLLECTED are parsed as admin verbs, but the block
+    that ran them sat inside the rider branch, which an admin never reaches.
+    Shriya typing COLLECTED 32 got the command list back.
+    """
+    from app.api.routes.webhook import _handle_staff
+    from app.models.user import UserRole
+    from tests.conftest import make_user
+
+    admin = make_user(db, "Shriya", UserRole.ADMIN)
+    order = make_order(db, customer, status=OrderStatus.READY_FOR_PICKUP,
+                       fulfilment=Fulfilment.PICKUP.value, with_proof=False)
+
+    reply = _handle_staff(db, admin, f"COLLECTED {order.id}", "919554444462")
+
+    assert "collected" in reply.lower()
+    assert "APPROVE <order no>" not in reply, "fell through to the help text"
+    db.refresh(order)
+    assert order.status == OrderStatus.COLLECTED
+
+
+def test_the_owner_can_mark_a_collection_ready_over_whatsapp(db, customer):
+    from app.api.routes.webhook import _handle_staff
+    from app.models.user import UserRole
+    from tests.conftest import make_user
+
+    admin = make_user(db, "Shriya", UserRole.ADMIN)
+    order = make_order(db, customer, status=OrderStatus.PACKAGED,
+                       fulfilment=Fulfilment.PICKUP.value)
+
+    reply = _handle_staff(db, admin, f"READY {order.id}", "919554444462")
+
+    assert "ready to collect" in reply.lower()
+    db.refresh(order)
+    assert order.status == OrderStatus.READY_FOR_PICKUP
+
+
+def test_whatsapp_still_refuses_to_collect_a_delivery(db, customer, rider):
+    """The verb is for the counter; a delivery must go through the rider."""
+    from app.api.routes.webhook import _handle_staff
+    from app.models.user import UserRole
+    from tests.conftest import make_user
+
+    admin = make_user(db, "Shriya", UserRole.ADMIN)
+    order = make_order(db, customer, status=OrderStatus.OUT_FOR_DELIVERY, rider=rider)
+
+    reply = _handle_staff(db, admin, f"COLLECTED {order.id}", "919554444462")
+
+    assert "delivery, not a collection" in reply.lower()
+    db.refresh(order)
+    assert order.status == OrderStatus.OUT_FOR_DELIVERY

@@ -464,3 +464,50 @@ def test_browser_then_webhook_for_the_same_payment_is_safe(client, db, customer,
     assert second.json()["settled"] is True
     db.refresh(order)
     assert order.payment_status == PaymentStatus.PAID
+
+
+# ─── WHAT THE CHECKOUT PAGE OFFERS ────────────────────
+# Instalments on a cake are not something the shop wants to sell, so the EMI
+# category is dropped from PayU's hosted page. The risk in doing this is the
+# signature: PayU refuses the whole transaction if the request hash does not
+# match, and the hash covers a fixed field list that drop_category is not in.
+# These two pin both halves — that it is sent, and that sending it did not
+# quietly invalidate every payment.
+
+def test_the_checkout_page_does_not_offer_emi(client, db, customer, payu, catalogue):
+    order = online_order(db, customer)
+
+    res = client.post("/payments/create-order", headers=auth(customer),
+                      json={"order_id": order.id, "payment_method": "ONLINE"})
+
+    assert res.status_code == 200, res.text
+    assert res.json()["params"]["drop_category"] == "EMI"
+
+
+def test_dropping_emi_leaves_the_request_hash_untouched(client, db, customer, payu, catalogue):
+    """
+    PayU's request hash is sha512 over key|txnid|amount|productinfo|firstname|
+    email|udf1..udf5 then five empty fields, then the salt. drop_category is
+    not one of them. Recomputed here from scratch rather than from the route's
+    own helper, so a change to the field list fails this test instead of
+    being mirrored by it.
+    """
+    order = online_order(db, customer)
+
+    res = client.post("/payments/create-order", headers=auth(customer),
+                      json={"order_id": order.id, "payment_method": "ONLINE"})
+    params = res.json()["params"]
+
+    expected = hashlib.sha512("|".join([
+        "testkey",
+        params["txnid"],
+        params["amount"],
+        params["productinfo"],
+        params["firstname"],
+        params["email"],
+        "", "", "", "", "",          # udf1..udf5
+        "", "", "", "", "",          # PayU's five reserved empties
+        "testsalt",
+    ]).encode()).hexdigest()
+
+    assert params["hash"] == expected, "drop_category changed the signature"

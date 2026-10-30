@@ -41,6 +41,20 @@ router = APIRouter(prefix="/payments", tags=["Payments"])
 
 PAYU_URL = "https://secure.payu.in/_payment" if settings.PAYU_ENV == "prod" else "https://test.payu.in/_payment"
 
+# Payment categories hidden on PayU's hosted page. "EMI" removes the whole EMI
+# category — instalments on a cake are not something the shop wants to offer,
+# and the fees come out of a bakery-sized margin.
+#
+# Comma-separated PayU category codes: CC (credit card), DC (debit card),
+# NB (net banking), NEFTRTGS, EMI, CASH (wallets), BNPL, SODEXO. A single
+# option inside a category is dropped with CATEGORY|BANKCODE, e.g. "EMI|EMI6"
+# for HDFC's 6-month plan only.
+#
+# This hides it at checkout; it does not switch EMI off on the merchant
+# account. Turning it off in the PayU dashboard is the permanent version and
+# needs no deploy.
+PAYU_DROP_CATEGORIES = "EMI"
+
 
 def _sha512(*parts) -> str:
     return hashlib.sha512("|".join(str(p) for p in parts).encode()).hexdigest()
@@ -222,6 +236,8 @@ def create_payment_order(
     callback = f"{settings.BACKEND_BASE_URL.rstrip('/')}/payments/payu-callback"
 
     # Request hash: key|txnid|amount|productinfo|firstname|email|udf1..5|||||| |salt (udf empty)
+    # drop_category is deliberately absent — PayU's hash covers only the fields
+    # below, so sending it does not change the signature.
     hash_ = _sha512(
         settings.PAYU_KEY, txnid, amount, productinfo, firstname, email,
         "", "", "", "", "", "", "", "", "", "", settings.PAYU_SALT,
@@ -245,6 +261,7 @@ def create_payment_order(
             "surl": callback,
             "furl": callback,
             "hash": hash_,
+            "drop_category": PAYU_DROP_CATEGORIES,
         },
     }
 

@@ -454,6 +454,51 @@ def _resolve_target(db, user, command, valid_statuses, order_field):
     return candidates[0], None
 
 
+def _handle_collection(db, command) -> str | None:
+    """
+    The counter's half of the lifecycle: READY, COLLECTED, NOTCOLLECTED.
+
+    These are admin verbs - only the shop closes a self pickup - but the block
+    lived in the rider branch, which an admin never reaches, so the owner
+    typing COLLECTED 32 got the command list back. Shared from here so the
+    branch a command is parsed for is the branch that runs it.
+
+    Returns None when the command is not one of these, so a caller can fall
+    through to its own verbs.
+    """
+    act = command.action
+    if act not in ("STAFF_COLLECTED", "STAFF_NOT_COLLECTED", "STAFF_READY"):
+        return None
+
+    order = db.query(Order).filter(Order.id == command.order_id).first()
+    if not order:
+        return f"Order #{command.order_id} not found."
+
+    if act == "STAFF_COLLECTED":
+        if not order.is_pickup:
+            return (f"Order #{order.id} is a delivery, not a collection. "
+                    f"Use DELIVERED once it has been handed over.")
+        if order.status != OrderStatus.READY_FOR_PICKUP:
+            return f"Order #{order.id} is {order.status.value}. Only an order waiting to be collected can be closed this way."
+        update_order_status(db, order.id, StatusUpdate(status="COLLECTED"))
+        return f"Order #{order.id} - collected. The customer has been thanked."
+
+    if act == "STAFF_NOT_COLLECTED":
+        if not order.is_pickup or order.status != OrderStatus.READY_FOR_PICKUP:
+            return f"Order #{command.order_id} is not waiting to be collected."
+        update_order_status(db, order.id, StatusUpdate(status="NOT_COLLECTED"))
+        return (f"Order #{order.id} - recorded as not collected. The customer has been "
+                f"reminded. Reply READY {order.id} when they come for it.")
+
+    # STAFF_READY
+    if not order.is_pickup:
+        return f"Order #{order.id} is a delivery. Use APPROVE to send it out."
+    if order.status not in (OrderStatus.PACKAGED, OrderStatus.NOT_COLLECTED):
+        return f"Order #{order.id} is {order.status.value}."
+    update_order_status(db, order.id, StatusUpdate(status="READY_FOR_PICKUP"))
+    return f"Order #{order.id} - the customer has been told it is ready to collect."
+
+
 def _handle_admin(db, user, command):
     act = command.action
 
@@ -540,6 +585,10 @@ def _handle_admin(db, user, command):
             return f"Order #{order.id} is {order.status.value} and can no longer be cancelled."
         update_order_status(db, order.id, StatusUpdate(status="CANCELLED"))
         return f"Order #{order.id} cancelled."
+
+    collection = _handle_collection(db, command)
+    if collection:
+        return collection
 
     return wa_commands.help_text(user.role)
 
@@ -639,45 +688,9 @@ def _handle_rider(db, user, command):
         update_order_status(db, order.id, StatusUpdate(status="DELIVERED"))
         return f"Order #{order.id} - delivered successfully."
 
-    # ── Collection ──
-    # The counter's half of the lifecycle. Without these, a self-pickup order
-    # could only be closed from the website, so the shop's quickest channel
-    # had no way to say "they came and took it".
-    if act == "STAFF_COLLECTED":
-        order = db.query(Order).filter(Order.id == command.order_id).first()
-        if not order:
-            return f"Order #{command.order_id} not found."
-        if not order.is_pickup:
-            return (f"Order #{order.id} is a delivery, not a collection. "
-                    f"Use DELIVERED once it has been handed over.")
-        if order.status != OrderStatus.READY_FOR_PICKUP:
-            return f"Order #{order.id} is {order.status.value}. Only an order waiting to be collected can be closed this way."
-        if not order.handover_image:
-            return (f"Order #{order.id} needs a photo of the handover first. "
-                    f"Take it here: {SITE}/admin/orders")
-        update_order_status(db, order.id, StatusUpdate(status="COLLECTED"))
-        return f"Order #{order.id} - collected. The customer has been thanked."
-
-    if act == "STAFF_NOT_COLLECTED":
-        order = db.query(Order).filter(Order.id == command.order_id).first()
-        if not order:
-            return f"Order #{command.order_id} not found."
-        if not order.is_pickup or order.status != OrderStatus.READY_FOR_PICKUP:
-            return f"Order #{command.order_id} is not waiting to be collected."
-        update_order_status(db, order.id, StatusUpdate(status="NOT_COLLECTED"))
-        return (f"Order #{order.id} - recorded as not collected. The customer has been "
-                f"reminded. Reply READY {order.id} when they come for it.")
-
-    if act == "STAFF_READY":
-        order = db.query(Order).filter(Order.id == command.order_id).first()
-        if not order:
-            return f"Order #{command.order_id} not found."
-        if not order.is_pickup:
-            return f"Order #{order.id} is a delivery. Use APPROVE to send it out."
-        if order.status not in (OrderStatus.PACKAGED, OrderStatus.NOT_COLLECTED):
-            return f"Order #{order.id} is {order.status.value}."
-        update_order_status(db, order.id, StatusUpdate(status="READY_FOR_PICKUP"))
-        return f"Order #{order.id} - the customer has been told it is ready to collect."
+    collection = _handle_collection(db, command)
+    if collection:
+        return collection
 
     return wa_commands.help_text(user.role)
 

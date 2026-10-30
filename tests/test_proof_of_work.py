@@ -74,17 +74,23 @@ def test_a_delivery_cannot_be_closed_without_a_handover_photo(db, customer, ride
     assert "photo" in str(e.value.detail).lower()
 
 
-def test_a_collection_cannot_be_closed_without_a_handover_photo(db, customer):
+def test_a_collection_closes_without_a_handover_photo(db, customer):
+    """
+    The counter is not the doorstep. The staff hand the cake over themselves,
+    with the customer standing there, so a photograph records nothing nobody
+    saw. Requiring one here had a worse effect than being pointless: the only
+    camera for a handover lives on the rider screen, a collection never
+    reaches a rider, so every pickup order was stuck at READY_FOR_PICKUP for
+    good.
+    """
     order = make_order(db, customer, status=OrderStatus.READY_FOR_PICKUP,
                        fulfilment=Fulfilment.PICKUP.value, with_proof=False)
+    assert order.handover_image is None
 
-    with pytest.raises(HTTPException) as e:
-        update_order_status(db, order.id, StatusUpdate(status="COLLECTED"))
+    update_order_status(db, order.id, StatusUpdate(status="COLLECTED"))
 
-    assert e.value.status_code == 400
-    assert "photo" in str(e.value.detail).lower()
-    # Worded for whoever is at the counter, not for a rider at a door.
-    assert "handing it over" in str(e.value.detail).lower()
+    db.refresh(order)
+    assert order.status == OrderStatus.COLLECTED
 
 
 def test_a_fully_evidenced_order_still_goes_all_the_way_through(db, customer, rider, baker):

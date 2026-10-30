@@ -368,11 +368,15 @@ def update_order_status(db: Session, order_id: int, data: StatusUpdate, rework: 
             detail=("This cake has not been checked yet. It needs to be approved "
                     "from the photo before it can be packed."),
         )
-    if new_status in (OrderStatus.DELIVERED, OrderStatus.COLLECTED) and not order.handover_image:
-        what = "handing it over" if order.is_pickup else "the delivery"
+    # Only a delivery. The rider is away from the shop and nobody there sees
+    # the handover, so the photo is the only record of it. A collection is
+    # handed across the counter by the staff themselves, in front of the
+    # customer - there is nothing a photograph adds, and demanding one left
+    # every pickup order with no way to be closed at all.
+    if new_status == OrderStatus.DELIVERED and not order.handover_image:
         raise HTTPException(
             status_code=400,
-            detail=f"Upload a photo of {what} before closing this order.",
+            detail="Upload a photo of the delivery before closing this order.",
         )
 
     # Nothing can go out for delivery without someone carrying it. This lived

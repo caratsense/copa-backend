@@ -242,8 +242,9 @@ def retry_delivery(
 #                    the cake can be offered for approval.
 #   proof_verified   Shriya looking at that shot and saying yes. Required
 #                    before the cake can be packed.
-#   handover_image   the doorstep, or the counter. Required before the order
-#                    can be closed as delivered or collected.
+#   handover_image   the doorstep. Required before a delivery can be closed,
+#                    because nobody at the shop sees it happen. A collection
+#                    is handed over the counter in person and needs no photo.
 
 
 @router.post("/{order_id}/proof", response_model=OrderRead)
@@ -372,11 +373,11 @@ def upload_handover_proof(
     db: Session = Depends(get_db),
 ):
     """
-    The handover shot - the doorstep for a delivery, the counter for a pickup.
+    The handover shot - the doorstep. Required before a delivery can be closed.
 
-    A rider may only do this for their own delivery. A collection has no rider,
-    so whoever is behind the counter takes it, which is why a baker and an
-    admin can too.
+    A rider may only do this for their own delivery. A collection does not need
+    one, but the shop may still record a counter handover if it wants to, which
+    is why a baker and an admin can post here too.
     """
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order:
