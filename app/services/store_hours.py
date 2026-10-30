@@ -252,6 +252,77 @@ def schedule_order_delivery(db: Session, requested_delivery_time: datetime | Non
         }
 
 
+# ── The dates and slots a customer may actually choose ──
+#
+# Derived here, from MIN_LEAD_HOURS and the shop's own opening hours, because
+# the WhatsApp bot was deciding this for itself and getting a different answer
+# from the website. The bot's earliest date was a hardcoded "Tomorrow", so a
+# cake the website would sell for collection at 7 PM today could not be ordered
+# for today at all over WhatsApp, and its three slots were offered whatever the
+# hour - "Morning (8 AM - 12 PM)" was still on the menu at 9 PM for the
+# following day only because the date had been pushed out a day to begin with.
+#
+# Named windows rather than a free time entry: a chat cannot validate "half
+# seven-ish", and the kitchen works in halves of the day anyway. Each carries
+# the hour the order is actually written down as.
+DELIVERY_SLOTS = (
+    {"key": 1, "label": "Morning (8 AM – 12 PM)", "hour": 10},
+    {"key": 2, "label": "Afternoon (12 PM – 4 PM)", "hour": 14},
+    {"key": 3, "label": "Evening (4 PM – 8 PM)", "hour": 18},
+)
+
+# How far ahead an order may be placed. Seven days matched the bot's old clamp.
+MAX_DAYS_AHEAD = 7
+
+
+def slots_for_date(db: Session, day: date, now: datetime | None = None) -> list[dict]:
+    """
+    The slots still bookable on `day`, soonest first.
+
+    A slot survives two tests: its hour falls inside the shop's opening hours,
+    and it is at least MIN_LEAD_HOURS away. The second is what lets today be
+    offered at all, and what stops it being offered once it is too late - the
+    same rule `check_delivery_lead_time` enforces when the order is submitted,
+    so the bot cannot offer a time the API will then refuse with a 422.
+    """
+    opens, closes = _get_hours(db)
+    earliest = earliest_delivery_time(now)
+
+    available = []
+    for slot in DELIVERY_SLOTS:
+        at = datetime.combine(day, time(slot["hour"], 0), tzinfo=IST)
+        if not (opens <= at.time() <= closes):
+            continue
+        if at < earliest:
+            continue
+        available.append({**slot, "at": at})
+    return available
+
+
+def delivery_date_options(db: Session, now: datetime | None = None) -> list[dict]:
+    """
+    The days a customer may choose, soonest first, each with its own slots.
+
+    A day with no bookable slot left is not offered. Today therefore drops off
+    the list by itself late in the evening instead of needing a rule of its own.
+    """
+    base = (now or datetime.now(IST)).astimezone(IST)
+    options = []
+    for offset in range(MAX_DAYS_AHEAD + 1):
+        day = (base + timedelta(days=offset)).date()
+        slots = slots_for_date(db, day, now=base)
+        if not slots:
+            continue
+        if offset == 0:
+            label = f"Today ({day.strftime('%d %b')})"
+        elif offset == 1:
+            label = f"Tomorrow ({day.strftime('%d %b')})"
+        else:
+            label = day.strftime("%a %d %b")
+        options.append({"date": day, "label": label, "slots": slots})
+    return options
+
+
 # ── Where to collect a self-pickup order ──────────────
 #
 # Not a hardcoded address. The shop's own address is the shop's to set, it is

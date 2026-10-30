@@ -3,6 +3,7 @@ Order Routes — complete with auth, payments, tracking, rider self-service.
 """
 
 from datetime import datetime, timezone
+from typing import Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
@@ -23,6 +24,7 @@ from app.services.order_service import (
     get_order, list_orders, get_user_orders, _enrich_order,
 )
 from app.services.assignment_engine import auto_assign_rider, rider_self_accept
+from app.services.event_service import emit_event
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
 
@@ -269,8 +271,11 @@ def upload_bake_proof(
     order.proof_image = save_image(file, prefix=f"bake_{order_id}")
     order.proof_verified_at = None
     order.proof_verified_by = None
-    db.add(OrderEvent(order_id=order.id, event_type="BAKE_PROOF_UPLOADED",
-                      description=f"{user.name or 'Baker'} photographed the finished cake"))
+    emit_event(db, order.id, "BAKE_PROOF_UPLOADED", {
+        "by": user.name or "Baker",
+        "by_id": user.id,
+        "note": f"{user.name or 'Baker'} photographed the finished cake",
+    })
     db.commit()
     db.refresh(order)
 
@@ -302,8 +307,11 @@ def verify_bake_proof(
 
     order.proof_verified_at = datetime.now(timezone.utc)
     order.proof_verified_by = user.id
-    db.add(OrderEvent(order_id=order.id, event_type="BAKE_PROOF_VERIFIED",
-                      description=f"{user.name or 'Admin'} checked the photo and approved the cake"))
+    emit_event(db, order.id, "BAKE_PROOF_VERIFIED", {
+        "by": user.name or "Admin",
+        "by_id": user.id,
+        "note": f"{user.name or 'Admin'} checked the photo and approved the cake",
+    })
     db.commit()
     db.refresh(order)
     _enrich_order(order)
@@ -336,8 +344,12 @@ def reject_bake_proof(
     order.proof_image = None
     order.proof_verified_at = None
     order.proof_verified_by = None
-    db.add(OrderEvent(order_id=order.id, event_type="BAKE_PROOF_REJECTED",
-                      description=f"Sent back by {user.name or 'Admin'}: {data.reason}"))
+    emit_event(db, order.id, "BAKE_PROOF_REJECTED", {
+        "by": user.name or "Admin",
+        "by_id": user.id,
+        "reason": data.reason,
+        "note": f"Sent back by {user.name or 'Admin'}: {data.reason}",
+    })
     db.commit()
 
     # Back to the bench if it had already been offered for approval. If it is
@@ -377,12 +389,83 @@ def upload_handover_proof(
         raise HTTPException(status_code=400, detail="This order is closed")
 
     order.handover_image = save_image(file, prefix=f"handover_{order_id}")
-    db.add(OrderEvent(
-        order_id=order.id, event_type="HANDOVER_PHOTOGRAPHED",
-        description=("Photographed at the counter" if order.is_pickup
-                     else f"Photographed at the door by {user.name or 'the rider'}"),
-    ))
+    emit_event(db, order.id, "HANDOVER_PHOTOGRAPHED", {
+        "by": user.name or "Staff",
+        "by_id": user.id,
+        "at": "counter" if order.is_pickup else "door",
+        "note": ("Photographed at the counter" if order.is_pickup
+                 else f"Photographed at the door by {user.name or 'the rider'}"),
+    })
     db.commit()
     db.refresh(order)
     _enrich_order(order)
     return order
+
+
+# ─── CUSTOMER CANCELLATION ────────────────────────────
+
+class CancelReason(BaseModel):
+    """Optional, and free text. Most people will not give one."""
+    reason: Optional[str] = Field(default=None, max_length=300)
+
+
+@router.post("/{order_id}/cancel", response_model=OrderRead)
+def cancel_own_order(
+    order_id: int,
+    data: CancelReason | None = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    The customer calls off their own order.
+
+    There was no way to do this. CANCELLED existed as a status and the admin
+    table could set it, but a customer looking at an order they no longer
+    wanted had one button on the page and it said Pay. The only way out was to
+    not pay and leave it sitting there, which is indistinguishable from a
+    payment that failed - so the shop could not tell an abandoned order from a
+    cancelled one, and neither could the customer.
+
+    Two limits, both deliberate:
+
+    - Unpaid only. Cancelling a paid order is a refund, and a refund is the
+      shop's decision and PayU's API, not a button. A paid customer is pointed
+      at the shop, and an admin can still cancel from the admin table.
+    - Before the kitchen commits. Once a baker has been assigned, ingredients
+      are out and the cake is someone's afternoon. RECEIVED and CONFIRMED are
+      the two states where nothing has been started yet.
+
+    Routed through update_order_status rather than setting the column here, so
+    the cancellation emits its event, broadcasts, and notifies the same way
+    every other transition does.
+    """
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    # An admin cancelling on a customer's behalf goes through the admin table,
+    # which has no such limits. This endpoint is the customer's own.
+    if order.user_id != user.id and user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="This is not your order")
+
+    if order.status == OrderStatus.CANCELLED:
+        # Already done. Saying so beats a 400 on a second tap or a stale page.
+        _enrich_order(order)
+        return order
+
+    if order.payment_status == PaymentStatus.PAID:
+        raise HTTPException(
+            status_code=400,
+            detail=("This order is already paid for, so cancelling it means a refund. "
+                    "Please contact the shop and we'll sort it out for you."),
+        )
+
+    if order.status not in (OrderStatus.RECEIVED, OrderStatus.CONFIRMED):
+        raise HTTPException(
+            status_code=400,
+            detail=("We've already started making this one, so it can't be cancelled "
+                    "here. Please contact the shop."),
+        )
+
+    reason = (data.reason if data else None) or "Cancelled by the customer"
+    return update_order_status(db, order.id, StatusUpdate(status="CANCELLED", reason=reason))

@@ -140,3 +140,35 @@ def test_the_assign_rider_endpoint_refuses_a_collection(db, client, customer, ri
     assert "self pickup" in res.json()["detail"].lower()
     db.refresh(order)
     assert order.assigned_rider_id is None
+
+
+# ─── WHAT THE CUSTOMER IS SHOWN ───────────────────────
+
+def test_the_customer_tracking_view_says_it_is_a_collection(db, client, customer):
+    """
+    The order page reads /orders/track/{id}, not /orders/{id}.
+
+    fulfilment was added to OrderRead only, so the admin table knew an order
+    was a collection and the customer's own page did not - it showed them
+    "Delivery" with an empty "Where", which is the confusion this column
+    exists to end.
+    """
+    from tests.conftest import auth
+
+    order = make_order(db, customer, status=OrderStatus.READY_FOR_PICKUP,
+                       fulfilment=Fulfilment.PICKUP.value)
+
+    res = client.get(f"/orders/track/{order.id}", headers=auth(customer))
+
+    assert res.status_code == 200, res.text
+    assert res.json()["fulfilment"] == "PICKUP"
+
+
+def test_the_customer_tracking_view_defaults_to_delivery(db, client, customer):
+    from tests.conftest import auth
+
+    order = make_order(db, customer, status=OrderStatus.PACKAGED)
+
+    res = client.get(f"/orders/track/{order.id}", headers=auth(customer))
+
+    assert res.json()["fulfilment"] == "DELIVERY"

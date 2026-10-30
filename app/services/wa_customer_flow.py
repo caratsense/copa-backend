@@ -5,7 +5,7 @@ Customer WhatsApp Flow — Professional, Conversational
 import json
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 from app.db import SessionLocal
@@ -17,6 +17,7 @@ from app.models.order import Order
 from app.services.gemini_parser import parse_message
 from app.schemas import ItemCustomization
 from app.services.pricing_engine import calculate_item_price
+from app.services.store_hours import delivery_date_options, slots_for_date
 from app.services import wa_escalation
 from app.config import get_settings
 settings = get_settings()
@@ -86,7 +87,61 @@ def _clear_state(phone):
     else: _memory.pop(phone, None)
 
 
-DATE_PROMPT = "*Delivery date:*\n\n1. Tomorrow\n2. Day after tomorrow\n3. 3 days from now"
+def _date_prompt(db) -> tuple[str, list[dict]]:
+    """
+    The date question, built from the days the kitchen can actually meet.
+
+    This was a constant reading "1. Tomorrow / 2. Day after tomorrow / 3. 3
+    days from now". It never named a date, so there was nothing to check it
+    against, and it ruled out same-day entirely while the website was selling
+    it - five hours' notice is the whole rule, so a cake ordered at eleven in
+    the morning can go out the same evening.
+
+    Returns the text and the options behind it, so the reply can be resolved
+    against the same list the customer was shown rather than re-derived.
+    """
+    options = delivery_date_options(db)
+    if not options:
+        return ("", [])
+    lines = ["*Delivery date:*\n"]
+    for i, o in enumerate(options, 1):
+        lines.append(f"{i}. {o['label']}")
+    return ("\n".join(lines), options)
+
+
+def _slot_prompt(slots: list[dict]) -> str:
+    """The time question for one date, listing only what is still bookable."""
+    lines = ["*Preferred time:*\n"]
+    for i, s in enumerate(slots, 1):
+        lines.append(f"{i}. {s['label']}")
+    return "\n".join(lines)
+
+
+# Said when every slot for the next week is gone, which in practice means the
+# shop is closed and it is late. Better than an empty numbered list.
+NO_DATES = ("We're not taking orders for collection or delivery just now. "
+            "Please try again tomorrow, or order online at ")
+
+
+def _go_to_dates(db, phone: str, state: dict) -> str:
+    """
+    Ask for the date, and remember what was offered.
+
+    Three steps arrive here - pickup, delivery with no zones configured, and
+    delivery once a zone is chosen - so the list is built once and stored on
+    the conversation. The reply is then resolved against what the customer was
+    actually shown, which matters because the list shortens as the day goes on:
+    deriving the date again from the number would land on a different day for
+    anyone who answered slowly.
+    """
+    text, options = _date_prompt(db)
+    if not options:
+        _clear_state(phone)
+        return NO_DATES + SITE
+    _set_state(phone, {**state, "step": "SELECT_DATE",
+                       "date_options": [{"date": o["date"].isoformat(),
+                                         "label": o["label"]} for o in options]})
+    return text
 
 
 def _is_per_kg(product: Optional[dict]) -> bool:
@@ -177,15 +232,20 @@ def _ask_for_flavor(db, phone: str, state: dict, header: str) -> str:
     # the rupee test cake, which is where this was finally seen. Worse than
     # noise: several of those flavours carry a surcharge, so it invited the
     # customer to add ₹250 to something nobody would flavour, and the kitchen
-    # would receive an instruction it cannot honour. Nothing to write on it
-    # either, so the message step goes with it.
+    # would receive an instruction it cannot honour.
+    #
+    # Only the flavour is skipped. This jumped to the address as well, which
+    # took the message step with it on the way past - but a message is piped
+    # onto the cake after it is baked, so it applies to a fixed-price cake
+    # exactly as much as to a made-to-order one, and the website asks every
+    # customer for one. Going to CAKE_MESSAGE keeps the two front doors asking
+    # the same questions.
     product = state.get("product") or {}
     if not product.get("is_customizable", True):
-        _set_state(phone, {**state, "step": "DELIVERY_ADDRESS",
-                           "flavor": {}, "cake_message": ""})
+        _set_state(phone, {**state, "step": "CAKE_MESSAGE", "flavor": {}})
         return (f"{header}\n\n"
-                "Please share your delivery address with a landmark.\n"
-                "For self-pickup, reply *pickup*.")
+                "Would you like a message on the cake?\n"
+                "Type your message or reply *skip*.")
 
     flavors = [{"id": f.id, "name": f.name, "extra_cost": f.extra_cost}
                for f in db.query(FlavorRule).filter(FlavorRule.is_active == True).all()][:10]
@@ -740,8 +800,7 @@ def _reply_to_customer(phone: str, message: str, user: Optional[User]) -> str:
             # the CONVERSATIONAL branch answers them and re-asks — and anything
             # the shop cannot price is caught before that, in code.
             if is_pickup:
-                _set_state(phone, {**state, "step": "SELECT_DATE", "address": "Self Pickup"})
-                return DATE_PROMPT
+                return _go_to_dates(db, phone, {**state, "address": "Self Pickup"})
 
             # Which area? The conversation never asked, so every WhatsApp
             # order was created with no zone at all - and a blank zone means
@@ -757,8 +816,7 @@ def _reply_to_customer(phone: str, message: str, user: Optional[User]) -> str:
             if not zones:
                 # Nothing configured to deliver to. Carry on rather than
                 # trapping the customer in a step they cannot answer.
-                _set_state(phone, {**state, "step": "SELECT_DATE", "address": addr})
-                return DATE_PROMPT
+                return _go_to_dates(db, phone, {**state, "address": addr})
 
             _set_state(phone, {
                 **state, "step": "SELECT_AREA", "address": addr,
@@ -797,22 +855,70 @@ def _reply_to_customer(phone: str, message: str, user: Optional[User]) -> str:
                 listing = "\n".join(f"{i}. {n}" for i, n in enumerate(options, 1))
                 return "Please pick your area by number:\n\n" + listing
 
-            _set_state(phone, {**state, "step": "SELECT_DATE",
-                               "delivery_zone": options[choice - 1]})
-            return DATE_PROMPT
+            return _go_to_dates(db, phone, {**state,
+                                            "delivery_zone": options[choice - 1]})
 
         # ─── DATE ────────────────────────────
         if step == "SELECT_DATE":
-            val = action.get("value", 1) if act == "SELECT_OPTION" else 1
-            d = datetime.now() + timedelta(days=max(1, min(val, 7)))
-            _set_state(phone, {**state, "step": "SELECT_TIME", "delivery_date": d.strftime("%Y-%m-%d"), "delivery_date_display": d.strftime("%d %b %Y")})
-            return "*Preferred time:*\n\n1. Morning (8 AM – 12 PM)\n2. Afternoon (12 PM – 4 PM)\n3. Evening (4 PM – 8 PM)"
+            offered = state.get("date_options") or []
+            if not offered:
+                # As above: an in-flight conversation that was asked the old
+                # hardcoded question. Ask again from a real list.
+                return _go_to_dates(db, phone, state)
+
+            val = action.get("value", 0) if act == "SELECT_OPTION" else 0
+            # Out of range is re-asked rather than clamped. `max(1, min(val, 7))`
+            # silently turned a 9 into a week away and a 0 into tomorrow, so a
+            # mistyped number booked a date nobody picked and the summary was
+            # the first the customer heard of it.
+            if not 1 <= val <= len(offered):
+                listing = "\n".join(f"{i}. {o['label']}"
+                                    for i, o in enumerate(offered, 1))
+                return f"Please pick a date by number:\n\n{listing}"
+
+            chosen = offered[val - 1]
+            day = date.fromisoformat(chosen["date"])
+            slots = slots_for_date(db, day)
+            if not slots:
+                # The last slot on that day went while the customer was
+                # choosing. Re-ask from a freshly built list.
+                return _go_to_dates(db, phone, state)
+
+            _set_state(phone, {**state, "step": "SELECT_TIME",
+                               "delivery_date": chosen["date"],
+                               "delivery_date_display": day.strftime("%d %b %Y"),
+                               "time_options": [{"label": s["label"], "hour": s["hour"]}
+                                                for s in slots]})
+            return _slot_prompt(slots)
 
         # ─── TIME → SUMMARY ──────────────────
         if step == "SELECT_TIME":
-            val = action.get("value", 2) if act == "SELECT_OPTION" else 2
-            hours = {1: 10, 2: 14, 3: 18}.get(val, 14)
-            time_label = {1: "Morning (8 AM – 12 PM)", 2: "Afternoon (12 PM – 4 PM)", 3: "Evening (4 PM – 8 PM)"}.get(val, "Afternoon")
+            offered = state.get("time_options") or []
+            if not offered:
+                # A conversation that reached this step before the slots were
+                # computed up front - one already in flight across a deploy -
+                # has a date but no list. Rebuild it from that date rather
+                # than re-asking with nothing in it.
+                try:
+                    offered = [{"label": s["label"], "hour": s["hour"]}
+                               for s in slots_for_date(
+                                   db, date.fromisoformat(state["delivery_date"]))]
+                except (KeyError, TypeError, ValueError):
+                    offered = []
+                if not offered:
+                    return _go_to_dates(db, phone, state)
+
+            val = action.get("value", 0) if act == "SELECT_OPTION" else 0
+            # Was `.get(val, 14)`, so anything unrecognised became the
+            # afternoon - including a slot that had already been filtered out
+            # for being too soon, which is how an order could be booked inside
+            # the five hours the kitchen needs.
+            if not 1 <= val <= len(offered):
+                return f"Please pick a time by number:\n\n" + "\n".join(
+                    f"{i}. {o['label']}" for i, o in enumerate(offered, 1))
+
+            hours = offered[val - 1]["hour"]
+            time_label = offered[val - 1]["label"]
 
             product = state.get("product", {})
             size = state.get("size") or {}
@@ -842,7 +948,12 @@ def _reply_to_customer(phone: str, message: str, user: Optional[User]) -> str:
             # back on a fixed-price line.
             if size.get("name") and _needs_size(product):
                 summary += f"Size: {size['name']}\n"
-            summary += f"Flavor: {flavor.get('name', 'Classic')}\n"
+            # Same gate as the size line above. A fixed-price product is never
+            # asked for a flavour, so printing one states a choice the customer
+            # did not make - the summary read "Flavor: Classic" against the
+            # rupee test cake, naming a flavour the shop does not sell.
+            if flavor.get("name"):
+                summary += f"Flavor: {flavor['name']}\n"
             if cake_msg:
                 summary += f"Message: \"{cake_msg}\"\n"
             summary += (
@@ -884,7 +995,18 @@ def _reply_to_customer(phone: str, message: str, user: Optional[User]) -> str:
                         # SizeRule - harmless at a 1.0 multiplier, but it wrote
                         # a weight onto the order line for something never sold
                         # by weight, and every staff screen then showed it.
-                        customization={"size": size.get("name") or "", "flavor": flavor.get("name", "Classic"),
+                        # `or ""` rather than a default flavour name. "Classic"
+                        # sat here as a fallback that nothing could reach while
+                        # the bot asked every customer to pick a flavour. Once
+                        # fixed-price products skipped that step the fallback
+                        # became live, and there is no FlavorRule called
+                        # Classic - so the engine refused the whole order with
+                        # "Unknown flavour: 'Classic'" and the customer was told
+                        # we couldn't process it. Blank is the value the engine
+                        # documents for "not chosen", and it is what _quote has
+                        # always sent, which is why the quote succeeded and only
+                        # the order failed.
+                        customization={"size": size.get("name") or "", "flavor": (flavor or {}).get("name") or "",
                             # The WhatsApp conversation never asks about design
                             # or rush, so it must not assert values for them.
                             # Both were hardcoded to zero-cost rule names, which

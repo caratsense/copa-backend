@@ -307,8 +307,12 @@ def test_selecting_a_fixed_price_product_skips_size_and_flavour(db, catalogue, b
 
     assert "Select size:" not in reply, "asked how many kilos of brownie"
     assert "Select flavor:" not in reply, "offered flavours for a brownie"
+    # The message is still asked. The skip originally jumped straight to the
+    # address and took this step with it, so a fixed-price cake could not be
+    # given a message at all - while the website asks everybody for one.
+    assert "message on the cake" in reply.lower()
     state = wcf._get_state("919222222222")
-    assert state["step"] == "DELIVERY_ADDRESS"
+    assert state["step"] == "CAKE_MESSAGE"
     assert state["size"] is None
     assert "/kg" not in reply
 
@@ -536,9 +540,10 @@ def test_picking_an_option_carries_its_label_into_the_conversation(db, catalogue
 
     assert "Size: *700g*" in reply
     assert wcf._get_state(PHONE)["size"]["name"] == "700g"
-    # Size is the only thing a named menu cake is asked. The flavour is the
-    # cake, so the conversation goes straight on to where it is going.
-    assert wcf._get_state(PHONE)["step"] == "DELIVERY_ADDRESS"
+    # Size is the only *pricing* choice a named menu cake is asked - the
+    # flavour is the cake. The message still gets asked, because a message is
+    # piped on after baking and has nothing to do with how the cake is priced.
+    assert wcf._get_state(PHONE)["step"] == "CAKE_MESSAGE"
 
 
 def test_an_unmatched_size_is_refused_rather_than_defaulted(db, catalogue, blueberry):

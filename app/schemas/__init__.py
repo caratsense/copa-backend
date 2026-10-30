@@ -695,6 +695,12 @@ class OrderTrackingRead(BaseModel):
     total_price: float
     delivery_address: Optional[str]
     delivery_time: Optional[datetime]
+    # The customer's own page reads this endpoint, not OrderRead, so leaving
+    # fulfilment off it meant the one person who most needs to know they are
+    # collecting could not be told. Their order said "Delivery" with an empty
+    # "Where", which is the exact confusion the fulfilment column was added to
+    # end - the database had it right and the page still said otherwise.
+    fulfilment: str = "DELIVERY"
     payment_status: str
     payment_method: Optional[str] = "ONLINE"
     rider_name: Optional[str] = None
