@@ -30,6 +30,7 @@ from app.models.cake_enquiry import CakeEnquiry
 from app.models.pricing import AddonRule, DesignRule, FlavorRule, RushRule, SizeRule
 from app.models.product import Product
 from app.models.user import User
+from app.services.pricing_engine import MIN_CUSTOM_CAKE_KG
 from app.schemas import (
     AddonRuleRead, BuildFlavorRead, BuildOptionsRead, BuildSizeRead,
     CakeEnquiryCreate, CakeEnquiryRead, DesignRuleRead, EnquiryImageRead,
@@ -42,6 +43,13 @@ router = APIRouter(prefix="/build-a-cake", tags=["Build a Cake"])
 # it; the size table is trimmed to match by scripts/setup_build_a_cake.py, so
 # an oversized cake is unorderable by the pricing engine too, not just here.
 MAX_ORDERABLE_KG = 3.5
+
+# And below this a cake is not customised at all - there is not enough of it to
+# carry a design. Imported from the pricing engine, which refuses a smaller one
+# outright, so the sizes offered here and the sizes that can actually be bought
+# come from the same number. The catalogue's own per-kg cakes keep their 500g;
+# this floor applies only to the builder's sponge rows.
+MIN_ORDERABLE_KG = MIN_CUSTOM_CAKE_KG
 
 # The product each sponge is priced from. The premium products are deliberately
 # absent: a premium cake is the base sponge plus a premium flavour's surcharge
@@ -114,7 +122,9 @@ def build_options(db: Session = Depends(get_db)):
     )
     sizes = (
         db.query(SizeRule)
-        .filter(SizeRule.is_active == True, SizeRule.multiplier <= MAX_ORDERABLE_KG)
+        .filter(SizeRule.is_active == True,
+                SizeRule.multiplier >= MIN_ORDERABLE_KG,
+                SizeRule.multiplier <= MAX_ORDERABLE_KG)
         .order_by(SizeRule.multiplier.asc())
         .all()
     )

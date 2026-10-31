@@ -434,3 +434,99 @@ def test_llm_is_not_consulted_for_staff_commands(client, db, wa_secret, monkeypa
     assert post(client, message("please finish it up mate", "919111111111")).status_code == 200
     db.refresh(order)
     assert order.status == OrderStatus.IN_PRODUCTION
+
+
+# ─── 12. THE WORK HAPPENS AFTER THE RESPONSE ─────────
+# Handling one message makes up to five blocking HTTP calls - fetching a voice
+# note, downloading it, transcribing it, asking the language model, sending the
+# reply. This ran inline in an `async def` route, which means it ran on the
+# event loop, which the server has exactly one of: a single voice note could
+# stall the whole backend - the website too - for over a minute.
+#
+# TestClient drains background tasks before it returns, so no test that posts
+# to the endpoint can tell the two shapes apart. These call the route function
+# directly and look at what it did with the message.
+
+class _FakeRequest:
+    """A minimal stand-in for the Request the route reads."""
+
+    def __init__(self, body: bytes, secret: str):
+        self._body = body
+        self.headers = {"x-hub-signature-256": sign(body, secret)}
+
+    async def body(self) -> bytes:
+        return self._body
+
+
+def _signed_request(payload: dict, secret: str = "test-app-secret"):
+    return _FakeRequest(json.dumps(payload).encode(), secret)
+
+
+def test_a_message_is_queued_not_handled_on_the_request_path(wa_secret, monkeypatch):
+    """The route must return without having done any of the work."""
+    import asyncio
+    from fastapi import BackgroundTasks
+
+    from app.api.routes import webhook as wh
+
+    called = []
+    monkeypatch.setattr(wh, "_process_message", lambda msg: called.append(msg) or "ok")
+
+    background = BackgroundTasks()
+    result = asyncio.run(wh.receive_whatsapp(
+        _signed_request(message("QUEUE", "919000000001")), background))
+
+    assert result["status"] == "ok"
+    assert called == [], "the message was handled on the event loop"
+    assert len(background.tasks) == 1, "the message was not queued either"
+
+    # And the queued task does the work when it is run.
+    asyncio.run(background())
+    assert len(called) == 1
+
+
+def test_every_message_in_a_batch_is_queued(wa_secret, monkeypatch):
+    """Meta batches. Queuing must not drop the siblings the old loop handled."""
+    import asyncio
+    from fastapi import BackgroundTasks
+
+    from app.api.routes import webhook as wh
+
+    monkeypatch.setattr(wh, "_process_message", lambda msg: "ok")
+
+    payload = {"entry": [{"changes": [{"value": {"messages": [
+        {"id": "wamid.A", "from": "919000000001", "type": "text", "text": {"body": "one"}},
+        {"id": "wamid.B", "from": "919000000002", "type": "text", "text": {"body": "two"}},
+    ]}}]}]}
+
+    background = BackgroundTasks()
+    result = asyncio.run(wh.receive_whatsapp(_signed_request(payload), background))
+
+    assert result["handled"] == 2
+    assert len(background.tasks) == 2
+
+
+def test_one_failing_message_does_not_take_its_siblings_with_it(wa_secret, monkeypatch):
+    """
+    The old loop caught per message. A background task raises into Starlette
+    instead, which would abandon the rest of the batch, so the wrapper has to
+    swallow it the same way.
+    """
+    import asyncio
+
+    from app.api.routes import webhook as wh
+
+    handled = []
+
+    def boom(msg):
+        if msg.get("id") == "wamid.A":
+            raise RuntimeError("kaboom")
+        handled.append(msg["id"])
+        return "ok"
+
+    monkeypatch.setattr(wh, "_process_message", boom)
+
+    wh._handle_one_message({"id": "wamid.A"})      # must not raise
+    wh._handle_one_message({"id": "wamid.B"})
+
+    assert handled == ["wamid.B"]

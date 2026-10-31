@@ -21,7 +21,7 @@ import string
 import time
 from typing import Optional
 
-from fastapi import APIRouter, Request, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Request, HTTPException
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
 
@@ -164,13 +164,27 @@ def _find_user_by_phone(db: Session, sender: str) -> User | None:
 
 
 @router.post("/whatsapp")
-async def receive_whatsapp(request: Request):
+async def receive_whatsapp(request: Request, background: BackgroundTasks):
     """
     Meta inbound webhook.
 
     Always answers 200 once the signature checks out. Meta treats any non-2xx as
     a delivery failure and retries the whole batch, so a single unparseable
     event must not become a retry loop that re-runs the events beside it.
+
+    The messages themselves are handled AFTER the response, on a worker thread.
+    They used to run inline, and this coroutine is the event loop: handling one
+    message makes up to five blocking HTTP calls - fetching a voice note (10s),
+    downloading it (30s), transcribing it (30s), asking the language model
+    (10s) and sending the reply (15s). All of that ran on the only thread the
+    server has, so a single voice note could stop the entire backend, the
+    website included, for over a minute, and Meta - still waiting for its 200 -
+    retried the batch and made it worse.
+
+    Losing a queued message to a restart is the trade. It is the better one:
+    the de-duplication claim is an atomic Redis SET NX, so a Meta retry is
+    still only ever handled once, and a restart mid-batch costs one reply where
+    the old shape cost every customer on the site their page load.
     """
     raw = await request.body()
     if not _verify_signature(raw, request.headers.get("x-hub-signature-256")):
@@ -197,14 +211,29 @@ async def receive_whatsapp(request: Request):
                 _log_status_callback(_as_dict(st))
 
             for msg in _as_list(value.get("messages")):
-                try:
-                    _process_message(_as_dict(msg))
-                    handled += 1
-                except Exception as e:
-                    # One bad message must not abort its siblings or the batch.
-                    logger.error("[WA] Failed to process message: %s", e, exc_info=True)
+                background.add_task(_handle_one_message, _as_dict(msg))
+                handled += 1
 
     return {"status": "ok", "handled": handled}
+
+
+def _handle_one_message(msg: dict) -> None:
+    """
+    Run one message to completion off the request path.
+
+    Starlette runs a synchronous background task in its worker threadpool, so
+    the blocking HTTP calls inside stay off the event loop. Nothing may escape
+    here: an exception from a background task is logged by Starlette but one
+    bad message must not take its siblings with it, and the timing line is the
+    only measurement we have of how slow a real conversation turn is.
+    """
+    started = time.monotonic()
+    try:
+        status = _process_message(msg)
+    except Exception as e:
+        logger.error("[WA] Failed to process message: %s", e, exc_info=True)
+        status = "error"
+    logger.info("[WA] %s in %dms", status, int((time.monotonic() - started) * 1000))
 
 
 def _as_list(value) -> list:

@@ -22,7 +22,7 @@ Two details worth stating because they are easy to get wrong:
 
 from app.models.cake_enquiry import CakeEnquiry
 from app.models.pricing import AddonRule, DesignRule, FlavorRule, RushRule, SizeRule
-from app.models.product import Product
+from app.models.product import PRICING_ROW_TAG, Product
 from app.models.user import UserRole
 from app.schemas import ItemCustomization, OrderCreate, OrderItemCreate
 from app.services.order_service import create_order
@@ -56,18 +56,33 @@ def no_rate_limit(monkeypatch):
 
 @pytest.fixture
 def builder(db):
-    """The catalogue the builder reads, as setup_build_a_cake leaves it."""
+    """The catalogue the builder reads, as setup_build_a_cake leaves it.
+
+    The sponge rows carry PRICING_ROW_TAG because they do in production - all
+    four of them - and the 1kg floor keys on that tag. Without it here the
+    fixture would be a shop this code has never run against, and the floor
+    would go untested while passing.
+    """
     db.add_all([
         Product(name="Vanilla Base Cake", category="vanilla-base",
                 base_price=VANILLA_PER_KG, pricing_unit="kg",
-                is_customizable=True, is_available=True),
+                is_customizable=True, is_available=True,
+                tags=[PRICING_ROW_TAG]),
         Product(name="Chocolate Base Cake", category="chocolate-base",
                 base_price=CHOCOLATE_PER_KG, pricing_unit="kg",
-                is_customizable=True, is_available=True),
+                is_customizable=True, is_available=True,
+                tags=[PRICING_ROW_TAG]),
         # Present in the catalogue but NOT a sponge: premium is the base sponge
         # plus a premium flavour's surcharge.
         Product(name="Vanilla Premium Cake", category="vanilla-premium",
                 base_price=2250.0, pricing_unit="kg",
+                is_customizable=True, is_available=True,
+                tags=[PRICING_ROW_TAG]),
+        # An ordinary catalogue cake: per-kg, no options of its own, no tag.
+        # It is here to prove the 1kg floor does NOT reach it - the shop still
+        # sells this one at 500g.
+        Product(name="Tiramisu Cake", category="signature",
+                base_price=1800.0, pricing_unit="kg",
                 is_customizable=True, is_available=True),
     ])
     for name, mult in (("500g", 0.5), ("1kg", 1.0), ("1.5kg", 1.5), ("2kg", 2.0),
@@ -185,17 +200,18 @@ def test_an_unknown_sponge_is_rejected_not_answered_with_an_empty_list(client, d
 
 # ─── 3. SIZES AND PRICING ────────────────────────────
 
-def test_sizes_run_up_to_3_5kg_and_no_further(client, db, builder):
+def test_sizes_run_from_1kg_to_3_5kg_and_no_further(client, db, builder):
     sizes = _options(client)["sizes"]
 
     assert [s["name"] for s in sizes] == \
-        ["500g", "1kg", "1.5kg", "2kg", "2.5kg", "3kg", "3.5kg"]
+        ["1kg", "1.5kg", "2kg", "2.5kg", "3kg", "3.5kg"]
+    assert min(s["multiplier"] for s in sizes) == 1.0
     assert max(s["multiplier"] for s in sizes) == 3.5
     assert _options(client)["max_orderable_kg"] == 3.5
 
 
 @pytest.mark.parametrize("size,expected", [
-    ("500g", 1000.0), ("1kg", 2000.0), ("1.5kg", 3000.0),
+    ("1kg", 2000.0), ("1.5kg", 3000.0),
     ("2kg", 4000.0), ("2.5kg", 5000.0), ("3kg", 6000.0), ("3.5kg", 7000.0),
 ])
 def test_every_offered_size_prices_through_the_engine(client, db, builder, size, expected):
@@ -465,3 +481,76 @@ def test_the_window_closes_on_an_old_enquiry(client, db, builder):
                       files={"file": ("ref.png", PNG, "image/png")})
 
     assert res.status_code == 404
+
+
+# ─── 6. UNDER 1 KG IS NOT CUSTOMISED ─────────────────
+# A custom cake starts at 1kg - there is not enough cake below that to carry a
+# design. The catalogue's own per-kg cakes are a different question and still
+# sell at 500g, so the floor keys on PRICING_ROW_TAG rather than on the size
+# table, which the whole shop shares.
+
+def test_the_customiser_does_not_offer_500g(client, db, builder):
+    assert "500g" not in [s["name"] for s in _options(client)["sizes"]]
+
+
+def test_a_500g_custom_cake_cannot_be_priced(client, db, builder):
+    """Refused by the engine, not merely absent from a list."""
+    product = db.query(Product).filter(Product.name == "Vanilla Base Cake").first()
+
+    with pytest.raises(HTTPException) as exc:
+        calculate_item_price(db=db, product=product,
+                             customization=ItemCustomization(size="500g"))
+
+    assert exc.value.status_code == 400
+    assert "1kg" in str(exc.value.detail)
+
+
+def test_a_500g_custom_cake_cannot_be_ordered_even_by_posting_it_directly(client, db, builder):
+    """
+    The options list is a list. The cart posts a size string, so a 500g custom
+    cake would still be orderable by anyone who sent one if the only thing
+    stopping it were the UI.
+    """
+    product = db.query(Product).filter(Product.name == "Vanilla Base Cake").first()
+    user = make_user(db, "Priya", UserRole.CUSTOMER, phone="+919222222222")
+
+    with pytest.raises(HTTPException) as exc:
+        create_order(db, OrderCreate(user_id=user.id, items=[
+            OrderItemCreate(product_id=product.id, quantity=1,
+                            customization=ItemCustomization(size="500g"))]))
+
+    assert exc.value.status_code == 400
+
+
+def test_the_premium_sponge_row_is_covered_too(client, db, builder):
+    """All four pricing rows are the customiser, not just the two bases."""
+    product = db.query(Product).filter(Product.name == "Vanilla Premium Cake").first()
+
+    with pytest.raises(HTTPException) as exc:
+        calculate_item_price(db=db, product=product,
+                             customization=ItemCustomization(size="500g"))
+
+    assert exc.value.status_code == 400
+
+
+def test_a_catalogue_cake_still_sells_at_500g(client, db, builder):
+    """
+    The floor is the customiser's, not the shop's.
+
+    500g stays active in the shared size table because 22 ordinary per-kg
+    cakes are sold with it. Had this been done by switching that row off, every
+    one of them would have lost the size silently.
+    """
+    product = db.query(Product).filter(Product.name == "Tiramisu Cake").first()
+
+    breakdown = calculate_item_price(
+        db=db, product=product, customization=ItemCustomization(size="500g"))
+
+    assert breakdown.line_total == 900.0
+
+
+def test_500g_is_still_an_active_size_rule(client, db, builder):
+    """The rule table is untouched; only the builder's floor moved."""
+    row = db.query(SizeRule).filter(SizeRule.name == "500g").first()
+
+    assert row is not None and row.is_active is True

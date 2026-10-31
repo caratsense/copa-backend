@@ -27,11 +27,21 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
 
-from app.models.product import Product
+from app.models.product import Product, PRICING_ROW_TAG
 from app.models.product_option import ProductOption
 from app.models.pricing import SizeRule, FlavorRule, DesignRule, AddonRule, RushRule
 from app.models.delivery import DeliveryZone
 from app.schemas import ItemCustomization, PriceBreakdown, PricingRequest, PricingResponse
+
+# A customised cake starts at 1kg - there is not enough cake below that to
+# carry a design. Lives here rather than in the Build a Cake route because
+# this is where it is enforced; the route imports it so the list it offers and
+# the rule it is held to cannot drift apart.
+#
+# It applies only to products tagged PRICING_ROW_TAG, which are the builder's
+# four sponge rows and nothing else. The catalogue's own per-kg cakes are
+# untouched and still sell at 500g.
+MIN_CUSTOM_CAKE_KG = 1.0
 
 
 def _normalise(name: str | None) -> str:
@@ -179,6 +189,18 @@ def calculate_item_price(
     elif product.pricing_unit == "kg":
         option_label = _normalise(customization.size) and customization.size or ""
         size_row = _find_rule(db, SizeRule, customization.size, "size")
+        # The builder's sponge rows are not sold under 1kg. /build-a-cake/options
+        # already stops offering the smaller sizes, but that list is only a
+        # list: the cart posts a size string, so without this a 500g custom
+        # cake remains orderable by anyone who sends one.
+        if (size_row is not None
+                and PRICING_ROW_TAG in (product.tags or [])
+                and float(size_row.multiplier) < MIN_CUSTOM_CAKE_KG):
+            raise HTTPException(
+                status_code=400,
+                detail=(f"A customised cake starts at {MIN_CUSTOM_CAKE_KG:g}kg. "
+                        f"Choose 1kg or larger."),
+            )
         size_multiplier = float(size_row.multiplier) if size_row else 1.0
         size_adjusted = round(base_price * size_multiplier, 2)
     else:
