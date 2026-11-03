@@ -441,3 +441,40 @@ def test_the_menu_survives_a_refused_photograph(sent_messages, monkeypatch):
     kinds = [m.get("type") for m in sent_messages]
     assert "interactive" in kinds
     assert sent_messages[-1]["interactive"]["type"] == "list"
+
+
+def test_a_photograph_meta_already_holds_is_sent_by_id(sent_messages, monkeypatch):
+    """
+    Why this matters more than it looks.
+
+    Sent as a link, the picture is not delivered when the API accepts it:
+    Meta fetches the file first. A list needs no fetch, so it overtook the
+    photograph and every menu arrived ABOVE the picture introducing it. An
+    id means the file is already there and nothing has to be fetched.
+    """
+    from app.services import whatsapp_sender
+
+    monkeypatch.setattr(whatsapp_sender, "_upload_media", lambda url: "MEDIA123")
+
+    send_reply("919999999999",
+               "*Cookies*\n1. One — ₹1\n2. Two — ₹2\n"
+               "3. Three — ₹3\n4. Four — ₹4")
+
+    picture = sent_messages[0]
+    assert picture["type"] == "image"
+    assert picture["image"] == {"id": "MEDIA123"}
+    assert "link" not in picture["image"]
+    assert sent_messages[1]["interactive"]["type"] == "list"
+
+
+def test_a_failed_upload_still_sends_the_picture_as_a_link(sent_messages):
+    """
+    The fallback. It loses the ordering, which is bad, and not the picture,
+    which would be worse. sent_messages stubs the upload to None for every
+    test, so this is the path the rest of them take.
+    """
+    send_reply("919999999999",
+               "*Cookies*\n1. One — ₹1\n2. Two — ₹2\n"
+               "3. Three — ₹3\n4. Four — ₹4")
+
+    assert sent_messages[0]["image"]["link"].endswith("/wa/cookies.jpg")

@@ -181,6 +181,12 @@ def sent_messages(monkeypatch):
     from app.services import whatsapp_sender
 
     monkeypatch.setattr(whatsapp_sender, "_send", fake_send)
+    # Uploading a picture does not go through _send - it is a multipart POST
+    # to a different endpoint, and it fetches the file over the network
+    # first. Stubbed to "no id", which is the path where the picture is sent
+    # as a link, so the promise above holds: no test reaches Meta, and none
+    # reaches cakeoclock.co.in either.
+    monkeypatch.setattr(whatsapp_sender, "_upload_media", lambda url: None)
     return captured
 
 

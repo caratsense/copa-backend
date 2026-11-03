@@ -8,6 +8,7 @@ free-form text messages (within 24hr reply window).
 
 import httpx
 import logging
+import time
 from app.config import get_settings
 settings = get_settings()
 
@@ -133,6 +134,67 @@ def _clip_body(text: str, limit: int) -> str:
 _PRICE_SEPARATOR = " — "
 
 
+# ── Pictures Meta already holds ───────────────────────────────────────────
+#
+# A picture sent as a `link` is not delivered when the API accepts it: Meta
+# has to go and fetch the file from the URL first. A list message needs no
+# such fetch, so it overtakes the picture, and the menu arrived ABOVE the
+# photograph that was supposed to introduce it — every time, in both the
+# category and the product menus.
+#
+# Uploading the file once and sending its id removes the fetch from the send
+# path entirely. Meta keeps an uploaded asset for 30 days; these are cached
+# for 25, and re-uploaded lazily after that.
+#
+# The cache is a plain dict because the service runs one uvicorn worker, and
+# losing it to a restart costs sixteen uploads spread over the next sixteen
+# menus, not correctness.
+_MEDIA_TTL_SECONDS = 25 * 24 * 60 * 60
+_media_ids: dict[str, tuple[str, float]] = {}
+
+
+def _upload_media(url: str) -> str | None:
+    """
+    Give Meta the picture itself, and remember the id it hands back.
+
+    Returns None whenever anything at all goes wrong, because the caller's
+    fallback — sending the link and letting Meta fetch it — still delivers
+    the picture. It only loses the ordering.
+    """
+    if not (settings.WHATSAPP_ENABLED and settings.WHATSAPP_PHONE_ID and settings.WHATSAPP_TOKEN):
+        return None
+
+    cached = _media_ids.get(url)
+    if cached and (time.time() - cached[1]) < _MEDIA_TTL_SECONDS:
+        return cached[0]
+
+    try:
+        picture = httpx.get(url, timeout=15, follow_redirects=True)
+        if picture.status_code >= 400:
+            logger.warning("[WA] Could not fetch %s to upload: %s", url, picture.status_code)
+            return None
+
+        resp = httpx.post(
+            f"https://graph.facebook.com/{settings.WHATSAPP_API_VERSION}"
+            f"/{settings.WHATSAPP_PHONE_ID}/media",
+            headers={"Authorization": f"Bearer {settings.WHATSAPP_TOKEN}"},
+            data={"messaging_product": "whatsapp"},
+            files={"file": (url.rsplit("/", 1)[-1], picture.content, "image/jpeg")},
+            timeout=30,
+        )
+        media_id = (resp.json() or {}).get("id")
+        if not media_id:
+            logger.warning("[WA] Media upload refused for %s: %s", url, resp.text[:200])
+            return None
+
+        _media_ids[url] = (media_id, time.time())
+        logger.info("[WA] Uploaded %s as media %s", url.rsplit("/", 1)[-1], media_id)
+        return media_id
+    except Exception as exc:
+        logger.warning("[WA] Media upload failed for %s: %s", url, exc)
+        return None
+
+
 def send_image(to: str, url: str, caption: str = "") -> dict | None:
     """
     A photograph, as a message of its own.
@@ -146,7 +208,10 @@ def send_image(to: str, url: str, caption: str = "") -> dict | None:
     to be a JPEG or a PNG — the WebP the site serves is refused.
     """
     to = _normalise(to)
-    image: dict = {"link": url}
+    # An id if Meta already holds the file, a link if not. See _upload_media:
+    # the link costs the ordering, because Meta fetches it before delivering.
+    media_id = _upload_media(url)
+    image: dict = {"id": media_id} if media_id else {"link": url}
     if caption:
         image["caption"] = _clip_body(caption, BODY_LIMIT)
     return _send({

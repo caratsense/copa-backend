@@ -41,6 +41,7 @@ perfectly plausibly.
 
 import logging
 import re
+import time
 
 from app.config.settings import get_settings
 from app.services.whatsapp_sender import (
@@ -58,6 +59,17 @@ _OPTION = re.compile(r"^\s*(\d{1,2})[.)]\s+(\S.*)$")
 _DECORATION = re.compile(r"[*_~`]")
 
 MIN_OPTIONS = 2
+
+# How long to let a picture settle before the menu that follows it.
+#
+# Belt and braces rather than the fix. The fix is that the picture is sent
+# by media id, so Meta is not fetching a file while the menu sails past it
+# (see _upload_media). But nothing in the API promises that two messages
+# accepted a millisecond apart are delivered in that order, and the cost of
+# being wrong is the photograph appearing underneath the menu it introduces
+# — which is exactly what it did before. This runs on the threadpool, after
+# the webhook has already answered Meta, so it delays nobody.
+IMAGE_LEAD_SECONDS = 0.4
 
 # ── The picture that goes with a menu ─────────────────────────────────────
 #
@@ -213,8 +225,8 @@ def send_reply(to: str, text: str, menu_label: str = "Choose") -> None:
         # message of its own and WhatsApp stacks the two. If it is refused —
         # a 404, a format Meta will not take — the menu still goes out, which
         # is the half that matters.
-        if photo:
-            send_image(to, photo)
+        if photo and _looks_sent(send_image(to, photo)):
+            time.sleep(IMAGE_LEAD_SECONDS)
         if _looks_sent(send_list(to, body or text, menu_label, options)):
             return
         logger.warning("[WA] List refused for %s — falling back to text", to[-4:])
