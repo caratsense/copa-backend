@@ -279,7 +279,9 @@ def _choose(phone: str, product) -> str:
     deterministic as picking a number was.
     """
     handle_customer_message(phone, "order", None)
-    assert wcf._get_state(phone)["step"] == "SELECT_CATEGORY"
+    # The flow opens on the three groups now, not the categories: thirteen
+    # categories could not fit the ten rows an interactive list allows.
+    assert wcf._get_state(phone)["step"] == "SELECT_GROUP"
     return handle_customer_message(phone, product.name, None)
 
 

@@ -42,8 +42,9 @@ perfectly plausibly.
 import logging
 import re
 
+from app.config.settings import get_settings
 from app.services.whatsapp_sender import (
-    BUTTON_LIMIT, LIST_LIMIT, send_buttons, send_list, send_text,
+    BUTTON_LIMIT, LIST_LIMIT, send_buttons, send_image, send_list, send_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,48 @@ _OPTION = re.compile(r"^\s*(\d{1,2})[.)]\s+(\S.*)$")
 _DECORATION = re.compile(r"[*_~`]")
 
 MIN_OPTIONS = 2
+
+# ── The picture that goes with a menu ─────────────────────────────────────
+#
+# Every menu the flow writes opens with its own name in bold on the first
+# line — "*Cookies*", "*Cakes*", "*What are you looking for?*" — so the
+# message says which picture belongs with it without the flow having to be
+# changed to carry one. That is the same trick as the options themselves:
+# recover the structure at the send boundary rather than thread it through a
+# thousand lines of state machine.
+#
+# The files are written by the frontend's scripts/wa_photos.py and served
+# with the site. This list has to agree with that script's; a name here with
+# no file behind it costs one refused image and the menu still goes out.
+_WITH_A_PHOTO = frozenset({
+    "What are you looking for?",
+    "Cakes", "Bakes & Desserts", "Gifting & More",
+    "Chocolate Celebration Cakes", "Vanilla Celebration Cakes", "Cheesecakes",
+    "Desserts & Pudding Tubs", "Brownies", "Tea Cakes",
+    "Breads & Bun Collection", "Cookies", "Healthy Collection", "Dog Cakes",
+    "Gifting Collection", "Signature Collection",
+})
+
+_HEADING = re.compile(r"^\s*\*([^*\n]+)\*\s*$")
+
+
+def _slug(name: str) -> str:
+    out = "".join(c.lower() if c.isalnum() else "-" for c in name)
+    while "--" in out:
+        out = out.replace("--", "-")
+    return out.strip("-")
+
+
+def photo_for(text: str) -> str:
+    """The absolute URL of this menu's photograph, or "" if it has none."""
+    first = (text or "").lstrip().split("\n", 1)[0]
+    match = _HEADING.match(first)
+    if not match:
+        return ""
+    heading = match.group(1).strip()
+    if heading not in _WITH_A_PHOTO:
+        return ""
+    return f"{get_settings().PUBLIC_SITE_URL.rstrip('/')}/wa/{_slug(heading)}.jpg"
 
 
 def parse_options(text: str) -> tuple[str, list[tuple[str, str]]]:
@@ -141,19 +184,38 @@ def send_reply(to: str, text: str, menu_label: str = "Choose") -> None:
 
     body, options = parse_options(text)
 
+    photo = photo_for(text)
+
     if MIN_OPTIONS <= len(options) <= BUTTON_LIMIT:
         # The buttons say what the choices are, so repeating them above is
         # noise. But a body cannot be empty, so if stripping the menu left
         # nothing, keep the original.
-        if _looks_sent(send_buttons(to, body or text, options)):
+        # A button message can carry the picture itself, in its header.
+        if _looks_sent(send_buttons(to, body or text, options, image_url=photo)):
+            return
+        # A refused header should not cost the customer the buttons as well.
+        if photo and _looks_sent(send_buttons(to, body or text, options)):
+            logger.warning("[WA] Header image refused for %s - buttons sent without it", to[-4:])
             return
         logger.warning("[WA] Buttons refused for %s — falling back to text", to[-4:])
 
     elif BUTTON_LIMIT < len(options) <= LIST_LIMIT:
-        # A list hides its rows behind a tap, so the body KEEPS the numbered
-        # lines: the customer should be able to see what is on offer without
-        # opening anything, and can still simply type a number.
-        if _looks_sent(send_list(to, text, menu_label, options)):
+        # The rows ARE the menu, so the body is the question and nothing else.
+        #
+        # This used to pass the untouched `text`, on the reasoning that a list
+        # hides its options behind a tap and the customer should be able to
+        # read them without opening anything. That reasoning was wrong twice
+        # over: WhatsApp renders a body as one flowing paragraph, so six cakes
+        # and their prices arrived as an unbroken wall of words with a Choose
+        # button stranded underneath it, and the same six were one tap away in
+        # a clean list the whole time. The question alone is the message.
+        # A list's header is text-only, so the picture goes ahead of it as a
+        # message of its own and WhatsApp stacks the two. If it is refused —
+        # a 404, a format Meta will not take — the menu still goes out, which
+        # is the half that matters.
+        if photo:
+            send_image(to, photo)
+        if _looks_sent(send_list(to, body or text, menu_label, options)):
             return
         logger.warning("[WA] List refused for %s — falling back to text", to[-4:])
 

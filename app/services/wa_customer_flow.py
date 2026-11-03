@@ -313,6 +313,13 @@ def _catalogue(db) -> list[dict]:
     for p in rows:
         if p.is_pricing_row or p.is_placeholder:
             continue
+        # The internal test cake, and anything else tagged the same way. It is
+        # a real row at a real ₹1 so payments can be exercised end to end,
+        # which is exactly why it must never be offered: the bot was showing
+        # customers a thirteenth category called "Internal Testing" holding a
+        # cake they could have bought for a rupee.
+        if INTERNAL_TAG in (p.tags or []):
+            continue
         section = p.section
         # A category hidden on the website is hidden here too. When Chocolate
         # Celebration Cakes was switched off in the admin, the site stopped
@@ -336,6 +343,78 @@ def _catalogue(db) -> list[dict]:
     return out
 
 
+# Products carrying this are internal and never offered. See _catalogue.
+INTERNAL_TAG = "internal"
+
+
+# ── The three groups the order flow opens with ────────────────────
+#
+# WhatsApp caps an interactive list at ten rows across all its sections, and
+# the shop has thirteen categories. So the opening menu could not be a list at
+# all — it fell through to plain text, and the first thing every customer saw
+# was a numbered wall with nothing on it to tap.
+#
+# Three groups fit in buttons, which is also the one interactive type Meta
+# allows a photograph on, and every list underneath them is well inside ten.
+#
+# The last group deliberately names nothing. It is the catch-all, so a section
+# added to the catalogue tomorrow appears there instead of vanishing from the
+# bot because nobody remembered to edit this list.
+GROUPS: list[tuple[str, tuple[str, ...]]] = [
+    ("Cakes", (
+        "Chocolate Celebration Cakes",
+        "Vanilla Celebration Cakes",
+        "Cheesecakes",
+        "Tea Cakes",
+        "Dog Cakes",
+        "Signature Collection",
+    )),
+    ("Bakes & Desserts", (
+        "Desserts & Pudding Tubs",
+        "Brownies",
+        "Cookies",
+        "Breads & Bun Collection",
+        "Healthy Collection",
+    )),
+    ("Gifting & More", ()),
+]
+
+
+def _categories_for(products: list[dict], group: str) -> list[tuple[str, list[dict]]]:
+    """The (category, products) pairs inside one group, in menu order."""
+    spoken_for = {name for _, names in GROUPS for name in names}
+    wanted = dict(GROUPS).get(group)
+    if wanted is None:
+        return []
+    return [
+        (name, items) for name, items in _by_section(products)
+        if (name in wanted if wanted else name not in spoken_for)
+    ]
+
+
+def _live_groups(products: list[dict]) -> list[tuple[str, list[tuple[str, list[dict]]]]]:
+    """Only the groups with something in them today."""
+    out = []
+    for group, _ in GROUPS:
+        pairs = _categories_for(products, group)
+        if pairs:
+            out.append((group, pairs))
+    return out
+
+
+def _group_prompt(products: list[dict]) -> tuple[str, list[str]]:
+    """The question that starts an order: three taps, not thirteen."""
+    groups = _live_groups(products)
+    lines = ["*What are you looking for?*\n"]
+    for i, (group, _pairs) in enumerate(groups, 1):
+        # No count here. A button title is capped at 20 characters and
+        # "Bakes & Desserts (28)" is 21, so the count pushed the name itself
+        # off the end of the button: "Bakes & Desserts (2…".
+        lines.append(f"{i}. {group}")
+    lines.append("\nTap one — or just type the cake you want.")
+    return "\n".join(lines), [group for group, _ in groups]
+
+
 def _by_section(products: list[dict]) -> list[tuple[str, list[dict]]]:
     """The catalogue grouped into the categories the menu already uses."""
     grouped: dict[str, list[dict]] = {}
@@ -344,7 +423,8 @@ def _by_section(products: list[dict]) -> list[tuple[str, list[dict]]]:
     return list(grouped.items())
 
 
-def _category_prompt(products: list[dict]) -> tuple[str, list[str]]:
+def _category_prompt(pairs: list[tuple[str, list[dict]]],
+                     group: str) -> tuple[str, list[str]]:
     """
     The question that starts an order, and the categories it offers.
 
@@ -353,12 +433,11 @@ def _category_prompt(products: list[dict]) -> tuple[str, list[str]]:
     category-first on the website for the same reason it should be here: a
     dozen choices is a question, sixty is a document.
     """
-    groups = _by_section(products)
-    lines = ["*What are you looking for?*\n"]
-    for i, (name, items) in enumerate(groups, 1):
+    lines = [f"*{group}*\n"]
+    for i, (name, items) in enumerate(pairs, 1):
         lines.append(f"{i}. {name} ({len(items)})")
-    lines.append("\nReply with a number — or just type the cake you want.")
-    return "\n".join(lines), [name for name, _ in groups]
+    lines.append("\nReply with a number. *0* goes back.")
+    return "\n".join(lines), [name for name, _ in pairs]
 
 
 def _product_prompt(phone: str, state: dict, category: str,
@@ -444,6 +523,7 @@ def _is_stale(state: dict) -> bool:
 # What the bot is waiting for at each step, for when something interrupts and
 # the customer needs putting back where they were.
 _STEP_QUESTION = {
+    "SELECT_GROUP": "what you are looking for",
     "SELECT_CATEGORY": "which part of the menu you are after",
     "SELECT_PRODUCT": "which cake you would like",
     "SELECT_SIZE": "the size",
@@ -670,15 +750,63 @@ def _reply_to_customer(phone: str, message: str, user: Optional[User]) -> str:
 
         # ─── START ORDER ─────────────────────
         if act == "START_ORDER":
-            prompt, categories = _category_prompt(products)
-            _set_state(phone, {"step": "SELECT_CATEGORY", "categories": categories})
+            prompt, groups = _group_prompt(products)
+            _set_state(phone, {"step": "SELECT_GROUP", "groups": groups})
             return prompt
+
+        # ─── SELECT GROUP ────────────────────
+        # Three choices, so this one goes out as buttons.
+        if step == "SELECT_GROUP":
+            groups = state.get("groups") or []
+            typed = message.strip()
+            choice = int(typed) if typed.isdigit() else (
+                action.get("value") if act == "SELECT_OPTION" else None)
+            chosen = None
+            if isinstance(choice, int) and 1 <= choice <= len(groups):
+                chosen = groups[choice - 1]
+            if chosen is None:
+                for name in groups:
+                    if name.lower() == typed.lower():
+                        chosen = name
+                        break
+
+            if chosen is not None:
+                pairs = _categories_for(products, chosen)
+                # A group holding a single category is a tap that asks
+                # nothing. Go straight to what is in it.
+                if len(pairs) == 1:
+                    name, items = pairs[0]
+                    return _product_prompt(phone, {**state, "group": chosen},
+                                           name, items)
+                prompt, categories = _category_prompt(pairs, chosen)
+                _set_state(phone, {"step": "SELECT_CATEGORY",
+                                   "group": chosen, "categories": categories})
+                return prompt
+
+            # Somebody who already knows what they want types the cake, not
+            # the part of the menu it lives in.
+            named = (action.get("name") if act == "SELECT_PRODUCT_BY_NAME" else None) or typed
+            direct = _match_product(products, named)
+            if direct is not None:
+                return _choose_product(db, phone, state, direct)
+
+            prompt, _ = _group_prompt(products)
+            return "Sorry, I did not catch that.\n\n" + prompt
 
         # ─── SELECT CATEGORY ─────────────────
         if step == "SELECT_CATEGORY":
             categories = state.get("categories") or []
+            group = state.get("group") or ""
             groups = dict(_by_section(products))
             typed = message.strip()
+
+            # Back to the three groups, the same way 0 steps back out of a
+            # product list. Without it the only way out of the wrong group is
+            # to cancel the order.
+            if typed == "0" or typed.lower() in ("back", "menu", "categories"):
+                prompt, names = _group_prompt(products)
+                _set_state(phone, {"step": "SELECT_GROUP", "groups": names})
+                return prompt
 
             # The number, read straight from the message. This step only picks
             # which part of the menu to show, but reading "3" out of a language
@@ -706,7 +834,7 @@ def _reply_to_customer(phone: str, message: str, user: Optional[User]) -> str:
             if direct is not None:
                 return _choose_product(db, phone, state, direct)
 
-            prompt, _ = _category_prompt(products)
+            prompt, _ = _category_prompt(_categories_for(products, group), group)
             return "Sorry, I did not catch that.\n\n" + prompt
 
         # ─── SELECT PRODUCT ──────────────────
@@ -726,8 +854,17 @@ def _reply_to_customer(phone: str, message: str, user: Optional[User]) -> str:
             # one of a dozen, and without this the only way out of the wrong
             # one is to cancel the order.
             if typed == "0" or typed.lower() in ("back", "menu", "categories"):
-                prompt, categories = _category_prompt(products)
-                _set_state(phone, {"step": "SELECT_CATEGORY", "categories": categories})
+                group = state.get("group") or ""
+                pairs = _categories_for(products, group)
+                # No group on the state means the customer arrived by naming a
+                # cake outright, so there is no category list to go back to.
+                if len(pairs) > 1:
+                    prompt, categories = _category_prompt(pairs, group)
+                    _set_state(phone, {"step": "SELECT_CATEGORY",
+                                       "group": group, "categories": categories})
+                    return prompt
+                prompt, names = _group_prompt(products)
+                _set_state(phone, {"step": "SELECT_GROUP", "groups": names})
                 return prompt
 
             selected = None

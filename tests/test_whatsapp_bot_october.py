@@ -180,10 +180,14 @@ def test_an_order_starts_with_the_categories(db):
     with patch.object(flow, "parse_message", return_value={"action": "START_ORDER"}):
         reply = flow._reply_to_customer(PHONE, "I want to order", None)
 
-    assert "Chocolate Celebration Cakes (2)" in reply
-    assert "Breads & Bun Collection (1)" in reply
-    assert "Tiramisu Cake" not in reply           # products come after
-    assert flow._get_state(PHONE)["step"] == "SELECT_CATEGORY"
+    # Groups first, each counting the products underneath it. Categories are
+    # the step after, so that a list never has to hold more than ten rows.
+    # No counts on these: a button title is capped at 20 characters, and the
+    # count pushed the group's own name off the end of the button.
+    assert "1. Cakes" in reply
+    assert "2. Bakes & Desserts" in reply
+    assert "Tiramisu Cake" not in reply           # products come later still
+    assert flow._get_state(PHONE)["step"] == "SELECT_GROUP"
 
 
 def test_a_category_opens_its_own_products(db):
@@ -215,7 +219,7 @@ def test_naming_a_cake_skips_the_category_step(db):
     assert flow._get_state(PHONE)["product"]["name"] == "Tiramisu Cake"
 
 
-def test_zero_goes_back_to_the_categories(db):
+def test_zero_goes_back_out_of_a_product_list(db):
     rows = _catalogue(db)
     flow._set_state(PHONE, {
         "step": "SELECT_PRODUCT",
@@ -228,7 +232,9 @@ def test_zero_goes_back_to_the_categories(db):
         reply = flow._reply_to_customer(PHONE, "0", None)
 
     assert "What are you looking for?" in reply
-    assert flow._get_state(PHONE)["step"] == "SELECT_CATEGORY"
+    # Back to the groups: the conversation carries no group here, and the one
+    # category this fixture puts in Cakes would be a list of a single row.
+    assert flow._get_state(PHONE)["step"] == "SELECT_GROUP"
 
 
 @pytest.mark.parametrize("step,state", [

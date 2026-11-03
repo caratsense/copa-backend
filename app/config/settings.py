@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRY_MINUTES: int = 1440  # 24 hours
 
+    # Where the public site is served from. The WhatsApp bot needs it to put
+    # an absolute URL on a menu photograph: Meta fetches the picture itself
+    # before delivering the message, so a relative path is no use to it.
+    PUBLIC_SITE_URL: str = "https://cakeoclock.co.in"
+
     # CORS — comma-separated list of allowed frontend origins.
     # MUST include your deployed frontend URL in production.
     CORS_ORIGINS: str = "http://localhost:3000,http://localhost:5173,http://localhost:8080"

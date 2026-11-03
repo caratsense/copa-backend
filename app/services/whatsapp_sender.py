@@ -90,7 +90,75 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
-def send_buttons(to: str, body: str, options: list[tuple[str, str]]) -> dict | None:
+def _shorten(text: str, limit: int) -> str:
+    """
+    Trim to `limit` keeping BOTH ends, not just the front.
+
+    The end is where these labels differ. A plain cut turned the cookie menu
+    into this, at a 24-character row title:
+
+        Chip Chocolate Cookie B…      <- Box - Button, ₹200
+        Chip Chocolate Cookie B…      <- Box - Jumbo,  ₹400
+        Orange Cardamom Butter…       <- Cookie - Button
+        Orange Cardamom Butter…       <- Cookie - Jumbo
+
+    Two pairs identical character for character, so four of the six rows could
+    not be told apart and the menu was unusable. Keeping the tail keeps the
+    word that distinguishes them.
+    """
+    text = " ".join((text or "").split())
+    if len(text) <= limit:
+        return text
+    head = (limit - 1) // 2
+    tail = limit - 1 - head
+    return text[:head].rstrip() + "…" + text[-tail:].lstrip()
+
+
+def _clip_body(text: str, limit: int) -> str:
+    """
+    Trim a message body, keeping its line breaks.
+
+    `_clip` collapses all whitespace, which is right for a row title or a
+    button — neither renders a newline — and wrong for a body, where WhatsApp
+    does. Running a body through it turned "*Cookies*" and the instruction
+    under it into one run-on line.
+    """
+    text = (text or "").strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+# A product label carries its price after an em dash: "Biscoff Cookie — ₹650".
+# A list row has a title and a description, so the two belong in different
+# places rather than crammed into one line and then cut.
+_PRICE_SEPARATOR = " — "
+
+
+def send_image(to: str, url: str, caption: str = "") -> dict | None:
+    """
+    A photograph, as a message of its own.
+
+    Used where a picture cannot be attached to the message it belongs with: a
+    list's header is text-only, so the only way to put a cake above a menu of
+    cakes is to send the cake first and the menu immediately after. WhatsApp
+    stacks them, and they read as one.
+
+    Meta fetches `url` itself, so it has to be publicly reachable, and it has
+    to be a JPEG or a PNG — the WebP the site serves is refused.
+    """
+    to = _normalise(to)
+    image: dict = {"link": url}
+    if caption:
+        image["caption"] = _clip_body(caption, BODY_LIMIT)
+    return _send({
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "image",
+        "image": image,
+    })
+
+
+def send_buttons(to: str, body: str, options: list[tuple[str, str]],
+                 image_url: str = "") -> dict | None:
     """
     Up to three tappable replies. `options` is [(id, label), ...].
 
@@ -105,7 +173,10 @@ def send_buttons(to: str, body: str, options: list[tuple[str, str]]) -> dict | N
         "type": "interactive",
         "interactive": {
             "type": "button",
-            "body": {"text": _clip(body, BODY_LIMIT)},
+            # Buttons are the one interactive type Meta allows a picture on.
+            # A list's header is text or nothing.
+            **({"header": {"type": "image", "image": {"link": image_url}}} if image_url else {}),
+            "body": {"text": _clip_body(body, BODY_LIMIT)},
             "action": {
                 "buttons": [
                     {"type": "reply", "reply": {"id": str(oid),
@@ -128,12 +199,44 @@ def send_list(to: str, body: str, menu_label: str,
     between.
     """
     to = _normalise(to)
-    rows = []
+    labels = []
     for oid, label in options[:LIST_LIMIT]:
         label = " ".join((label or "").split())
-        row = {"id": str(oid), "title": _clip(label, ROW_TITLE_LIMIT)}
-        if len(label) > ROW_TITLE_LIMIT:
-            row["description"] = _clip(label, ROW_DESC_LIMIT)
+        name, separator, price = label.rpartition(_PRICE_SEPARATOR)
+        if not separator:
+            name, price = label, ""
+        labels.append((str(oid), name, price, label))
+
+    # The trim is chosen for the list as a whole, not row by row.
+    #
+    # An end-trim reads best, so it is the default. But deciding row by row
+    # fixed only half the cookie menu: row 2 took the plain trim because
+    # nothing had collided with it YET, and row 3 — arriving to find its own
+    # reading taken — took the two-ended one. The two rows then differed, and
+    # the test for "no two rows are identical" passed, while the customer
+    # still faced "Chip Chocolate Cookie B…" with no idea it meant Button.
+    #
+    # So every row whose plain reading is shared by another switches, and its
+    # partner switches with it.
+    plain = [_clip(name, ROW_TITLE_LIMIT) for _, name, _, _ in labels]
+    ambiguous = {title for title in plain if plain.count(title) > 1}
+
+    rows = []
+    seen: set[str] = set()
+    for (oid, name, price, label), flat in zip(labels, plain):
+        title = _shorten(name, ROW_TITLE_LIMIT) if flat in ambiguous else flat
+        # Last resort: names alike at both ends get their number back, so no
+        # row can ever be indistinguishable from another.
+        if title in seen:
+            title = _clip(f"{oid}. {name}", ROW_TITLE_LIMIT)
+        seen.add(title)
+
+        # The description carries the price when the name fitted, and the
+        # whole label when it did not, so nothing is lost to the trim.
+        description = price if title == name else label
+        row = {"id": oid, "title": title}
+        if description:
+            row["description"] = _clip(description, ROW_DESC_LIMIT)
         rows.append(row)
 
     return _send({
@@ -142,7 +245,7 @@ def send_list(to: str, body: str, menu_label: str,
         "type": "interactive",
         "interactive": {
             "type": "list",
-            "body": {"text": _clip(body, BODY_LIMIT)},
+            "body": {"text": _clip_body(body, BODY_LIMIT)},
             "action": {
                 "button": _clip(menu_label, BUTTON_TITLE_LIMIT),
                 "sections": [{"title": _clip(section_title, ROW_TITLE_LIMIT), "rows": rows}],
