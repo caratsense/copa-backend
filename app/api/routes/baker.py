@@ -18,6 +18,7 @@ from app.schemas import OrderRead, StatusUpdate, DutyToggle, TransferRequest
 from app.services.order_service import update_order_status, _enrich_order
 from app.services.event_service import emit_event
 from app.services.assignment_engine import transfer_order_baker
+from app.services.attendance import clock_in, clock_out, hours_today, open_shift, set_on_duty
 
 router = APIRouter(prefix="/baker", tags=["Baker"])
 
@@ -118,13 +119,22 @@ def toggle_duty(
     user: User = Depends(require_role(UserRole.BAKER, UserRole.RIDER)),
     db: Session = Depends(get_db),
 ):
-    """Baker/rider toggles their own duty status."""
-    user.on_duty = data.on_duty
-    db.commit()
+    """
+    Baker/rider toggles their own duty status — which is also clocking in and
+    out.
+
+    It used to assign user.on_duty and commit, and nothing recorded the time.
+    Going through the attendance service means the duty flag and the shift
+    record are written together and cannot drift: a roster saying somebody has
+    been in since nine, while the assignment engine thinks they are off duty
+    and hands their cakes to somebody else, is worse than having no roster.
+    """
+    shift = set_on_duty(db, user, data.on_duty)
     return {
         "id": user.id,
         "name": user.name,
         "on_duty": user.on_duty,
+        "clocked_in_at": shift.clocked_in_at if shift and user.on_duty else None,
         "message": f"You are now {'on duty' if user.on_duty else 'off duty'}",
     }
 

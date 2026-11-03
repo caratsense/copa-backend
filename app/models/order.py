@@ -137,6 +137,13 @@ class Order(Base):
     rider = relationship("User", foreign_keys=[assigned_rider_id], lazy="selectin")
     items = relationship("OrderItem", back_populates="order", lazy="selectin", cascade="all, delete-orphan")
     events = relationship("OrderEvent", back_populates="order", lazy="selectin", cascade="all, delete-orphan")
+    # The brief: reference pictures, written instructions and voice notes, in
+    # the order they were left. Oldest first, because it reads as a
+    # conversation and the first thing said is the thing being answered.
+    attachments = relationship(
+        "OrderAttachment", back_populates="order", lazy="selectin",
+        cascade="all, delete-orphan", order_by="OrderAttachment.created_at",
+    )
 
     @property
     def is_pickup(self) -> bool:

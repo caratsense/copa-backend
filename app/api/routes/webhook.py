@@ -32,6 +32,7 @@ from app.schemas import StatusUpdate
 from app.services.order_service import update_order_status, _enrich_order
 from app.services.assignment_engine import auto_assign_rider
 from app.services.whatsapp_sender import send_text
+from app.services.wa_interactive import send_reply
 from app.services.gemini_parser import transcribe_voice, get_audio_url
 from app.services import wa_commands
 from app.services.wa_customer_flow import handle_customer_message
@@ -366,7 +367,13 @@ def _process_message(msg: dict) -> str:
         else:
             reply = _handle_new_user(db, sender, text)
 
-        send_text(sender, reply)
+        # Not send_text. A reply that ends in a numbered menu goes out as
+        # tappable buttons or a list instead; everything else is unchanged
+        # text. The ids on those buttons are the same numbers the flow
+        # already expects, and _extract_text above reads a tapped reply's id
+        # and hands it on as though it had been typed - so the conversation
+        # is identical either way and anyone who prefers to type still can.
+        send_reply(sender, reply)
         return "ok"
     except Exception as e:
         logger.error("[WA] Error handling message from %s: %s", _mask(sender), e, exc_info=True)

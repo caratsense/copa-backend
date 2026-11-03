@@ -29,6 +29,8 @@ RATE LIMITS:
 """
 
 from datetime import datetime, timezone
+from typing import Literal
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -42,6 +44,7 @@ from app.core.auth import (
     get_current_user,
 )
 from app.services.otp_service import send_otp, verify_otp
+from app.services.wa_consent import record_opt_in, record_opt_out
 from app.core.phone import lookup_values, normalize_phone
 from app.core.ratelimit import limiter
 from app.schemas import (
@@ -347,3 +350,37 @@ def reset_password(request: Request, data: ResetPasswordRequest, db: Session = D
     db.query(TrustedDevice).filter(TrustedDevice.user_id == user.id).delete()
     db.commit()
     return {"message": "Password reset successfully. You can now login."}
+
+
+class WhatsAppConsent(BaseModel):
+    opt_in: bool
+    # Where the person gave or withdrew consent, recorded so we can show when
+    # and how it was given if Meta ever asks. Constrained to the places that
+    # actually ask - a free string would let a caller invent a provenance.
+    source: Literal["checkout", "account_page"] = "account_page"
+
+
+@router.post("/whatsapp-consent", response_model=UserRead)
+def set_whatsapp_consent(
+    data: WhatsAppConsent,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Turn WhatsApp order updates on or off for the signed-in customer.
+
+    Consent was collected once, at registration, and there was no way to give
+    it afterwards: someone who left the box unticked never received an order
+    update again, and nothing told them or the shop. STOP and START over
+    WhatsApp existed, but only someone we had already messaged would ever
+    learn about them - and we had never messaged these people.
+
+    This is the person acting on their own account, which is what makes it
+    consent. It deliberately takes no user id: nobody can opt anybody else in.
+    """
+    if data.opt_in:
+        record_opt_in(db, user, source=data.source)
+    else:
+        record_opt_out(db, user)
+    db.refresh(user)
+    return user

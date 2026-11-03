@@ -28,6 +28,7 @@ from app.models.product import Product
 from app.models.menu_section import MenuSection
 from app.models.pricing import SizeRule, FlavorRule, DesignRule, AddonRule, RushRule
 from app.models.delivery import DeliveryZone
+from app.services.pricing_engine import FOUNDER_DELIVERY_ZONE
 from app.models.coupon import Coupon, DiscountType
 from app.models.ingredient import Ingredient
 from app.models.site_settings import SiteSettings
@@ -207,16 +208,34 @@ def seed():
         # ══════════════════════════════════════════════════
         # DELIVERY ZONES — Lucknow areas
         # ══════════════════════════════════════════════════
+        # A standard ladder, not a per-area guess. Nothing paid sits below
+        # MIN_DELIVERY_CHARGE (₹100), and the rungs follow the shop's own
+        # estimated_time readings outward: ≤30 min is the base, 35-40 min is
+        # the middle rung, then the named outer areas.
+        #
+        # Gomtinagar is ₹200 at 35 minutes while Indira Nagar and Mahanagar are
+        # ₹150 at the same 35 — that is not an oversight. ₹200 for Gomtinagar
+        # is a price the shop set directly; the rest of the ladder is filled in
+        # around it.
+        #
+        # Changing these here does NOT change them in production: the rows are
+        # already live and admin-editable. Run scripts/standardise_delivery.py
+        # against the deployed database to apply the same list there.
         zones = [
             DeliveryZone(area_name="Pickup (Self)", charge=0, estimated_time=0),
-            DeliveryZone(area_name="Lucknow Central", charge=50, estimated_time=30),
-            DeliveryZone(area_name="Gomtinagar", charge=60, estimated_time=35),
-            DeliveryZone(area_name="Aliganj", charge=70, estimated_time=40),
-            DeliveryZone(area_name="Indira Nagar", charge=60, estimated_time=35),
-            DeliveryZone(area_name="Hazratganj", charge=50, estimated_time=25),
-            DeliveryZone(area_name="Aminabad", charge=55, estimated_time=30),
-            DeliveryZone(area_name="Mahanagar", charge=65, estimated_time=35),
-            DeliveryZone(area_name="Lucknow Outskirts", charge=150, estimated_time=75),
+            DeliveryZone(area_name="Hazratganj", charge=100, estimated_time=25),
+            DeliveryZone(area_name="Lucknow Central", charge=100, estimated_time=30),
+            DeliveryZone(area_name="Aminabad", charge=100, estimated_time=30),
+            DeliveryZone(area_name="Indira Nagar", charge=150, estimated_time=35),
+            DeliveryZone(area_name="Mahanagar", charge=150, estimated_time=35),
+            DeliveryZone(area_name="Aliganj", charge=150, estimated_time=40),
+            DeliveryZone(area_name="Gomtinagar", charge=200, estimated_time=35),
+            DeliveryZone(area_name="Lucknow Outskirts", charge=300, estimated_time=75),
+            DeliveryZone(area_name="Vrindavan Yojna", charge=350, estimated_time=55),
+            DeliveryZone(area_name="South City", charge=400, estimated_time=60),
+            # Not an area: a flat fee to have it brought by hand, wherever in
+            # the city you are. Checkout gives it its own card.
+            DeliveryZone(area_name=FOUNDER_DELIVERY_ZONE, charge=10000, estimated_time=90),
         ]
 
         # ══════════════════════════════════════════════════

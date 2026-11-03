@@ -13,6 +13,8 @@ from app.models.delivery import DeliveryZone  # noqa
 from app.models.order import Order  # noqa
 from app.models.order_item import OrderItem  # noqa
 from app.models.event import OrderEvent  # noqa
+from app.models.shift import Shift  # noqa
+from app.models.order_attachment import OrderAttachment  # noqa
 from app.models.coupon import Coupon  # noqa
 from app.models.ingredient import Ingredient  # noqa
 from app.models.review import Review  # noqa

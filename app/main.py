@@ -42,6 +42,7 @@ from app.api.routes.websocket import router as ws_router
 from app.api.routes.delivery import router as delivery_router
 from app.api.routes.baker import router as baker_router
 from app.api.routes.staff import router as staff_router
+from app.api.routes.attendance import router as attendance_router
 from app.api.routes.ingredients import router as ingredients_router
 from app.api.routes.reviews import router as reviews_router
 from app.api.routes.settings import router as settings_router
@@ -188,6 +189,7 @@ app.include_router(ws_router)
 app.include_router(delivery_router)
 app.include_router(baker_router)
 app.include_router(staff_router)
+app.include_router(attendance_router)
 app.include_router(ingredients_router)
 app.include_router(reviews_router)
 app.include_router(settings_router)

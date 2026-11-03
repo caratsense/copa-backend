@@ -26,6 +26,7 @@ from app.core.auth import require_admin, hash_password
 from app.core.phone import normalize_phone
 from app.schemas import StaffCreate, StaffRead, StaffUpdate, DutyToggle, OrderRead
 from app.services.assignment_engine import admin_assign_baker
+from app.services.attendance import clock_out, hours_today, open_shift, set_on_duty
 
 logger = logging.getLogger(__name__)
 
@@ -162,8 +163,12 @@ def toggle_staff_duty(
     if not user:
         raise HTTPException(status_code=404, detail="Staff member not found")
 
-    user.on_duty = data.on_duty
-    db.commit()
+    # Through the attendance service, not a direct assignment: toggling
+    # somebody on here also opens a shift for them, and toggling them off
+    # closes it. Writing user.on_duty straight was what let the roster say a
+    # baker had been in since nine while the assignment engine had him off
+    # duty and was giving his cakes to someone else.
+    set_on_duty(db, user, data.on_duty, by="admin")
     db.refresh(user)
     return _staff_with_count(db, user)
 
@@ -184,7 +189,10 @@ def toggle_staff_active(
 
     user.is_active = not user.is_active
     if not user.is_active:
-        user.on_duty = False  # deactivated = off duty
+        # Deactivated = off duty, and off duty means the shift ends. Setting
+        # the flag alone left an open shift running against an account that
+        # could no longer log in to close it.
+        clock_out(db, user, closed_by="admin")
     db.commit()
     db.refresh(user)
     return _staff_with_count(db, user)
@@ -326,6 +334,7 @@ def _staff_with_count(db: Session, user: User) -> StaffRead:
             Order.status.in_(statuses),
         ).scalar() or 0
 
+    shift = open_shift(db, user.id)
     return StaffRead(
         id=user.id,
         name=user.name,
@@ -334,5 +343,7 @@ def _staff_with_count(db: Session, user: User) -> StaffRead:
         role=user.role.value,
         is_active=user.is_active,
         on_duty=user.on_duty,
+        clocked_in_at=shift.clocked_in_at if shift else None,
+        hours_today=hours_today(db, user.id),
         active_order_count=count,
     )

@@ -63,6 +63,94 @@ def send_text(to: str, text: str) -> dict | None:
     })
 
 
+# ─── INTERACTIVE ──────────────────────────────────────
+# Tappable replies instead of "reply 1, 2 or 3". Meta's limits, which are
+# refusals and not suggestions — a payload over any of them comes back 400 and
+# the customer gets nothing at all:
+#
+#   buttons   at most 3, title <= 20 chars
+#   list      at most 10 rows across all sections, title <= 24, description <= 72
+#   body      <= 1024 chars either way
+#
+# The ids we attach are the ones the conversation already understands: "1",
+# "2", "3". The webhook reads a tapped reply's id and hands it to the flow as
+# though it had been typed, so the same state machine serves both, and anyone
+# who prefers to type still can.
+
+BUTTON_LIMIT = 3
+LIST_LIMIT = 10
+BODY_LIMIT = 1024
+BUTTON_TITLE_LIMIT = 20
+ROW_TITLE_LIMIT = 24
+ROW_DESC_LIMIT = 72
+
+
+def _clip(text: str, limit: int) -> str:
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def send_buttons(to: str, body: str, options: list[tuple[str, str]]) -> dict | None:
+    """
+    Up to three tappable replies. `options` is [(id, label), ...].
+
+    Returns None if the send failed, exactly like the rest of this module, so
+    the caller can fall back to plain text rather than leaving the customer
+    looking at nothing.
+    """
+    to = _normalise(to)
+    return _send({
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": _clip(body, BODY_LIMIT)},
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": str(oid),
+                                                "title": _clip(label, BUTTON_TITLE_LIMIT)}}
+                    for oid, label in options[:BUTTON_LIMIT]
+                ],
+            },
+        },
+    })
+
+
+def send_list(to: str, body: str, menu_label: str,
+              options: list[tuple[str, str]], section_title: str = "Options") -> dict | None:
+    """
+    A tap-to-open menu, for four to ten choices. `options` is [(id, label), ...].
+
+    A label longer than a row title is split across the title and its
+    description rather than simply cut: these are cake names and delivery
+    windows, and "Belgian Chocolate Tru…" is not something anyone can choose
+    between.
+    """
+    to = _normalise(to)
+    rows = []
+    for oid, label in options[:LIST_LIMIT]:
+        label = " ".join((label or "").split())
+        row = {"id": str(oid), "title": _clip(label, ROW_TITLE_LIMIT)}
+        if len(label) > ROW_TITLE_LIMIT:
+            row["description"] = _clip(label, ROW_DESC_LIMIT)
+        rows.append(row)
+
+    return _send({
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "list",
+            "body": {"text": _clip(body, BODY_LIMIT)},
+            "action": {
+                "button": _clip(menu_label, BUTTON_TITLE_LIMIT),
+                "sections": [{"title": _clip(section_title, ROW_TITLE_LIMIT), "rows": rows}],
+            },
+        },
+    })
+
+
 def send_template(to: str, template_name: str, params: list[str]) -> dict | None:
     """Send a pre-approved template message (works anytime, no 24hr restriction)."""
     to = _normalise(to)

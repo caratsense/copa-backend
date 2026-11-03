@@ -5,19 +5,20 @@ Order Routes — complete with auth, payments, tracking, rider self-service.
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.core.uploads import save_image
+from app.core.uploads import save_audio, save_image
 from app.db import get_db
 from app.models.user import User, UserRole
 from app.models.order import Order, OrderStatus, PaymentStatus
+from app.models.order_attachment import AttachmentKind, OrderAttachment
 from app.models.event import OrderEvent
 from app.core.auth import get_current_user, require_admin, require_role
 from app.schemas import (
     OrderCreate, OrderRead, StatusUpdate, PaymentUpdate,
-    EventRead, OrderTrackingRead,
+    EventRead, OrderTrackingRead, OrderAttachmentRead, OrderNoteCreate,
 )
 from app.services.order_service import (
     create_order, update_order_status, update_payment_status,
@@ -470,3 +471,150 @@ def cancel_own_order(
 
     reason = (data.reason if data else None) or "Cancelled by the customer"
     return update_order_status(db, order.id, StatusUpdate(status="CANCELLED", reason=reason))
+
+
+# ─── THE BRIEF ────────────────────────────────────────
+#
+# Everything the baker needs to make the right cake that is not a line item:
+# the pictures the customer sent, the spelling of the name, "pipe it like last
+# week's". None of it had anywhere to live. `orders.notes` is one box the
+# CUSTOMER writes at checkout, and there was no field at all in the other
+# direction, so instructions from the shop to the kitchen travelled by WhatsApp
+# or not at all and were attached to nothing. A baker opening an order could
+# not see any of it.
+#
+# Admin writes, the assigned baker reads and can write back. A rider is
+# deliberately not here: this is about making the cake, not moving it.
+
+
+def _brief_order(db: Session, order_id: int, user: User) -> Order:
+    """The order, if this person has any business reading its brief."""
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if user.role == UserRole.ADMIN:
+        return order
+    if user.role == UserRole.BAKER and order.assigned_baker_id == user.id:
+        return order
+    raise HTTPException(status_code=403, detail="This order is not assigned to you")
+
+
+def _add_attachment(db: Session, order: Order, user: User, **fields) -> OrderAttachment:
+    item = OrderAttachment(
+        order_id=order.id,
+        author_id=user.id,
+        # Copied, not joined: the brief has to keep saying who left it after
+        # that person's account is gone.
+        author_name=user.name,
+        author_role=user.role.value if hasattr(user.role, "value") else user.role,
+        **fields,
+    )
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+@router.get("/{order_id}/attachments", response_model=list[OrderAttachmentRead])
+def list_attachments(
+    order_id: int,
+    user: User = Depends(require_role(UserRole.ADMIN, UserRole.BAKER)),
+    db: Session = Depends(get_db),
+):
+    order = _brief_order(db, order_id, user)
+    return sorted(order.attachments, key=lambda a: (a.created_at, a.id))
+
+
+@router.post("/{order_id}/attachments/note", response_model=OrderAttachmentRead, status_code=201)
+def add_note(
+    order_id: int,
+    data: OrderNoteCreate,
+    user: User = Depends(require_role(UserRole.ADMIN, UserRole.BAKER)),
+    db: Session = Depends(get_db),
+):
+    """A written instruction, or a baker's question back."""
+    order = _brief_order(db, order_id, user)
+    body = data.body.strip()
+    if not body:
+        raise HTTPException(status_code=422, detail="Write something first")
+    return _add_attachment(db, order, user, kind=AttachmentKind.NOTE, body=body)
+
+
+@router.post("/{order_id}/attachments/photo", response_model=OrderAttachmentRead, status_code=201)
+def add_photo(
+    order_id: int,
+    file: UploadFile = File(...),
+    caption: Optional[str] = Form(None),
+    user: User = Depends(require_role(UserRole.ADMIN, UserRole.BAKER)),
+    db: Session = Depends(get_db),
+):
+    """
+    A reference picture. There is no limit on how many — that is the point of
+    "multi picture slots": a customer sends four photos of what they want and
+    all four belong on the order, not whichever one fitted in the single slot.
+    """
+    order = _brief_order(db, order_id, user)
+    url = save_image(file, prefix=f"brief_{order_id}")
+    return _add_attachment(
+        db, order, user,
+        kind=AttachmentKind.PHOTO, file_url=url,
+        body=(caption or "").strip() or None,
+    )
+
+
+@router.post("/{order_id}/attachments/voice", response_model=OrderAttachmentRead, status_code=201)
+def add_voice_note(
+    order_id: int,
+    file: UploadFile = File(...),
+    duration_seconds: Optional[int] = Form(None),
+    user: User = Depends(require_role(UserRole.ADMIN, UserRole.BAKER)),
+    db: Session = Depends(get_db),
+):
+    """
+    A spoken instruction. Quicker than typing on a phone in a kitchen, and it
+    carries the tone — "careful with this one" sounds like something.
+
+    The duration comes from the recorder in the browser because the server
+    would have to decode the file to work it out. It is a label, so it is
+    clamped rather than trusted: a wrong number is cosmetic, but a negative or
+    absurd one renders as nonsense next to the play button.
+    """
+    order = _brief_order(db, order_id, user)
+    url, _size = save_audio(file, prefix=f"voice_{order_id}")
+    seconds = None
+    if duration_seconds is not None and 0 < duration_seconds <= 60 * 60:
+        seconds = int(duration_seconds)
+    return _add_attachment(
+        db, order, user,
+        kind=AttachmentKind.VOICE, file_url=url, duration_seconds=seconds,
+    )
+
+
+@router.delete("/{order_id}/attachments/{attachment_id}", status_code=204)
+def delete_attachment(
+    order_id: int,
+    attachment_id: int,
+    user: User = Depends(require_role(UserRole.ADMIN, UserRole.BAKER)),
+    db: Session = Depends(get_db),
+):
+    """
+    Remove something left by mistake.
+
+    An admin can remove anything on an order they can see; a baker only what
+    they left themselves, so nobody can quietly delete the instructions they
+    were given and then say they never had them.
+    """
+    _brief_order(db, order_id, user)
+    item = db.query(OrderAttachment).filter(
+        OrderAttachment.id == attachment_id,
+        OrderAttachment.order_id == order_id,
+    ).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Not found on this order")
+    if user.role != UserRole.ADMIN and item.author_id != user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="You can only remove something you left yourself.",
+        )
+    db.delete(item)
+    db.commit()

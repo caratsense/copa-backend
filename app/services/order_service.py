@@ -8,7 +8,7 @@ Enhanced with:
 - Customer order history & tracking
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
 
@@ -622,13 +622,67 @@ def _end_delivery_tracking(order: Order):
         logging.getLogger(__name__).error(f"[Tracking] stop failed for order {order.id}: {e}")
 
 
-def _enrich_order(order: Order):
+# How long before the slot the cake has to be finished and off the bench.
+#
+# The baker's screen used to show the delivery time and nothing else, so an
+# 8 PM cake read as an 8 PM deadline — the hour it takes to box a cake, load
+# it and drive it across Lucknow came out of the baker's own time, which is
+# how cakes went out late while every screen said they were on schedule.
+#
+# A flat hour rather than the delivery zone's own estimated_time, which runs
+# 25 to 75 minutes. Those numbers are driving time only; the gap also covers
+# checking, boxing and handing over, and a baker working to a deadline that
+# shifts by half an hour depending on the customer's postcode is a deadline
+# nobody internalises. Overridable per shop via the kitchen_lead_minutes
+# setting.
+DEFAULT_KITCHEN_LEAD_MINUTES = 60
+MAX_KITCHEN_LEAD_MINUTES = 12 * 60
+
+
+def kitchen_lead_minutes(db: Session) -> int:
+    """The shop's lead time, or the default if it has not set one."""
+    from app.models.site_settings import SiteSettings
+
+    row = db.query(SiteSettings).filter(
+        SiteSettings.key == "kitchen_lead_minutes"
+    ).first()
+    if not row:
+        return DEFAULT_KITCHEN_LEAD_MINUTES
+    try:
+        value = int(float((row.value or "").strip()))
+    except (TypeError, ValueError):
+        return DEFAULT_KITCHEN_LEAD_MINUTES
+    # A negative lead would put the deadline AFTER the delivery, and an
+    # absurd one would mark every order overdue the moment it was placed.
+    if not (0 <= value <= MAX_KITCHEN_LEAD_MINUTES):
+        return DEFAULT_KITCHEN_LEAD_MINUTES
+    return value
+
+
+def ready_by(order: Order, lead_minutes: int = DEFAULT_KITCHEN_LEAD_MINUTES):
+    """
+    When this cake has to be done, or None for an order with no slot.
+
+    Derived rather than stored, so moving a delivery time moves the kitchen
+    deadline with it and the two can never disagree. A collection needs no
+    travel time, but it does need the cake finished before the customer walks
+    in, so the same gap applies.
+    """
+    if not order.delivery_time:
+        return None
+    return order.delivery_time - timedelta(minutes=lead_minutes)
+
+
+def _enrich_order(order: Order, lead_minutes: int = DEFAULT_KITCHEN_LEAD_MINUTES):
     """Add customer_name, customer_phone, baker_name, rider_name as dynamic attributes."""
     if order.user:
         order.customer_name = order.user.name
         order.customer_phone = order.user.phone
+        order.customer_wa_opt_in = order.user.whatsapp_opt_in
     else:
         order.customer_name = None
         order.customer_phone = None
+        order.customer_wa_opt_in = None
     order.baker_name = order.baker.name if order.baker else None
     order.rider_name = order.rider.name if order.rider else None
+    order.ready_by = ready_by(order, lead_minutes)

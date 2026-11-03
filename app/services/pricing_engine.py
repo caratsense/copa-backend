@@ -43,6 +43,25 @@ from app.schemas import ItemCustomization, PriceBreakdown, PricingRequest, Prici
 # untouched and still sell at 500g.
 MIN_CUSTOM_CAKE_KG = 1.0
 
+# The floor under every paid delivery zone.
+#
+# Delivery used to be priced per area with no common rule, from ₹50 to ₹150,
+# which was below what any of those runs actually cost. The list is now a
+# standard ladder with this as its bottom rung. Enforced on the way IN, by
+# DeliveryZoneCreate, so the number stored, the number the checkout dropdown
+# shows and the number charged are all the same one.
+#
+# Self pickup is a zone row charging 0 and is deliberately not held to this.
+MIN_DELIVERY_CHARGE = 100.0
+
+# The one delivery option that is not an area: the founder takes it herself,
+# anywhere in the city, for a flat fee. Named here because checkout has to
+# recognise it to give it its own card rather than burying it in the area
+# dropdown, and because `lookup_delivery_charge` must keep treating it as an
+# ordinary zone — it is the thing that makes the charge apply with no new
+# plumbing anywhere else.
+FOUNDER_DELIVERY_ZONE = "Hand-delivered by the founder"
+
 
 def _normalise(name: str | None) -> str:
     """Collapse whitespace and case so 'belgian  chocolate ' matches its rule."""

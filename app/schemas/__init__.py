@@ -160,6 +160,14 @@ class UserRead(BaseModel):
     role: str
     is_active: bool = True
     on_duty: bool = True
+    # Whether we are allowed to send this person WhatsApp order updates.
+    #
+    # It was captured at registration and then never read back by anything, so
+    # a customer who left the box unticked was unreachable for good and had no
+    # way of finding out: their order was placed, every notification was
+    # skipped, and neither they nor the shop was told. Exposing it is what
+    # makes that state visible and recoverable.
+    whatsapp_opt_in: bool = False
     created_at: datetime
 
     class Config:
@@ -187,9 +195,44 @@ class StaffRead(BaseModel):
     role: str
     is_active: bool
     on_duty: bool
+    # When this shift started. None means they are not in. `on_duty` alone was
+    # a boolean with no time attached, so the staff screen could say "On duty"
+    # and nothing more — there was no answer to "since when?".
+    clocked_in_at: Optional[datetime] = None
+    hours_today: float = 0.0
     active_order_count: int = 0
     class Config:
         from_attributes = True
+
+
+# ─── ATTENDANCE ──────────────────────────────────────
+
+class AttendanceRead(BaseModel):
+    """One person's own clock: am I in, since when, how long today."""
+    user_id: int
+    name: str
+    role: str
+    on_duty: bool
+    clocked_in_at: Optional[datetime] = None
+    hours_today: float = 0.0
+
+
+class RosterEntry(BaseModel):
+    """A line on the admin's present/absent board."""
+    user_id: int
+    name: str
+    role: str
+    is_active: bool
+    # Whether there is a shift open. Normally equal to on_duty — both are
+    # written together — and carried separately anyway, so that if they ever
+    # do come apart the screen shows it rather than hiding it behind one of
+    # them.
+    present: bool
+    on_duty: bool
+    clocked_in_at: Optional[datetime] = None
+    # When they last clocked out, for the people who are not here.
+    last_seen_at: Optional[datetime] = None
+    hours_today: float = 0.0
 
 class DutyToggle(BaseModel):
     on_duty: bool
@@ -469,6 +512,28 @@ class DeliveryZoneCreate(BaseModel):
     charge: float = 0.0
     estimated_time: int = 60
 
+    @model_validator(mode="after")
+    def _charge_clears_the_floor(self):
+        """
+        A paid zone may not be priced below the standard minimum.
+
+        The price list is now standardised around a floor, and the floor has to
+        be enforced where zones are written rather than where they are read.
+        Coercing on read would show one number in the checkout dropdown — which
+        is populated from these same rows — and charge another.
+
+        Zero is left alone on purpose: that is the self-pickup row, which is not
+        a delivery and is filtered out of the area list at checkout.
+        """
+        from app.services.pricing_engine import MIN_DELIVERY_CHARGE
+
+        if 0 < self.charge < MIN_DELIVERY_CHARGE:
+            raise ValueError(
+                f"Delivery is a minimum of ₹{MIN_DELIVERY_CHARGE:g}. "
+                f"Set ₹{MIN_DELIVERY_CHARGE:g} or more, or 0 for self pickup."
+            )
+        return self
+
 class DeliveryZoneRead(BaseModel):
     id: int
     area_name: str
@@ -619,11 +684,44 @@ class OrderItemRead(BaseModel):
     class Config:
         from_attributes = True
 
+class OrderAttachmentRead(BaseModel):
+    """One entry in an order's brief: a picture, a voice note, or words."""
+    id: int
+    order_id: int
+    kind: str                                # "photo" | "voice" | "note"
+    file_url: Optional[str] = None
+    body: Optional[str] = None
+    duration_seconds: Optional[int] = None
+    # Exposed so a staff screen can tell "mine" from "theirs" and draw the
+    # Remove button only where the server would actually allow it. Safe here
+    # and not elsewhere: every route that returns this requires admin or the
+    # order's own baker.
+    author_id: Optional[int] = None
+    author_name: Optional[str] = None
+    author_role: Optional[str] = None
+    created_at: datetime
+    class Config:
+        from_attributes = True
+
+
+class OrderNoteCreate(BaseModel):
+    # A blank comment is not a comment. Stripped and length-checked here so an
+    # accidental Enter on an empty box cannot put an empty bubble in front of
+    # the baker.
+    body: Annotated[str, Field(min_length=1, max_length=2000)]
+
+
 class OrderRead(BaseModel):
     id: int
     user_id: int
     customer_name: Optional[str] = None
     customer_phone: Optional[str] = None
+    # Whether this customer will actually receive the WhatsApp updates the
+    # pipeline sends. False means every notification for this order is skipped
+    # for want of consent, and the only way the shop will reach them is the
+    # phone. None means it was not resolved, which is not the same thing - the
+    # screens must only warn on an explicit False.
+    customer_wa_opt_in: Optional[bool] = None
     status: str
     subtotal: float
     delivery_charge: float = 0.0
@@ -635,6 +733,16 @@ class OrderRead(BaseModel):
     fulfilment: str = "DELIVERY"
     delivery_address: Optional[str]
     delivery_time: Optional[datetime]
+    # When the cake has to be OFF the bench, which is not when it is due at the
+    # door. The baker's screen showed him the delivery time and left him to do
+    # the subtraction, so an 8 PM cake read as an 8 PM deadline and the hour it
+    # takes to get there came out of nowhere.
+    #
+    # Derived, never stored: see ready_by() in app/services/order_service.py.
+    # Deliberately NOT on OrderTrackingRead — this is the kitchen's deadline,
+    # and showing a customer an earlier time than the one they booked would
+    # only read as the order being late.
+    ready_by: Optional[datetime] = None
     delivery_zone_id: Optional[int]
     payment_status: str
     payment_method: Optional[str] = "ONLINE"
@@ -649,6 +757,9 @@ class OrderRead(BaseModel):
     rider_name: Optional[str] = None
     notes: Optional[str]
     items: list[OrderItemRead] = []
+    # Reference pictures, written instructions and voice notes left for whoever
+    # is making this cake. Oldest first.
+    attachments: list[OrderAttachmentRead] = []
     created_at: datetime
     updated_at: datetime
 
@@ -658,10 +769,18 @@ class OrderRead(BaseModel):
     @classmethod
     def from_order(cls, order):
         """Build from ORM order with baker/rider names resolved."""
+        from app.services.order_service import ready_by
+
         data = {c.key: getattr(order, c.key) for c in order.__table__.columns}
         data["items"] = order.items
+        data["attachments"] = order.attachments
         data["baker_name"] = order.baker.name if order.baker else None
         data["rider_name"] = order.rider.name if order.rider else None
+        data["customer_wa_opt_in"] = order.user.whatsapp_opt_in if order.user else None
+        # Both read paths have to set this or one of them silently serves None.
+        # The other is _enrich_order, which is what the ORM-returning routes
+        # use; this one is for the routes that build the schema by hand.
+        data["ready_by"] = ready_by(order)
         data["status"] = order.status.value if hasattr(order.status, 'value') else order.status
         data["payment_status"] = order.payment_status.value if hasattr(order.payment_status, 'value') else order.payment_status
         return cls(**data)

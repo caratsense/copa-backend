@@ -63,3 +63,68 @@ def save_image(file: UploadFile, prefix: str) -> str:
     with open(os.path.join(settings.UPLOAD_DIR, filename), "wb") as f:
         f.write(contents)
     return f"/media/{filename}"
+
+
+# ─── AUDIO ────────────────────────────────────────────
+# Voice notes left on an order. Held to exactly the same rule as images: the
+# extension comes from what the bytes are, never from the name the browser
+# sent, because UPLOAD_DIR is served by StaticFiles and StaticFiles types a
+# file by its extension. A ".webm" that is really HTML would otherwise come
+# back from /media as a live document on the API's own origin.
+
+_AUDIO_EXTENSION = {
+    "audio/webm": "webm",     # what Chrome's MediaRecorder produces
+    "audio/mp4": "m4a",       # what Safari's does
+    "audio/ogg": "ogg",
+    "audio/mpeg": "mp3",
+    "audio/wav": "wav",
+}
+
+
+def sniff_audio(head: bytes) -> str | None:
+    """The audio type these leading bytes belong to, or None if not one we take."""
+    if head.startswith(b"\x1a\x45\xdf\xa3"):
+        # EBML. Matroska and WebM share it; a browser recording is WebM.
+        return "audio/webm"
+    if len(head) >= 12 and head[4:8] == b"ftyp":
+        return "audio/mp4"
+    if head.startswith(b"OggS"):
+        return "audio/ogg"
+    if head.startswith(b"ID3"):
+        return "audio/mpeg"
+    if len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0:
+        # MPEG frame sync: an MP3 with no ID3 tag in front of it.
+        return "audio/mpeg"
+    if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+        return "audio/wav"
+    return None
+
+
+def save_audio(file: UploadFile, prefix: str) -> tuple[str, int]:
+    """
+    Validate an uploaded recording, write it to UPLOAD_DIR, return its /media
+    URL and its size in bytes.
+
+    The size comes back because the caller cannot get it afterwards without
+    reading the file again, and the UI wants to show how long a note is before
+    anyone commits to playing it.
+    """
+    limit = settings.MAX_UPLOAD_MB * 1024 * 1024
+    contents = file.file.read(limit + 1)
+    if len(contents) > limit:
+        raise HTTPException(status_code=400, detail=f"Max {settings.MAX_UPLOAD_MB}MB")
+    if not contents:
+        raise HTTPException(status_code=400, detail="That recording is empty")
+
+    kind = sniff_audio(contents[:16])
+    if kind is None:
+        raise HTTPException(
+            status_code=400,
+            detail="That file is not a recording we can play back",
+        )
+
+    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
+    filename = f"{prefix}_{uuid.uuid4().hex[:8]}.{_AUDIO_EXTENSION[kind]}"
+    with open(os.path.join(settings.UPLOAD_DIR, filename), "wb") as f:
+        f.write(contents)
+    return f"/media/{filename}", len(contents)
