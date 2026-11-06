@@ -28,6 +28,7 @@ from app.core.uploads import ALLOWED_TYPES, save_image
 from app.db import get_db
 from app.models.cake_enquiry import CakeEnquiry
 from app.models.pricing import AddonRule, DesignRule, FlavorRule, RushRule, SizeRule
+from app.services.store_hours import rush_is_sellable
 from app.models.product import Product
 from app.models.user import User
 from app.services.pricing_engine import MIN_CUSTOM_CAKE_KG
@@ -136,8 +137,12 @@ def build_options(db: Session = Depends(get_db)):
                  db.query(DesignRule).filter(DesignRule.is_active == True).all()],
         addons=[AddonRuleRead.model_validate(a) for a in
                 db.query(AddonRule).filter(AddonRule.is_active == True).all()],
+        # A paid rush option is not offered while same-day ordering is
+        # blocked: there is nothing faster than tomorrow to sell. They come
+        # back by themselves when the block lapses, like the dates do.
         rush=[RushRuleRead.model_validate(r) for r in
-              db.query(RushRule).filter(RushRule.is_active == True).all()],
+              db.query(RushRule).filter(RushRule.is_active == True).all()
+              if rush_is_sellable(db, float(r.cost or 0))],
         max_orderable_kg=MAX_ORDERABLE_KG,
     )
 

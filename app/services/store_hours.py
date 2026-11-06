@@ -218,6 +218,28 @@ def same_day_blocked(db: Session, today: date) -> bool:
         return False
 
 
+def rush_is_sellable(db: Session, cost: float) -> bool:
+    """
+    Whether a rush option may still be sold.
+
+    A paid rush option is a promise to bake the cake sooner than the standard
+    lead time. While same-day ordering is blocked, nothing can be sooner than
+    tomorrow, so there is nothing left to sell: "Same Day" at Rs 300 and
+    "Express (4hr)" at Rs 500 were on the menu beside a date picker that
+    would not let anyone choose today. Somebody could pay 500 rupees for a
+    four-hour cake and then be made to pick tomorrow.
+
+    Cost is the test, rather than a list of names. The free option is the
+    standard lead time by definition - it is what every order gets - and
+    anything charged for is charged for being faster than that. A name
+    matcher would miss "Rush", "Priority", or whatever the next one is
+    called, and would miss it silently.
+    """
+    if cost <= 0:
+        return True
+    return not same_day_blocked(db, datetime.now(IST).date())
+
+
 def earliest_delivery_time(now: datetime | None = None,
                            db: Session | None = None) -> datetime:
     """

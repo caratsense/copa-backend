@@ -43,6 +43,21 @@ class Template:
     trigger: str            # what causes it to send
     variables: tuple = field(default=())   # ordered body placeholders {{1}}..{{n}}
 
+    # What to send as a plain message when Meta refuses the template.
+    #
+    # Six of these have been failing since they were written, with
+    # "(#132001) Template name does not exist in the translation" - they were
+    # never created in the Meta console. The customer was told nothing at
+    # all, silently, including the one that says a collection order is ready.
+    #
+    # A plain message only reaches somebody who has written to the business
+    # in the last 24 hours, so this does not replace getting the template
+    # approved. It does mean the common case - a customer who ordered an hour
+    # ago - hears something instead of nothing.
+    #
+    # Positional slots, matching `variables` in order.
+    fallback: str = ""
+
     @property
     def meta_name(self) -> str:
         return _overrides().get(self.key, {}).get("name", self.default_name)
@@ -98,6 +113,9 @@ TEMPLATES: dict[str, Template] = {
             recipient="customer",
             trigger="Pickup order is packed and waiting (PACKAGED -> READY_FOR_PICKUP)",
             variables=("customer_name", "order_id", "pickup_details", "slot"),
+            fallback=(
+                "Hi {1}, your order #{2} is ready to collect.\n\n{3}\n{4}\n\nSee you soon - Cake O' Clock"
+            ),
         ),
         Template(
             key="order_collected",
@@ -105,6 +123,9 @@ TEMPLATES: dict[str, Template] = {
             recipient="customer",
             trigger="Customer collected the order (READY_FOR_PICKUP -> COLLECTED)",
             variables=("customer_name", "order_id"),
+            fallback=(
+                "Thank you {1}! Order #{2} has been collected. We hope you enjoy it.\n\nCake O' Clock"
+            ),
         ),
         Template(
             key="order_not_collected",
@@ -112,6 +133,9 @@ TEMPLATES: dict[str, Template] = {
             recipient="customer",
             trigger="Pickup slot passed with the cake still on the counter",
             variables=("customer_name", "order_id", "pickup_details"),
+            fallback=(
+                "Hi {1}, order #{2} is still waiting for you.\n\n{3}\n\nDo let us know when you can come by - Cake O' Clock"
+            ),
         ),
         Template(
             key="order_not_collected_admin",
@@ -119,6 +143,9 @@ TEMPLATES: dict[str, Template] = {
             recipient="admin",
             trigger="A pickup nobody came for — the shop has to chase it",
             variables=("order_id", "customer_name", "customer_phone"),
+            fallback=(
+                "Order #{1} was not collected.\n{2} ({3})"
+            ),
         ),
         Template(
             key="admin_proof_ready",
@@ -126,6 +153,9 @@ TEMPLATES: dict[str, Template] = {
             recipient="admin",
             trigger="Baker photographs the finished cake; the photo is waiting to be checked",
             variables=("order_id", "items", "photo_url"),
+            fallback=(
+                "Order #{1} has a finished photo waiting for approval.\n{2}\n{3}"
+            ),
         ),
         Template(
             key="order_rework",
@@ -140,6 +170,9 @@ TEMPLATES: dict[str, Template] = {
             recipient="rider",
             trigger="Order packaged with a rider assigned, or a rider assigned to an already-packaged order",
             variables=("order_id", "customer_name", "customer_phone", "address", "maps_link", "amount_to_collect"),
+            fallback=(
+                "New delivery - order #{1}\n{2} ({3})\n{4}\n{5}\n\nCollect Rs {6}"
+            ),
         ),
         Template(
             key="order_out_for_delivery",
@@ -242,3 +275,27 @@ def _reset_cache_for_tests() -> None:
     """Drop the memoised overrides. Tests change settings between cases."""
     global _cached_overrides
     _cached_overrides = None
+
+
+def fallback_for(meta_name: str, params: list) -> str:
+    """
+    The plain-message version of a template Meta would not send, or "".
+
+    Looked up by the name that was actually sent, because that is all the
+    sender has: the registry key and the Meta name can differ once an
+    override is configured, and a retry from the outbox replays the recorded
+    name rather than re-resolving the key.
+    """
+    for template in TEMPLATES.values():
+        if template.meta_name != meta_name or not template.fallback:
+            continue
+        slots = [""] + [str(p) for p in (params or [])]
+        try:
+            return template.fallback.format(*slots)
+        except (IndexError, KeyError):
+            # Fewer parameters than the text expects. Saying nothing is
+            # better than sending a message with a gap in it.
+            logger.warning("[WA TEMPLATES] %s fallback wants more parameters "
+                           "than were passed", meta_name)
+            return ""
+    return ""

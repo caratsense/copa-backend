@@ -243,6 +243,18 @@ def calculate_item_price(
 
     # ── Rush ──
     rush_cost = _cost_of(db, RushRule, customization.rush, "cost", "rush option")
+    # The backstop. /build-a-cake/options stops offering a paid rush while
+    # same-day is blocked, but that endpoint returns a list and the cart posts
+    # a name, so a page loaded before the block went on could still buy one.
+    # The bot cannot reach this: its conversation never asks about rush and
+    # always sends an empty string.
+    from app.services.store_hours import rush_is_sellable
+    if rush_cost > 0 and not rush_is_sellable(db, rush_cost):
+        raise HTTPException(
+            status_code=422,
+            detail=("We are not taking same-day orders at the moment, so that "
+                    "rush option is not available. The earliest is tomorrow."),
+        )
 
     # ── Delivery ──
     # Reported here for display only. Delivery is charged ONCE per order (see

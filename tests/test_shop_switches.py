@@ -30,6 +30,7 @@ from fastapi import HTTPException
 from app.models.site_settings import SiteSettings
 from app.services.store_hours import (
     IST,
+    rush_is_sellable,
     DELIVERY_ENABLED_KEY,
     SAME_DAY_BLOCK_KEY,
     check_delivery_lead_time,
@@ -246,3 +247,41 @@ def test_the_checkout_is_told_the_earliest_date_it_may_offer(client, db, clean_s
         db.delete(row)
         db.commit()
     assert client.get("/settings/store-hours").json()["earliest_date"] == date.today().isoformat()
+
+
+# ── Nothing faster than tomorrow is for sale ─────────────────────────
+
+
+def test_a_paid_rush_is_not_sold_while_same_day_is_blocked(db, clean_settings):
+    """
+    The hole this closes.
+
+    Blocking same-day ordering stopped the dates and left the rush options
+    on the menu: "Same Day" at Rs 300 and "Express (4hr)" at Rs 500, beside
+    a date picker that would not let anyone choose today. Somebody could pay
+    Rs 500 for a four-hour cake and then be made to pick tomorrow.
+    """
+    _set(db, SAME_DAY_BLOCK_KEY, date.today().isoformat())
+
+    assert rush_is_sellable(db, 300.0) is False
+    assert rush_is_sellable(db, 500.0) is False
+    # The free one is the standard lead time by definition - it is what every
+    # order gets - so it is always on.
+    assert rush_is_sellable(db, 0.0) is True
+
+
+def test_the_paid_options_come_back_when_the_block_lapses(db, clean_settings):
+    """No one has to remember to put them back, same as the dates."""
+    _set(db, SAME_DAY_BLOCK_KEY, "2020-01-01")
+    assert rush_is_sellable(db, 300.0) is True
+
+
+def test_cost_is_the_test_and_not_the_name(db, clean_settings):
+    """
+    A name matcher would miss "Rush", "Priority", or whatever the next one
+    is called, and would miss it silently. Anything charged for is charged
+    for being faster than standard.
+    """
+    _set(db, SAME_DAY_BLOCK_KEY, date.today().isoformat())
+    assert rush_is_sellable(db, 1.0) is False
+    assert rush_is_sellable(db, 0.0) is True

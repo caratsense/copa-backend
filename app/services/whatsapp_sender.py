@@ -320,7 +320,20 @@ def send_list(to: str, body: str, menu_label: str,
 
 
 def send_template(to: str, template_name: str, params: list[str]) -> dict | None:
-    """Send a pre-approved template message (works anytime, no 24hr restriction)."""
+    """
+    Send a pre-approved template message (works anytime, no 24hr restriction).
+
+    If Meta refuses it, the same thing goes out as a plain message instead.
+    Six of these templates had never been created in the console and were
+    failing with "(#132001) Template name does not exist in the translation"
+    - including the one telling a customer their collection order is ready.
+    Nobody was told anything, and nothing said so outside the logs.
+
+    A plain message only reaches somebody who has written to the business in
+    the last 24 hours, so this is a floor and not a fix: the template still
+    needs approving. It does mean the common case - a customer who ordered an
+    hour ago - hears something rather than nothing.
+    """
     to = _normalise(to)
     components = []
     if params:
@@ -328,7 +341,7 @@ def send_template(to: str, template_name: str, params: list[str]) -> dict | None
             "type": "body",
             "parameters": [{"type": "text", "text": str(p)} for p in params],
         })
-    return _send({
+    result = _send({
         "messaging_product": "whatsapp",
         "to": to,
         "type": "template",
@@ -339,6 +352,19 @@ def send_template(to: str, template_name: str, params: list[str]) -> dict | None
             "components": components,
         },
     })
+
+    if isinstance(result, dict) and "error" in result:
+        from app.services.wa_templates import fallback_for
+
+        text = fallback_for(template_name, params)
+        if text:
+            logger.warning("[WA] Template %s refused (%s) - sending plain text instead",
+                           template_name,
+                           str(result.get("error", {}).get("code", "?")))
+            return send_text(to, text)
+        logger.error("[WA] Template %s refused and has no plain-text fallback: %s",
+                     template_name, str(result.get("error"))[:160])
+    return result
 
 
 def send_template_raw(to: str, template_name: str, language: str, params: list) -> dict | None:
