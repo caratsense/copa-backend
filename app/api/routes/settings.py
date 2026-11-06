@@ -47,6 +47,12 @@ PUBLIC_KEYS = frozenset({
     # their WhatsApp confirmation. Unlike brand_phone this is a shop front, not
     # a private line.
     "pickup_address",
+    # Whether the shop is delivering at all. "false" means pickup only: the
+    # checkout reads it to grey the Delivery option out, and POST /orders
+    # refuses a delivery order so a stale page cannot place one anyway.
+    # Missing means delivering - that is how the shop behaved before the
+    # switch existed, so an upgrade changes nothing until an admin flips it.
+    "delivery_enabled",
 })
 
 
