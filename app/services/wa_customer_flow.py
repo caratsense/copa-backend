@@ -247,13 +247,121 @@ def _ask_for_flavor(db, phone: str, state: dict, header: str) -> str:
                 "Would you like a message on the cake?\n"
                 "Type your message or reply *skip*.")
 
-    flavors = [{"id": f.id, "name": f.name, "extra_cost": f.extra_cost}
-               for f in db.query(FlavorRule).filter(FlavorRule.is_active == True).all()][:10]
+    groups = _flavour_groups(db)
+    if not groups:
+        _set_state(phone, {**state, "step": "CAKE_MESSAGE", "flavor": {}})
+        return (f"{header}\n\n"
+                "Would you like a message on the cake?\n"
+                "Type your message or reply *skip*.")
+
     lines = [f"{header}\n\n*Select flavor:*\n"]
-    for i, f in enumerate(flavors, 1):
-        cost = f" (+₹{f['extra_cost']})" if f['extra_cost'] > 0 else ""
-        lines.append(f"{i}. {f['name']}{cost}")
-    _set_state(phone, {**state, "step": "SELECT_FLAVOR", "flavors": flavors})
+    for i, (name, flavours) in enumerate(groups, 1):
+        lines.append(f"{i}. {name} ({len(flavours)})")
+    lines.append("\nTap one — or just type the flavour you want.")
+    _set_state(phone, {**state, "step": "SELECT_FLAVOR_GROUP",
+                       "flavor_groups": [name for name, _ in groups]})
+    return "\n".join(lines)
+
+
+# ── Flavours, in groups ─────────────────────────────────────────
+#
+# There are 34 active flavours and this step used to take the first ten of
+# them. Not the ten best, or the ten cheapest - the first ten by id, which are
+# all vanilla. Every chocolate flavour and all twelve Belgian ones were
+# unreachable over WhatsApp: the Belgian surcharge was correct in the data and
+# no customer could ever trigger it, because no customer could pick a Belgian
+# flavour at all.
+#
+# Ten is also exactly what an interactive list holds, so the truncation cannot
+# simply be removed. Groups first, then the flavours in one - the same shape
+# the category menu already uses.
+#
+# Belgian is split out of the chocolate sponge it shares a column with: it is
+# the one the customer pays extra for, and burying twelve of them inside
+# nineteen chocolates is how it stayed invisible.
+FLAVOUR_GROUPS = ("Vanilla", "Chocolate", "Belgian")
+
+# A group with more than this many shows the rest behind "type the name",
+# because a list cannot hold more.
+FLAVOUR_ROWS = 9
+TYPE_IT_INSTEAD = "Something else — type the name"
+
+
+def _flavour_group_of(flavour) -> str:
+    if "belgian" in (flavour.name or "").lower():
+        return "Belgian"
+    return "Chocolate" if (flavour.sponge or "").lower() == "chocolate" else "Vanilla"
+
+
+def _flavour_groups(db) -> list[tuple[str, list[dict]]]:
+    """The active flavours, grouped, empty groups dropped."""
+    rows = db.query(FlavorRule).filter(FlavorRule.is_active == True).all()
+    out = []
+    for name in FLAVOUR_GROUPS:
+        members = [{"id": f.id, "name": f.name, "extra_cost": f.extra_cost}
+                   for f in rows if _flavour_group_of(f) == name]
+        if members:
+            out.append((name, members))
+    return out
+
+
+def _all_flavours(db) -> list[dict]:
+    """Every active flavour, for matching a name somebody typed."""
+    return [{"id": f.id, "name": f.name, "extra_cost": f.extra_cost}
+            for f in db.query(FlavorRule).filter(FlavorRule.is_active == True).all()]
+
+
+def _without_group_prefix(name: str, group: str) -> str:
+    """
+    Drop the part of the name the heading above it already says.
+
+    Every Belgian flavour is called "Belgian Chocolate something", which spent
+    eighteen of the twenty-four characters a row title has on a word printed
+    at the top of the same list - and left "Belgian Chocolate Orange" and
+    "Belgian Chocolate Orange Hazelnut Crumble" reading identically.
+
+    Only a leading match is removed, so "Plain Chocolate" and "Plain Vanilla
+    White Chocolate" keep their names. The full name still goes to the row's
+    description and is still what a typed reply is matched against; this is
+    the label, not the identity.
+    """
+    for prefix in (f"{group} Chocolate ", f"{group} "):
+        if name.lower().startswith(prefix.lower()) and len(name) > len(prefix):
+            return name[len(prefix):]
+    return name
+
+
+def _flavour_list_prompt(phone: str, state: dict, group: str,
+                         flavours: list[dict]) -> str:
+    """One group's flavours, trimmed to what a list can hold."""
+    shown = flavours[:FLAVOUR_ROWS] if len(flavours) > FLAVOUR_ROWS else flavours
+    lines = [f"*{group}*\n"]
+    for i, f in enumerate(shown, 1):
+        # The em dash is not decoration. send_list splits a label there to put
+        # the name in the row title and the price in the line beneath it, so
+        # "(+₹200)" written any other way is spent out of the 24 characters
+        # the title has - which pushed "Belgian Chocolate Orange" and "Belgian
+        # Chocolate Orange Hazelnut Crumble" into reading the same.
+        cost = f" — +₹{f['extra_cost']:.0f}" if f["extra_cost"] > 0 else ""
+        lines.append(f"{i}. {_without_group_prefix(f['name'], group)}{cost}")
+    if len(flavours) > len(shown):
+        lines.append(f"{len(shown) + 1}. {TYPE_IT_INSTEAD}")
+    lines.append("\nReply with the number or the name. *0* goes back.")
+    _set_state(phone, {**state, "step": "SELECT_FLAVOR",
+                       "flavors": shown, "flavor_group": group,
+                       "flavor_more": len(flavours) > len(shown)})
+    return "\n".join(lines)
+
+
+def _flavour_prompt_again(db, phone: str, state: dict) -> str:
+    """Re-offer the groups, keeping everything already chosen."""
+    groups = _flavour_groups(db)
+    lines = ["*Select flavor:*\n"]
+    for i, (name, flavours) in enumerate(groups, 1):
+        lines.append(f"{i}. {name} ({len(flavours)})")
+    lines.append("\nTap one — or just type the flavour you want.")
+    _set_state(phone, {**state, "step": "SELECT_FLAVOR_GROUP",
+                       "flavor_groups": [name for name, _ in groups]})
     return "\n".join(lines)
 
 
@@ -527,6 +635,7 @@ _STEP_QUESTION = {
     "SELECT_CATEGORY": "which part of the menu you are after",
     "SELECT_PRODUCT": "which cake you would like",
     "SELECT_SIZE": "the size",
+    "SELECT_FLAVOR_GROUP": "which kind of flavour",
     "SELECT_FLAVOR": "the flavour",
     "CAKE_MESSAGE": "the message for the cake (or *skip*)",
     "DELIVERY_ADDRESS": "your delivery address",
@@ -903,19 +1012,77 @@ def _reply_to_customer(phone: str, message: str, user: Optional[User]) -> str:
             return _ask_for_flavor(db, phone, {**state, "size": selected},
                                    header=f"Size: *{selected['name']}*")
 
+        # ─── SELECT FLAVOR GROUP ─────────────
+        # Three groups, so this goes out as buttons.
+        if step == "SELECT_FLAVOR_GROUP":
+            names = state.get("flavor_groups") or []
+            typed = message.strip()
+            choice = int(typed) if typed.isdigit() else (
+                action.get("value") if act == "SELECT_OPTION" else None)
+
+            chosen = None
+            if isinstance(choice, int) and 1 <= choice <= len(names):
+                chosen = names[choice - 1]
+            else:
+                for name in names:
+                    if name.lower() == typed.lower():
+                        chosen = name
+                        break
+
+            if chosen is not None:
+                members = dict(_flavour_groups(db)).get(chosen, [])
+                return _flavour_list_prompt(phone, state, chosen, members)
+
+            # Somebody who knows the flavour types it rather than hunting for
+            # the group it lives in. Matched against EVERY flavour, not the
+            # group's, because they have not picked a group yet.
+            named = (action.get("name") if act == "SELECT_FLAVOR_BY_NAME" else None) or typed
+            for f in _all_flavours(db):
+                if named and named.lower() in f["name"].lower():
+                    _set_state(phone, {**state, "step": "CAKE_MESSAGE", "flavor": f})
+                    return ("Would you like a message on the cake?\n"
+                            "Type your message or reply *skip*.")
+
+            return ("Sorry, I did not catch that.\n\n"
+                    + _flavour_prompt_again(db, phone, state))
+
         # ─── SELECT FLAVOR ───────────────────
         if step == "SELECT_FLAVOR":
             flavors = state.get("flavors", [])
+            typed = message.strip()
+
+            # Back to the groups.
+            if typed == "0" or typed.lower() in ("back", "flavours", "flavors"):
+                return _flavour_prompt_again(db, phone, state)
+
             selected = None
-            if act == "SELECT_OPTION":
-                idx = action.get("value", 0) - 1
-                if 0 <= idx < len(flavors): selected = flavors[idx]
-            elif act == "SELECT_FLAVOR_BY_NAME":
-                name = action.get("name", "").lower()
-                for f in flavors:
-                    if name in f["name"].lower(): selected = f; break
+            if act == "SELECT_OPTION" or typed.isdigit():
+                idx = (int(typed) if typed.isdigit() else action.get("value", 0)) - 1
+                if 0 <= idx < len(flavors):
+                    selected = flavors[idx]
+                elif idx == len(flavors) and state.get("flavor_more"):
+                    # They tapped "Something else - type the name". A list
+                    # cannot hold this group, so the rest are reached by name.
+                    return (f"Type the flavour you would like, and I will find it."
+                            f"\nFor example: *{flavors[0]['name']}*."
+                            if flavors else "Type the flavour you would like.")
+
+            if selected is None:
+                # Matched against every flavour and not just the nine on
+                # screen: the whole point of the "type the name" row is that
+                # the rest of the group is reachable.
+                name = ((action.get("name") if act == "SELECT_FLAVOR_BY_NAME" else None)
+                        or typed).lower()
+                if name:
+                    pool = flavors + [f for f in _all_flavours(db) if f not in flavors]
+                    for f in pool:
+                        if name in f["name"].lower():
+                            selected = f
+                            break
+
             if not selected:
-                return f"Please select a flavor (1 to {len(flavors)})."
+                return (f"I did not find that flavour. Reply with a number, "
+                        f"or type the name. *0* goes back.")
 
             _set_state(phone, {**state, "step": "CAKE_MESSAGE", "flavor": selected})
             return "Would you like a message on the cake?\nType your message or reply *skip*."

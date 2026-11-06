@@ -102,21 +102,22 @@ def create_order(db: Session, data: OrderCreate) -> Order:
     # in the past to the next available slot, which is how an order placed at
     # 6 PM for "today, 2 PM" was accepted and confirmed for a time nobody
     # chose. Every cake is baked to order; tomorrow is the earliest.
-    from app.services.store_hours import check_delivery_lead_time, delivery_enabled
+    from app.services.store_hours import check_delivery_lead_time
 
-    # ── Is the shop delivering at all? ──
-    # The admin switch is enforced here and not only greyed out at checkout.
-    # The checkout posts a fulfilment string, so a Delivery button hidden in
-    # the UI stops nobody who has the old page open, a stale tab, or the API.
-    # Collection is deliberately untouched: switching delivery off must leave
-    # the shop still able to sell.
-    if str(data.fulfilment).upper() == "DELIVERY" and not delivery_enabled(db):
-        raise HTTPException(
-            status_code=422,
-            detail=("We are not delivering at the moment — collection only. "
-                    "Please choose self-pickup."),
-        )
-
+    # The pickup-only gate is deliberately NOT here. It lives on the checkout
+    # route, and the conversation handles it for WhatsApp.
+    #
+    # Putting it here looked stronger - one guard covering every caller - and
+    # it is worse. The bot builds its orders through this function inside a
+    # try/except that clears the customer's state and tells them to order
+    # online: raising here would throw away the cake, the size, the flavour,
+    # the message, the date and the slot they had just spent five minutes
+    # choosing, say nothing about why, and send them to a website that would
+    # refuse them too. The bot never reaches this point with a delivery while
+    # the switch is off, because it stops offering delivery at all.
+    #
+    # tests/test_pickup_only.py pins this on purpose. If it starts failing,
+    # the gate has slipped back into the service.
     check_delivery_lead_time(data.delivery_time, db)
 
     schedule = schedule_order_delivery(db, data.delivery_time)

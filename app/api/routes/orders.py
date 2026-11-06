@@ -32,13 +32,18 @@ router = APIRouter(prefix="/orders", tags=["Orders"])
 
 def _delivery_enabled(db: Session) -> bool:
     """
-    Whether the shop is delivering at all, from the `delivery_enabled` site
-    setting. Only an explicit "false" turns it off: a missing row is how every
-    deployment behaved before the switch existed, and must keep delivering.
+    Whether the shop is delivering at all, from the `delivery_enabled` setting.
+
+    Delegates rather than reading the row itself. This used to be its own
+    query, which is two implementations of one rule: the website asks here,
+    the bot and the order service ask store_hours, and the day the two stopped
+    agreeing the shop would have taken an order it had already decided it
+    could not fulfil. Only an explicit "false" turns delivery off - a missing
+    row is how every deployment behaved before the switch existed, and must
+    keep delivering.
     """
-    from app.models.site_settings import SiteSettings
-    row = db.query(SiteSettings).filter(SiteSettings.key == "delivery_enabled").first()
-    return not (row and (row.value or "").strip().lower() == "false")
+    from app.services.store_hours import delivery_enabled
+    return delivery_enabled(db)
 
 
 # ─── CUSTOMER ─────────────────────────────────────────
