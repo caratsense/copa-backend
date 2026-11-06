@@ -179,19 +179,79 @@ def get_next_available_time(db: Session) -> datetime:
 # checkout page had shown them 2 PM.
 MIN_LEAD_HOURS = 5
 
+# ── Two switches the shop can throw ───────────────────────────────────────
+#
+# Both live here rather than in the website or the bot, because both of those
+# have to agree with what the API will accept. The bot used to decide its own
+# earliest date and got a different answer from the website; that is the
+# mistake this module exists to prevent, and a switch read in two places
+# would reintroduce it.
 
-def earliest_delivery_time(now: datetime | None = None) -> datetime:
-    """The soonest a customer may ask for, in IST."""
+# "false" turns delivery off and leaves collection running. Absent means
+# delivering, which is how the shop behaved before the switch existed, so an
+# upgrade cannot silently stop delivery.
+DELIVERY_ENABLED_KEY = "delivery_enabled"
+
+# A date, ISO format. While today is on or before it, nothing can be ordered
+# for today - the earliest is tomorrow. It is a DATE and not a flag so that it
+# expires by itself: the kitchen being swamped is a Tuesday problem, and a
+# flag someone has to remember to turn off is how a shop ends up refusing
+# same-day orders in December because of a Tuesday in November.
+SAME_DAY_BLOCK_KEY = "same_day_blocked_until"
+
+
+def delivery_enabled(db: Session) -> bool:
+    """Whether the shop is taking deliveries at all, as opposed to collection."""
+    value = _setting(db, (DELIVERY_ENABLED_KEY,))
+    return (value or "true").strip().lower() != "false"
+
+
+def same_day_blocked(db: Session, today: date) -> bool:
+    """Whether an order placed on `today` must be for tomorrow or later."""
+    value = _setting(db, (SAME_DAY_BLOCK_KEY,))
+    if not value:
+        return False
+    try:
+        return today <= date.fromisoformat(value.strip())
+    except ValueError:
+        # A date nobody can parse is not a reason to stop taking orders.
+        return False
+
+
+def earliest_delivery_time(now: datetime | None = None,
+                           db: Session | None = None) -> datetime:
+    """
+    The soonest a customer may ask for, in IST.
+
+    `db` is optional so that the callers which only know the clock keep
+    working; pass it wherever the answer has to respect the shop's switches,
+    which is everywhere a customer is shown or sold a time.
+    """
     base = (now or datetime.now(IST)).astimezone(IST)
-    return base + timedelta(hours=MIN_LEAD_HOURS)
+    floor = base + timedelta(hours=MIN_LEAD_HOURS)
+
+    if db is not None and same_day_blocked(db, base.date()):
+        opens, _ = _get_hours(db)
+        tomorrow = datetime.combine(base.date() + timedelta(days=1), opens, tzinfo=IST)
+        return max(floor, tomorrow)
+    return floor
 
 
-def check_delivery_lead_time(requested: datetime | None) -> None:
+def check_delivery_lead_time(requested: datetime | None,
+                             db: Session | None = None) -> None:
     """Refuse a delivery time the kitchen cannot meet."""
     if requested is None:
         return
     moment = requested if requested.tzinfo else requested.replace(tzinfo=IST)
-    if moment.astimezone(IST) < earliest_delivery_time():
+    moment = moment.astimezone(IST)
+    if moment < earliest_delivery_time(db=db):
+        now = datetime.now(IST)
+        if db is not None and same_day_blocked(db, now.date()) and moment.date() <= now.date():
+            raise HTTPException(
+                status_code=422,
+                detail=("We are fully booked today. The earliest we can have "
+                        "your cake ready is tomorrow."),
+            )
         raise HTTPException(
             status_code=422,
             detail=(
@@ -286,7 +346,7 @@ def slots_for_date(db: Session, day: date, now: datetime | None = None) -> list[
     so the bot cannot offer a time the API will then refuse with a 422.
     """
     opens, closes = _get_hours(db)
-    earliest = earliest_delivery_time(now)
+    earliest = earliest_delivery_time(now, db)
 
     available = []
     for slot in DELIVERY_SLOTS:

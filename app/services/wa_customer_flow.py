@@ -923,13 +923,36 @@ def _reply_to_customer(phone: str, message: str, user: Optional[User]) -> str:
         # ─── CAKE MESSAGE ────────────────────
         if step == "CAKE_MESSAGE":
             cake_msg = "" if act == "SKIP" else message.strip()
-            _set_state(phone, {**state, "step": "DELIVERY_ADDRESS", "cake_message": cake_msg})
+            state = {**state, "cake_message": cake_msg}
+
+            # Collection only? Then there is no address to ask for.
+            #
+            # Asking anyway and refusing the answer is the worst of both: the
+            # customer types their street, waits, and is told it was never an
+            # option. The same switch the website reads decides it here, so
+            # the two cannot disagree about whether the shop delivers.
+            from app.services.store_hours import delivery_enabled
+            if not delivery_enabled(db):
+                return ("We are collection only at the moment — your cake will be "
+                        "ready to pick up from the shop.\n\n"
+                        + _go_to_dates(db, phone, {**state, "address": "Self Pickup"}))
+
+            _set_state(phone, {**state, "step": "DELIVERY_ADDRESS"})
             return "Please share your delivery address with a landmark.\nFor self-pickup, reply *pickup*."
 
         # ─── ADDRESS ─────────────────────────
         if step == "DELIVERY_ADDRESS":
             addr = message.strip()
             is_pickup = addr.upper() in ("PICKUP", "SELF PICKUP")
+
+            # Delivery switched off while this customer was mid-conversation.
+            # Their state still says to ask for an address; the shop no longer
+            # has one to deliver to. Collection, rather than a dead end.
+            from app.services.store_hours import delivery_enabled
+            if not delivery_enabled(db) and not is_pickup:
+                return ("We have just stopped taking deliveries for now — "
+                        "collection only.\n\n"
+                        + _go_to_dates(db, phone, {**state, "address": "Self Pickup"}))
 
             # A question is never an address: this step takes whatever arrives,
             # which is how "cake above 3.5kg" became the delivery address and

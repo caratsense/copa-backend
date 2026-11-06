@@ -102,8 +102,22 @@ def create_order(db: Session, data: OrderCreate) -> Order:
     # in the past to the next available slot, which is how an order placed at
     # 6 PM for "today, 2 PM" was accepted and confirmed for a time nobody
     # chose. Every cake is baked to order; tomorrow is the earliest.
-    from app.services.store_hours import check_delivery_lead_time
-    check_delivery_lead_time(data.delivery_time)
+    from app.services.store_hours import check_delivery_lead_time, delivery_enabled
+
+    # ── Is the shop delivering at all? ──
+    # The admin switch is enforced here and not only greyed out at checkout.
+    # The checkout posts a fulfilment string, so a Delivery button hidden in
+    # the UI stops nobody who has the old page open, a stale tab, or the API.
+    # Collection is deliberately untouched: switching delivery off must leave
+    # the shop still able to sell.
+    if str(data.fulfilment).upper() == "DELIVERY" and not delivery_enabled(db):
+        raise HTTPException(
+            status_code=422,
+            detail=("We are not delivering at the moment — collection only. "
+                    "Please choose self-pickup."),
+        )
+
+    check_delivery_lead_time(data.delivery_time, db)
 
     schedule = schedule_order_delivery(db, data.delivery_time)
 
