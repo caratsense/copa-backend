@@ -30,11 +30,35 @@ from app.services.event_service import emit_event
 router = APIRouter(prefix="/orders", tags=["Orders"])
 
 
+def _delivery_enabled(db: Session) -> bool:
+    """
+    Whether the shop is delivering at all, from the `delivery_enabled` site
+    setting. Only an explicit "false" turns it off: a missing row is how every
+    deployment behaved before the switch existed, and must keep delivering.
+    """
+    from app.models.site_settings import SiteSettings
+    row = db.query(SiteSettings).filter(SiteSettings.key == "delivery_enabled").first()
+    return not (row and (row.value or "").strip().lower() == "false")
+
+
 # ─── CUSTOMER ─────────────────────────────────────────
 
 @router.post("", response_model=OrderRead, status_code=201)
 def create(data: OrderCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Create a new order — prices calculated automatically, coupons applied."""
+    # Checked HERE, on the website's route, and not in create_order: the
+    # WhatsApp flow builds its own order through the service and handles this
+    # inside the conversation, where a refusal can be said in words rather
+    # than surfacing as an error mid-chat. The checkout greys Delivery out
+    # when the setting is off, so this only fires for a page loaded before
+    # the switch flipped - but it has to fire, or that stale page could place
+    # the one kind of order the shop cannot fulfil right now.
+    if data.fulfilment == "DELIVERY" and not _delivery_enabled(db):
+        raise HTTPException(
+            status_code=409,
+            detail="We're only taking self-pickup orders right now. "
+                   "Please choose Self Pickup, or try again in a few days.",
+        )
     data.user_id = user.id
     return create_order(db, data)
 
