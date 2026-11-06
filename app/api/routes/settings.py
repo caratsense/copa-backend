@@ -65,8 +65,21 @@ def get_store_hours(db: Session = Depends(get_db)):
     - Whether store is currently open
     - Opening/closing times
     - Message for the customer
+    - The earliest date an order may be placed for
+
+    That last one is here, on a call the checkout already makes, rather than
+    as a setting the page has to read and interpret for itself. The checkout
+    was computing its own earliest date from the browser's clock, so when the
+    kitchen closed same-day ordering the date picker carried on offering
+    today: the customer chose it, filled the form in, picked a slot and was
+    refused on submit. The bot had the right answer because it asks the
+    server. Now both ask the same question of the same function.
     """
-    return is_store_open(db)
+    from app.services.store_hours import earliest_delivery_time
+
+    hours = dict(is_store_open(db))
+    hours["earliest_date"] = earliest_delivery_time(db=db).date().isoformat()
+    return hours
 
 
 @router.get("/public", response_model=list[SiteSettingRead])

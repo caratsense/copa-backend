@@ -222,3 +222,27 @@ def test_the_owners_private_number_is_still_not_public(client):
     table, brand_phone included. Adding a key to it must not become a habit.
     """
     assert client.get("/settings/public/brand_phone").status_code == 404
+
+
+def test_the_checkout_is_told_the_earliest_date_it_may_offer(client, db, clean_settings):
+    """
+    The second half of the same-day block, and the half that was missing.
+
+    The checkout computed its earliest date from the browser's clock, so
+    blocking same-day orders server-side left the date picker still offering
+    today: the customer chose it, filled the form in, picked a slot, and was
+    refused on submit by a rule the page never saw. The bot was always right
+    because it asks the server which dates to offer. Now the checkout asks
+    too, on a call it already made.
+    """
+    from datetime import date, timedelta
+
+    _set(db, SAME_DAY_BLOCK_KEY, date.today().isoformat())
+    blocked = client.get("/settings/store-hours").json()
+    assert blocked["earliest_date"] == (date.today() + timedelta(days=1)).isoformat()
+
+    row = db.query(SiteSettings).filter(SiteSettings.key == SAME_DAY_BLOCK_KEY).first()
+    if row:
+        db.delete(row)
+        db.commit()
+    assert client.get("/settings/store-hours").json()["earliest_date"] == date.today().isoformat()
