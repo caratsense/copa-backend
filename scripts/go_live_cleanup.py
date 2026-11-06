@@ -50,6 +50,7 @@ from app.models.review import Review
 from app.models.shift import Shift
 from app.models.trusted_device import TrustedDevice
 from app.models.user import User, UserRole
+from app.models.whatsapp_message import WhatsAppMessage
 
 # (id, the name it was surveyed under). The name is a checksum on the id, not
 # a lookup: if the two ever disagree the database is not the one this manifest
@@ -132,7 +133,27 @@ def main() -> int:
             print("Re-run with --apply.")
             return 0
 
-        # ── orders first: everything else references them ──
+        # ── two things point at an order and are NOT cascaded ──
+        #
+        # Order cascades its items, events and attachments. Reviews and
+        # WhatsApp messages carry an order_id too, with no cascade and no
+        # relationship on Order to find them through - so deleting an order
+        # they reference raises a foreign key violation partway through,
+        # which on a thirty-order delete means a half-finished cleanup.
+        #
+        # Both columns are nullable, so the reference is dropped rather than
+        # the row: a review is about the cake and survives its order, and the
+        # WhatsApp history is a record of what the shop said to somebody.
+        order_ids = [o.id for o in orders]
+        if order_ids:
+            for model in (Review, WhatsAppMessage):
+                detached = (db.query(model)
+                              .filter(model.order_id.in_(order_ids))
+                              .update({"order_id": None}, synchronize_session=False))
+                if detached:
+                    print(f"  detached {detached} {model.__tablename__} row(s) "
+                          f"from the orders being deleted")
+
         # Deleted one at a time rather than with a bulk query, so the
         # cascades configured on the relationships (items, events,
         # attachments) actually run.
