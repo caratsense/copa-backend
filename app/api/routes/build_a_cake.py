@@ -53,7 +53,7 @@ MIN_ORDERABLE_KG = MIN_CUSTOM_CAKE_KG
 
 # The product each sponge is priced from. The premium products are deliberately
 # absent: a premium cake is the base sponge plus a premium flavour's surcharge
-# (2000 + 250 = 2250, which is exactly what "Vanilla Premium Cake" costs), so
+# (2250 + 250 = 2500, which is exactly what "Vanilla Premium Cake" costs), so
 # offering both would be two routes to one cake at one price, and a customer
 # picking the premium product AND a premium flavour would be charged the
 # surcharge twice.
