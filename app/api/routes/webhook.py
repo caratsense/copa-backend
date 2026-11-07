@@ -896,27 +896,42 @@ def _handle_new_user(db, phone, text):
             db.commit()
             _signup_clear(phone)
 
-            reply = (
-                f"Welcome, {name}! Your account has been created.\n\n"
+            # Answer what they came for. They asked it two messages ago and
+            # have been doing paperwork ever since; making them type it again
+            # is the kind of thing that loses the enquiry.
+            asked = (pending.get("asked") or "").strip()
+            answer_to_first = ""
+            if asked and not _looks_like_a_name(asked):
+                try:
+                    answer_to_first = handle_customer_message(phone, asked, new_user) or ""
+                except Exception as exc:  # never fail a signup over this
+                    logger.error("[WA] could not answer the opening message: %s", exc)
+
+            # ONE menu, whichever branch supplies it.
+            #
+            # This used to print its own "1. Place an order / 2. Track an
+            # order / 3. View our menu" and then append the answer below a
+            # dash - and for anybody who opened with "hi" that answer is the
+            # standard welcome, carrying the very same menu. Two numbered
+            # runs in one message, so wa_interactive declined to convert it,
+            # and the first thing every new customer ever saw went out as
+            # plain text with nothing to tap. It looked correct only in the
+            # chats of people who already had an account.
+            #
+            # Deliberately not fixed by teaching the parser to merge two
+            # identical runs: the message was also asking "How can I assist
+            # you?" twice, which is wrong however it is rendered.
+            greeting = f"Welcome, {name}! Your account has been created."
+            if answer_to_first:
+                return f"{greeting}\n\n{answer_to_first}"
+            return (
+                f"{greeting}\n\n"
                 f"How can I assist you?\n"
                 f"1. Place an order\n"
                 f"2. Track an order\n"
                 f"3. View our menu\n\n"
                 f"{SITE}"
             )
-
-            # Answer what they came for. They asked it two messages ago and
-            # have been doing paperwork ever since; making them type it again
-            # is the kind of thing that loses the enquiry.
-            asked = (pending.get("asked") or "").strip()
-            if asked and not _looks_like_a_name(asked):
-                try:
-                    answer_to_first = handle_customer_message(phone, asked, new_user)
-                    if answer_to_first:
-                        reply += f"\n\n\u2014\n\n{answer_to_first}"
-                except Exception as exc:  # never fail a signup over this
-                    logger.error("[WA] could not answer the opening message: %s", exc)
-            return reply
 
         if answer in ("NO", "N", "NAHI", "NAH"):
             _signup_clear(phone)

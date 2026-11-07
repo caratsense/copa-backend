@@ -231,7 +231,11 @@ def help_text(role: UserRole) -> str:
 # be the ONLY thing they ever got: every message that was not a command came
 # back as this, including "hi". Saying that the assistant is there is what
 # stops the number looking broken to the people who run the shop.
-ALSO_ASK = "\n\nOr just ask me anything — prices, flavours, delivery, or an order you want to place."
+# "timings" rather than "delivery": this line has no database handle to
+# check whether the shop is delivering this week, and offering to answer
+# questions about a service that is switched off is worse than being
+# vague. Timings is true whether the cake is delivered or collected.
+ALSO_ASK = "\n\nOr just ask me anything — prices, flavours, timings, or an order you want to place."
 
 
 def staff_help(role: UserRole) -> str:

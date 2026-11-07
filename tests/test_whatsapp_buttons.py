@@ -478,3 +478,73 @@ def test_a_failed_upload_still_sends_the_picture_as_a_link(sent_messages):
                "3. Three — ₹3\n4. Four — ₹4")
 
     assert sent_messages[0]["image"]["link"].endswith("/wa/cookies.jpg")
+
+
+# ──── The first message a new customer ever sees ────────────────────────────────────────
+
+
+WELCOME = (
+    "Welcome to Cake O' Clock.\n\n"
+    "We offer premium handcrafted cakes with 40+ flavors, ready to collect "
+    "from our Lucknow kitchen.\n\n"
+    "How can I assist you?\n\n"
+    "1. Place an order\n"
+    "2. Track an order\n"
+    "3. View our menu\n\n"
+    "You can also ask me anything about our cakes, pricing, or collection.\n\n"
+    "https://cakeoclock.co.in"
+)
+
+
+def test_two_menus_in_one_message_are_still_refused():
+    """
+    The rule that caused the bug, kept on purpose.
+
+    Two numbered runs are ambiguous about which one is being offered, and
+    attaching the wrong number to the wrong label fails silently - the
+    conversation answers the wrong choice perfectly plausibly. So this stays
+    as plain text, and messages are written with one menu instead.
+    """
+    _, options = parse_options(
+        "Welcome!\n\nHow can I assist you?\n1. Place an order\n"
+        "2. Track an order\n3. View our menu\n\n"
+        "—\n\n"
+        "Welcome to Cake O' Clock.\n\nHow can I assist you?\n"
+        "1. Place an order\n2. Track an order\n3. View our menu"
+    )
+    assert options == []
+
+
+def test_a_new_customers_welcome_arrives_with_buttons(sent_messages):
+    """
+    What a brand new customer gets.
+
+    The signup reply used to print its own copy of this menu and then append
+    the welcome below a dash, which answered "How can I assist you?" twice
+    and gave the message two numbered runs. The parser declined it, so the
+    very first message anyone received went out as plain text with nothing
+    to tap - and it looked right in the chats of everyone who already had an
+    account, because they were sent one menu.
+    """
+    send_reply("919999999999",
+               "Welcome, Vedant! Your account has been created.\n\n" + WELCOME)
+
+    sent = [m for m in sent_messages if m.get("type") == "interactive"]
+    assert sent, "the welcome went out as plain text again"
+    interactive = sent[0]["interactive"]
+    assert interactive["type"] == "button"
+    assert [b["reply"]["title"] for b in interactive["action"]["buttons"]] == [
+        "Place an order", "Track an order", "View our menu",
+    ]
+    # The ids are the numbers the flow already understands.
+    assert [b["reply"]["id"] for b in interactive["action"]["buttons"]] == ["1", "2", "3"]
+
+
+def test_the_greeting_survives_above_the_buttons(sent_messages):
+    """The customer is still greeted by name; only the menu is lifted out."""
+    send_reply("919999999999",
+               "Welcome, Vedant! Your account has been created.\n\n" + WELCOME)
+
+    body = [m for m in sent_messages if m.get("type") == "interactive"][0]["interactive"]["body"]["text"]
+    assert "Welcome, Vedant!" in body
+    assert "1. Place an order" not in body

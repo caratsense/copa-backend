@@ -782,14 +782,23 @@ def _reply_to_customer(phone: str, message: str, user: Optional[User]) -> str:
         # ─── WELCOME ─────────────────────────
         if act == "WELCOME" or (step == "IDLE" and act == "UNKNOWN"):
             _set_state(phone, {"step": "IDLE"})
+            # What the shop is actually doing this week, not what it does in
+            # general. Promising delivery across Lucknow while the kitchen is
+            # taking collection only is the first sentence a new customer
+            # reads, and it is the one they will quote back.
+            from app.services.store_hours import delivery_enabled
+            how = ("delivered across Lucknow" if delivery_enabled(db)
+                   else "ready to collect from our Lucknow kitchen")
+            ask = ("our cakes, pricing, or delivery" if delivery_enabled(db)
+                   else "our cakes, pricing, or collection")
             return (
                 f"Welcome to Cake O' Clock.\n\n"
-                f"We offer premium handcrafted cakes with 40+ flavors, delivered across Lucknow.\n\n"
+                f"We offer premium handcrafted cakes with 40+ flavors, {how}.\n\n"
                 f"How can I assist you?\n\n"
                 f"1. Place an order\n"
                 f"2. Track an order\n"
                 f"3. View our menu\n\n"
-                f"You can also ask me anything about our cakes, pricing, or delivery.\n\n"
+                f"You can also ask me anything about {ask}.\n\n"
                 f"{SITE}"
             )
 
