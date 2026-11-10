@@ -372,12 +372,23 @@ def update_order_status(db: Session, order_id: int, data: StatusUpdate, rework: 
     # handover shot. Enforced here rather than in the routes because the
     # website, the admin table and the WhatsApp commands all land on this one
     # function, and a rule that only one of them honours is not a rule.
-    if new_status == OrderStatus.AWAITING_APPROVAL and not order.proof_image:
+    #
+    # Both gates apply only when somebody ELSE made the cake. The photograph
+    # exists so the shop can check work it did not watch being done: a baker
+    # says a cake is finished, and the picture is what turns that into
+    # something Shriya has actually seen. With no baker the shop makes the
+    # cake itself, and the person who would take the photograph is the person
+    # who would approve it - so it is a picture taken to show yourself, and a
+    # step standing between the shop and its own counter.
+    made_by_someone_else = order.assigned_baker_id is not None
+    if (new_status == OrderStatus.AWAITING_APPROVAL
+            and made_by_someone_else and not order.proof_image):
         raise HTTPException(
             status_code=400,
             detail="Upload a photo of the finished cake before sending it for approval.",
         )
-    if new_status == OrderStatus.PACKAGED and not order.proof_verified_at:
+    if (new_status == OrderStatus.PACKAGED
+            and made_by_someone_else and not order.proof_verified_at):
         raise HTTPException(
             status_code=400,
             detail=("This cake has not been checked yet. It needs to be approved "

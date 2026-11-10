@@ -104,12 +104,11 @@ def test_a_paid_collection_goes_all_the_way_through_with_no_baker(
                  reason="No baker assigned - the shop is making this in-house").status_code == 200
     assert _move(client, admin, oid, "IN_PRODUCTION").status_code == 200
 
-    # The cake cannot be offered for checking unseen, and with no baker the
-    # admin is the one holding the phone.
-    refused = _move(client, admin, oid, "AWAITING_APPROVAL")
-    assert refused.status_code == 400
-    assert "photo" in refused.json()["detail"].lower()
-
+    # She may still photograph it — the endpoint takes an admin — and this
+    # walk does, because a shop that wants the record should be able to keep
+    # one. What it must NOT do is demand it: see
+    # test_an_in_house_cake_needs_no_photograph for the same walk with no
+    # photograph at all.
     shot = client.post(
         f"/orders/{oid}/proof",
         files={"file": ("cake.png", io.BytesIO(_png()), "image/png")},
@@ -119,9 +118,6 @@ def test_a_paid_collection_goes_all_the_way_through_with_no_baker(
     assert shot.json()["proof_image"]
 
     assert _move(client, admin, oid, "AWAITING_APPROVAL").status_code == 200
-
-    # Packing waits on somebody having looked at that photograph.
-    assert _move(client, admin, oid, "PACKAGED").status_code == 400
     assert client.post(f"/orders/{oid}/verify-proof", headers=auth(admin)).status_code == 200
     assert _move(client, admin, oid, "PACKAGED").status_code == 200
 
@@ -236,3 +232,65 @@ def test_a_real_baker_is_still_preferred_when_there_is_one(client, db, admin, pa
 
     db.refresh(paid_pickup)
     assert paid_pickup.assigned_baker_id == baker.id
+
+
+# ── The photograph is for work somebody else did ─────────────────────────
+
+
+def test_an_in_house_cake_needs_no_photograph(client, db, admin, paid_pickup):
+    """
+    Shriya photographing a cake so that Shriya can approve the photograph is
+    a step between the shop and its own counter.
+
+    The gate exists so the shop can see work it did not watch being done. With
+    nobody else involved there is nothing to check up on — the quality check
+    is her looking at the cake in front of her.
+    """
+    oid = paid_pickup.id
+    assert _move(client, admin, oid, "ASSIGNED").status_code == 200
+    assert _move(client, admin, oid, "IN_PRODUCTION").status_code == 200
+
+    # No photo on the order at all.
+    db.refresh(paid_pickup)
+    assert paid_pickup.proof_image is None
+    assert paid_pickup.assigned_baker_id is None
+
+    assert _move(client, admin, oid, "AWAITING_APPROVAL").status_code == 200
+    assert _move(client, admin, oid, "PACKAGED").status_code == 200
+    assert _move(client, admin, oid, "READY_FOR_PICKUP").status_code == 200
+
+    db.refresh(paid_pickup)
+    assert paid_pickup.status == OrderStatus.READY_FOR_PICKUP
+
+
+def test_a_baker_still_cannot_wave_a_cake_through_unseen(client, db, admin, customer):
+    """
+    The other half, and the reason the gate exists at all.
+
+    "Baked" used to be a button, and the shop's only record that a cake had
+    been made was that somebody pressed it. The moment an order belongs to
+    somebody else, the photograph is required again.
+    """
+    baker = make_user(db, "Shreyansh Baker", UserRole.BAKER)
+    order = make_order(db, customer, status=OrderStatus.IN_PRODUCTION,
+                       fulfilment="PICKUP", baker=baker, with_proof=False)
+    order.payment_method = "ONLINE"
+    order.payment_status = PaymentStatus.PAID
+    db.commit()
+
+    refused = _move(client, admin, order.id, "AWAITING_APPROVAL")
+    assert refused.status_code == 400
+    assert "photo" in refused.json()["detail"].lower()
+
+    shot = client.post(
+        f"/orders/{order.id}/proof",
+        files={"file": ("cake.png", io.BytesIO(_png()), "image/png")},
+        headers=auth(admin),
+    )
+    assert shot.status_code == 200
+    assert _move(client, admin, order.id, "AWAITING_APPROVAL").status_code == 200
+
+    # And packing still waits on somebody having looked at that photograph.
+    assert _move(client, admin, order.id, "PACKAGED").status_code == 400
+    assert client.post(f"/orders/{order.id}/verify-proof", headers=auth(admin)).status_code == 200
+    assert _move(client, admin, order.id, "PACKAGED").status_code == 200
