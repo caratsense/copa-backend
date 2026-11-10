@@ -34,3 +34,20 @@ class OrderItem(Base):
         """
         product = self.__dict__.get("product")
         return getattr(product, "name", None) if product is not None else None
+
+    @property
+    def product_image(self) -> str | None:
+        """
+        The catalogue photograph of the cake that was ordered.
+
+        The staff screens described an order in words alone — "1kg Vanilla
+        Cookie Cream Cake" — and the catalogue carries five vanilla cakes whose
+        names differ by one word. Whoever is making it had nothing to check
+        against, which is how the wrong cake gets made.
+
+        Same reasoning as product_name: read through the relationship so a
+        re-uploaded photograph is picked up everywhere at once, and None rather
+        than a lazy fetch when the relationship was deliberately not loaded.
+        """
+        product = self.__dict__.get("product")
+        return getattr(product, "image_url", None) if product is not None else None

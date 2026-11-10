@@ -677,6 +677,13 @@ class OrderItemRead(BaseModel):
     # so the flavour field can mean only "a FlavorRule the customer chose".
     # Populated from OrderItem.product_name (see app/models/order_item.py).
     product_name: Optional[str] = None
+    # The catalogue photograph of that cake. On OrderItemRead rather than on one
+    # screen's own fetch, because every screen that lists an order needs it: the
+    # person making the cake, the person checking it off, and the customer
+    # confirming it is the one they chose. Both read schemas take their items
+    # from here, so the customer's tracking page gets it too.
+    # Populated from OrderItem.product_image (see app/models/order_item.py).
+    product_image: Optional[str] = None
     quantity: int
     customization: dict
     price: float

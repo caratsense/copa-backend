@@ -66,7 +66,22 @@ def auto_assign_baker(db: Session, order_id: int, force: bool = False) -> Order:
     bakers = query.all()
 
     if not bakers:
-        raise HTTPException(status_code=400, detail="No bakers available." + (" All are off-duty or inactive." if not force else " No active bakers found."))
+        # Says what to do next, because for a shop with no baker on the books
+        # this is not a transient failure - it is every order, and the old
+        # wording ("No bakers available. No active bakers found.") read as a
+        # dead end on the one screen that has to keep moving. The shop can
+        # make the cake itself; the admin order screen offers exactly that.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No bakers available. All of them are off duty or deactivated - "
+                "turn one back on under Staff."
+                if not force else
+                "There are no bakers on the books yet. You can still take this "
+                "order through yourself with “Make it in-house”, or add a "
+                "baker under Staff."
+            ),
+        )
 
     active_statuses = [OrderStatus.ASSIGNED, OrderStatus.IN_PRODUCTION, OrderStatus.QC]
 

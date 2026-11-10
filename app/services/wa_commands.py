@@ -210,7 +210,7 @@ def help_text(role: UserRole) -> str:
     if key == "admin":
         return ("Commands:\n"
                 "APPROVE <order no> — pass quality check\n"
-                "REJECT <order no> — send back to baker\n"
+                "REJECT <order no> — send it back to the kitchen\n"
                 "PAID <order no>\n"
                 "CANCEL <order no>\n"
                 "ORDERS — today's summary")

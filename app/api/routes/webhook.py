@@ -607,7 +607,7 @@ def _handle_admin(db, user, command):
         if order.status != OrderStatus.AWAITING_APPROVAL:
             return f"Order #{order.id} is {order.status.value}. Only orders awaiting approval can be sent back."
         update_order_status(db, order.id, StatusUpdate(status="IN_PRODUCTION"), rework=True)
-        return f"Order #{order.id} sent back to the baker."
+        return f"Order #{order.id} sent back to the kitchen."
 
     if act == "ADMIN_PAID":
         from app.services.order_service import update_payment_status

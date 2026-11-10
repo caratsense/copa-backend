@@ -87,7 +87,7 @@ def _clear_state(phone):
     else: _memory.pop(phone, None)
 
 
-def _date_prompt(db) -> tuple[str, list[dict]]:
+def _date_prompt(db, collecting: bool = False) -> tuple[str, list[dict]]:
     """
     The date question, built from the days the kitchen can actually meet.
 
@@ -103,10 +103,33 @@ def _date_prompt(db) -> tuple[str, list[dict]]:
     options = delivery_date_options(db)
     if not options:
         return ("", [])
-    lines = ["*Delivery date:*\n"]
+    # The shop is collection-only at the moment, and asking somebody who
+    # is walking in to choose a "delivery date" is the same small lie as
+    # telling them a rider is on the way. The dates are identical; only
+    # the word for what happens on them changes.
+    lines = [f"*{'Collection' if collecting else 'Delivery'} date:*\n"]
     for i, o in enumerate(options, 1):
         lines.append(f"{i}. {o['label']}")
     return ("\n".join(lines), options)
+
+
+def is_collecting(address: str | None) -> bool:
+    """Whether this order is being fetched rather than taken anywhere."""
+    return (address or "").strip().lower() in ("self pickup", "pickup")
+
+
+def _fulfilment_line(address: str | None) -> str:
+    """
+    How the order reaches the customer, on the summary they confirm.
+
+    It read "Delivery: Self Pickup" — a line labelled Delivery whose own value
+    says it is not one. Pulled out of the summary so it can be tested without
+    driving an eight-step conversation to reach it, which is why it was wrong
+    for as long as it was.
+    """
+    if is_collecting(address):
+        return "Collection: from the shop\n"
+    return f"Delivery: {address}\n"
 
 
 def _slot_prompt(slots: list[dict]) -> str:
@@ -134,7 +157,13 @@ def _go_to_dates(db, phone: str, state: dict) -> str:
     deriving the date again from the number would land on a different day for
     anyone who answered slowly.
     """
-    text, options = _date_prompt(db)
+    # Read off the conversation rather than passed in: eight call sites
+    # reach this, and one of them forgetting the flag is how the wording
+    # drifts back.
+    from app.services.store_hours import delivery_enabled
+
+    collecting = is_collecting(state.get("address")) or not delivery_enabled(db)
+    text, options = _date_prompt(db, collecting)
     if not options:
         _clear_state(phone)
         return NO_DATES + SITE
@@ -848,16 +877,27 @@ def _reply_to_customer(phone: str, message: str, user: Optional[User]) -> str:
                 )
                 if order:
                     from app.services.order_service import _enrich_order
+                    from app.services.wa_notifications import (
+                        customer_status_phrase, items_summary, scheduled_for,
+                    )
                     _enrich_order(order)
-                    items = ", ".join([f"{i.customization.get('size', '')} {i.customization.get('flavor', '')}" for i in order.items]) if order.items else "Cake"
-                    status_map = {"CONFIRMED": "Order confirmed", "ASSIGNED": "Assigned to baker", "IN_PRODUCTION": "Being prepared",
-                        "AWAITING_APPROVAL": "Quality check", "PACKAGED": "Ready for delivery", "OUT_FOR_DELIVERY": "Out for delivery",
-                        "DELIVERED": "Delivered", "CANCELLED": "Cancelled"}
+                    # Both of these were written out by hand here and were
+                    # wrong in the same two ways the notification templates
+                    # once were. The items line read size and flavour only, so
+                    # a brownie - which has neither - came back as a bare
+                    # space. And the status map named a baker, missed every
+                    # collection state, and told someone coming to fetch their
+                    # cake it was "Ready for delivery".
+                    items = items_summary(order)
+                    status = customer_status_phrase(order)
+                    collecting = order.is_pickup
                     return (
                         f"*Order #{order.id}*\n\n"
                         f"Items: {items}\n"
                         f"Amount: ₹{order.total_price:,.0f}\n"
-                        f"Status: {status_map.get(order.status.value, order.status.value)}\n\n"
+                        f"{'Collection' if collecting else 'Delivery'}: "
+                        f"{scheduled_for(order)}\n"
+                        f"Status: {status}\n\n"
                         f"Track online: {SITE}/track?id={order.id}"
                     )
                 # Deliberately identical whether the order is missing or
@@ -1293,8 +1333,8 @@ def _reply_to_customer(phone: str, message: str, user: Optional[User]) -> str:
             if cake_msg:
                 summary += f"Message: \"{cake_msg}\"\n"
             summary += (
-                f"Delivery: {addr}\n"
-                f"Date: {ddate_display} — {time_label}\n\n"
+                _fulfilment_line(addr)
+                + f"Date: {ddate_display} — {time_label}\n\n"
                 f"*Total: ₹{total:,.0f}*\n\n"
                 f"Reply *confirm* to place this order.\n"
                 f"Reply *cancel* to start over."

@@ -38,7 +38,43 @@ def _consenting_admins(db: Session) -> list[User]:
     ]
 
 
-def _items_str(order: Order) -> str:
+def customer_status_phrase(order: Order) -> str:
+    """
+    What to tell a customer their order is doing, in their words.
+
+    Two things this fixes, both of which the customer read on WhatsApp.
+
+    ASSIGNED said "Assigned to baker". There is no baker — the shop makes
+    these itself — so it was telling the customer about a person who does not
+    exist. "With our kitchen" is true either way, which is the point: the
+    customer does not care who is holding it, only that somebody is.
+
+    And the map covered eight statuses out of thirteen. The five missing ones
+    included every collection state, so a customer who asked where their
+    pickup order was got the raw enum back: "Status: READY_FOR_PICKUP".
+    PACKAGED said "Ready for delivery" to someone who was coming to fetch it.
+    """
+    status = order.status.value if hasattr(order.status, "value") else str(order.status)
+    pickup = bool(getattr(order, "is_pickup", False))
+    return {
+        "RECEIVED": "Received — being confirmed",
+        "CONFIRMED": "Confirmed",
+        "ASSIGNED": "With our kitchen",
+        "IN_PRODUCTION": "Being made",
+        "QC": "Being checked",
+        "AWAITING_APPROVAL": "Being checked",
+        "PACKAGED": "Packed and ready to collect" if pickup else "Packed, about to go out",
+        "READY_FOR_PICKUP": "Ready to collect",
+        "COLLECTED": "Collected — thank you!",
+        "NOT_COLLECTED": "Waiting for you at the shop",
+        "OUT_FOR_DELIVERY": "On its way to you",
+        "DELIVERED": "Delivered",
+        "DELIVERY_FAILED": "We could not deliver it — we will be in touch",
+        "CANCELLED": "Cancelled",
+    }.get(status, status.replace("_", " ").capitalize())
+
+
+def items_summary(order: Order) -> str:
     """
     Build a human-readable items string.
 
@@ -57,7 +93,14 @@ def _items_str(order: Order) -> str:
     return ", ".join(parts) or "Cake"
 
 
-def _delivery_str(order: Order) -> str:
+# The old name, kept because it is what the tests and the rest of this module
+# call. The public one exists so the WhatsApp bot can use the same assembly
+# rather than its own, which read size and flavour only and printed a bare
+# space for anything the customer did not choose a flavour for.
+_items_str = items_summary
+
+
+def scheduled_for(order: Order) -> str:
     """
     Delivery time, rendered in IST.
 
@@ -69,6 +112,9 @@ def _delivery_str(order: Order) -> str:
     if not order.delivery_time:
         return "ASAP"
     return to_ist(order.delivery_time).strftime("%d %b, %I:%M %p")
+
+
+_delivery_str = scheduled_for
 
 
 def _maps_link(address: str) -> str:
@@ -97,13 +143,23 @@ def _money(value) -> str:
         return "0.00"
 
 
-def _send(db, order, template_key, recipient, params, event_type, role, allowed):
-    """One notification: skipped-with-reason, or attempted and recorded."""
+def _send(db, order, template_key, recipient, params, event_type, role, allowed,
+          skip_reason: str | None = None):
+    """
+    One notification: skipped-with-reason, or attempted and recorded.
+
+    `skip_reason` is for when the caller knows something this function cannot:
+    that there is nobody in the role at all. "No phone number on record" reads
+    like a broken staff account, and a shop with no baker would have collected
+    one of those against every order it made itself.
+    """
     # Order matters: `allowed` already folds in "has a phone number", so
     # checking it first would report a missing number as a consent problem and
     # send whoever reads the outbox looking in the wrong place.
-    reason = None
-    if not settings.WHATSAPP_ENABLED:
+    reason = skip_reason
+    if reason:
+        pass
+    elif not settings.WHATSAPP_ENABLED:
         reason = "WHATSAPP_ENABLED is false"
     elif not recipient:
         reason = "no phone number on record"
@@ -137,6 +193,11 @@ def notify_baker_assigned(db: Session, order: Order) -> None:
         [str(order.id), _items_str(order), order.notes or "None", _delivery_str(order)],
         OrderStatus.ASSIGNED.value, "baker",
         may_message(baker) and bool(baker and baker.phone),
+        # Nothing has gone wrong when there is nobody to tell: the shop is
+        # making this one itself, which is its normal way of working until it
+        # hires. Said plainly so the outbox is not a column of red.
+        skip_reason=None if order.assigned_baker_id
+        else "no baker on this order — the shop is making it in-house",
     )
 
 
@@ -229,7 +290,9 @@ def dispatch_notifications(db: Session, order: Order, new_status: str, rework: b
             if rework:
                 _send(db, order, "order_rework",
                       baker.phone if baker else "", [str(order.id)],
-                      new_status, "baker", baker_ok)
+                      new_status, "baker", baker_ok,
+                      skip_reason=None if order.assigned_baker_id
+                      else "no baker on this order — sent back to the shop itself")
             # A baker starting their own order needs no message; they just acted.
 
         # ─── AWAITING_APPROVAL → admin (quality check) ─
