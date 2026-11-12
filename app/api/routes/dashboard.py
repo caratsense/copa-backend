@@ -10,7 +10,7 @@ Admin Dashboard Routes
 from datetime import datetime, timedelta, timezone, date
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import func, cast, Date, or_
+from sqlalchemy import func, or_
 
 from app.db import get_db
 from app.models.user import User
@@ -119,6 +119,22 @@ def get_stats(admin: User = Depends(require_admin), db: Session = Depends(get_db
     )
 
 
+def _bucket(when: datetime, period: str) -> str:
+    """
+    Which day, week or month a sale belongs to, as an ISO date.
+
+    A week is labelled by its Monday and a month by its first, so the label is
+    a real date the caller can parse and sort rather than "2026-W46", which
+    nothing downstream knows how to render.
+    """
+    day = when.date()
+    if period == "weekly":
+        return (day - timedelta(days=day.weekday())).isoformat()
+    if period == "monthly":
+        return day.replace(day=1).isoformat()
+    return day.isoformat()
+
+
 @router.get("/revenue", response_model=RevenueReport)
 def get_revenue_report(
     period: str = Query("daily", pattern="^(daily|weekly|monthly)$"),
@@ -126,36 +142,68 @@ def get_revenue_report(
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Revenue report grouped by day/week/month."""
+    """
+    Revenue grouped by day, week or month.
 
+    TWO THINGS WERE WRONG HERE.
+
+    It grouped with `CAST(created_at AS DATE)`, which is a PostgreSQL answer to
+    a question SQLite answers differently: SQLite has no DATE type, so the cast
+    falls back to numeric affinity, reads the leading digits of
+    "2026-08-12 10:00:00" and returns the integer 2026. Every row collapsed
+    into one bucket called 2026 and the endpoint 500'd on the way out. In
+    production, on Postgres, it worked - so this was invisible until somebody
+    ran the admin dashboard locally, where it is the only screen that fails.
+
+    And `period` was accepted, validated, echoed back in the response, and then
+    ignored: the GROUP BY was by day whatever was asked for, so "monthly"
+    returned a daily series labelled monthly. Nothing called it with anything
+    but the default, which is the only reason that had not been noticed.
+
+    Both go away by bucketing in Python. Day, week and month need date_trunc on
+    Postgres and strftime on SQLite - three dialect-specific expressions to
+    keep in step - whereas this is one implementation that provably agrees
+    across both. The row count is bounded by `days` (365 at most) on a shop
+    doing a handful of orders a day, and only two columns are fetched.
+
+    Days are UTC days, which is what the cast did and what /stats still does.
+    For a Lucknow bakery an IST boundary would be more honest - a 3am order
+    currently counts as the day before - but that shifts every figure the
+    owner has already seen, so it is a decision rather than a bug fix.
+    """
     since = datetime.now(timezone.utc) - timedelta(days=days)
 
     rows = (
-        db.query(
-            cast(Order.created_at, Date).label("day"),
-            func.count(Order.id).label("orders"),
-            func.coalesce(func.sum(Order.total_price), 0.0).label("revenue"),
-        )
+        db.query(Order.created_at, Order.total_price)
         .filter(
             Order.created_at >= since,
             Order.status != OrderStatus.CANCELLED,
             # Same rule as the dashboard tile: only money actually collected.
             Order.payment_status == PaymentStatus.PAID,
         )
-        .group_by(cast(Order.created_at, Date))
-        .order_by(cast(Order.created_at, Date))
         .all()
     )
 
-    data = [{"date": str(r.day), "orders": r.orders, "revenue": round(r.revenue, 2)} for r in rows]
-    total_revenue = sum(d["revenue"] for d in data)
-    total_orders = sum(d["orders"] for d in data)
+    buckets: dict[str, dict] = {}
+    for created_at, total in rows:
+        if created_at is None:
+            continue
+        key = _bucket(created_at, period)
+        bucket = buckets.setdefault(key, {"date": key, "orders": 0, "revenue": 0.0})
+        bucket["orders"] += 1
+        bucket["revenue"] += float(total or 0.0)
+
+    # ISO dates sort lexicographically, so this is chronological.
+    data = [
+        {**bucket, "revenue": round(bucket["revenue"], 2)}
+        for bucket in sorted(buckets.values(), key=lambda b: b["date"])
+    ]
 
     return RevenueReport(
         period=period,
         data=data,
-        total_revenue=round(total_revenue, 2),
-        total_orders=total_orders,
+        total_revenue=round(sum(d["revenue"] for d in data), 2),
+        total_orders=sum(d["orders"] for d in data),
     )
 
 
