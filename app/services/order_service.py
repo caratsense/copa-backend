@@ -22,6 +22,7 @@ from app.models.extra import Extra
 from app.models.pricing import AddonRule
 from app.schemas import OrderCreate, StatusUpdate, PaymentUpdate
 from app.services.pricing_engine import calculate_item_price, lookup_delivery_charge
+from app.services import stock_service
 from app.services.event_service import emit_event
 
 
@@ -163,6 +164,15 @@ def create_order(db: Session, data: OrderCreate) -> Order:
         if not product.is_available:
             raise HTTPException(status_code=400, detail=f"Product '{product.name}' is currently unavailable")
 
+        # Reserve the cake itself, before anything is priced. A sold-out
+        # product used to price and sell perfectly well: is_available is a
+        # different switch - it takes a product off the menu - and nothing
+        # consulted a count, because products did not have one to consult.
+        stock_service.take(
+            db, stock_service.KIND_PRODUCT, product, item_data.quantity,
+            order_id=order.id,
+        )
+
         breakdown = calculate_item_price(
             db=db,
             product=product,
@@ -182,11 +192,19 @@ def create_order(db: Session, data: OrderCreate) -> Order:
         db.add(order_item)
         subtotal += breakdown.line_total
 
-        # Decrement stock for finite addons
+        # The add-ons the customer ticked. Resolved by name because the order
+        # line stores names, not ids, and AddonRule.name is unique.
+        #
+        # This was `addon.stock = max(0, addon.stock - quantity)` with no check
+        # in front of it, so the last topper could be sold twice and the count
+        # floored at zero without telling anybody. See stock_service.take.
         for addon_name in item_data.customization.addons:
             addon = db.query(AddonRule).filter(AddonRule.name == addon_name).first()
-            if addon and addon.stock is not None:
-                addon.stock = max(0, addon.stock - item_data.quantity)
+            if addon is not None:
+                stock_service.take(
+                    db, stock_service.KIND_ADDON, addon, item_data.quantity,
+                    order_id=order.id,
+                )
 
     items_subtotal = round(subtotal, 2)
 
@@ -207,6 +225,9 @@ def create_order(db: Session, data: OrderCreate) -> Order:
                 detail=f"These extras are unavailable: {sorted(missing)}",
             )
         for e in rows:
+            # One of each: data.extras is de-duplicated into a set above, so a
+            # balloon bundle counts once however many times it was sent.
+            stock_service.take(db, stock_service.KIND_EXTRA, e, 1, order_id=order.id)
             price = float(e.price or 0.0)
             extras_total += price
             extras_snapshot.append({"id": e.id, "name": e.name, "price": price})
@@ -430,13 +451,16 @@ def update_order_status(db: Session, order_id: int, data: StatusUpdate, rework: 
     old_status = current.value
     order.status = new_status
 
-    # Give the add-ons back. create_order reserves finite stock by decrementing
-    # it, and nothing ever put it back: every cancelled order permanently ate
-    # its toppers. When stock reaches 0 the public list route filters the addon
-    # out of the customer builder entirely, so it silently disappears from the
-    # menu with no warning to anyone.
+    # Give everything back. create_order reserves stock by decrementing it and
+    # nothing ever put it back: every cancelled order permanently ate its
+    # toppers, and when a count reached 0 the item silently disappeared from
+    # the customer builder with no warning to anyone.
+    #
+    # Products and extras can be counted now too, so this releases all three
+    # kinds rather than only add-ons - a cancellation that knows about one of
+    # them quietly eats the other two.
     if new_status == OrderStatus.CANCELLED:
-        _restore_addon_stock(db, order)
+        stock_service.release_order(db, order)
 
     event_payload = {"from": old_status, "to": new_status.value}
     reason = (getattr(data, "reason", None) or "").strip()
@@ -605,25 +629,15 @@ def _begin_delivery_tracking(db: Session, order: Order):
 
 def _restore_addon_stock(db: Session, order: Order) -> None:
     """
-    Return the finite add-on units an order was holding.
+    Kept as a name, moved as a behaviour: see stock_service.release_order.
 
-    Only touches rules with a finite stock (NULL means unlimited), and never
-    raises: releasing inventory must not be able to block a cancellation.
+    It used to walk the order's lines and add each add-on's units back. That
+    reads what was *asked for* rather than what was actually taken, and the
+    two part company the moment a count stops being kept or a product is
+    deleted — and it knew nothing about products or extras. The ledger says
+    what was taken, so the release reads that instead.
     """
-    from app.models.pricing import AddonRule
-
-    try:
-        for item in order.items or []:
-            names = (item.customization or {}).get("addons") or []
-            for name in names:
-                addon = db.query(AddonRule).filter(AddonRule.name == name).first()
-                if addon is not None and addon.stock is not None:
-                    addon.stock = addon.stock + (item.quantity or 1)
-    except Exception as e:                       # noqa: BLE001 — best effort
-        import logging
-        logging.getLogger(__name__).error(
-            "[STOCK] Could not restore add-ons for cancelled order %s: %s", order.id, e
-        )
+    stock_service.release_order(db, order)
 
 
 def _end_delivery_tracking(order: Order):

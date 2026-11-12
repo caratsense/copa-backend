@@ -53,6 +53,7 @@ from app.api.routes.addresses import router as addresses_router
 from app.api.routes.extras import router as extras_router
 from app.api.routes.payments import router as payments_router
 from app.api.routes.build_a_cake import router as build_a_cake_router
+from app.api.routes.inventory import router as inventory_router
 
 settings = get_settings()
 
@@ -93,6 +94,16 @@ async def lifespan(app: FastAPI):
             # empty here; the script is still what fills it in.
             "ALTER TABLE flavor_rules ADD COLUMN IF NOT EXISTS sponge VARCHAR",
             "CREATE INDEX IF NOT EXISTS ix_flavor_rules_sponge ON flavor_rules (sponge)",
+            # Stock. Nullable on purpose and left NULL for every existing row:
+            # NULL means "not counted", so adding these columns changes nothing
+            # about what the shop sells until somebody sets a number. Adding
+            # them NOT NULL DEFAULT 0 would have marked the entire catalogue
+            # sold out on the first boot after the deploy.
+            "ALTER TABLE products ADD COLUMN IF NOT EXISTS stock INTEGER",
+            "ALTER TABLE products ADD COLUMN IF NOT EXISTS sold_out BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE extras ADD COLUMN IF NOT EXISTS stock INTEGER",
+            "ALTER TABLE extras ADD COLUMN IF NOT EXISTS sold_out BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE addon_rules ADD COLUMN IF NOT EXISTS sold_out BOOLEAN NOT NULL DEFAULT FALSE",
         ]:
             try:
                 conn.execute(text(stmt))
@@ -200,6 +211,7 @@ app.include_router(addresses_router)
 app.include_router(extras_router)
 app.include_router(payments_router)
 app.include_router(build_a_cake_router)
+app.include_router(inventory_router)
 
 
 @app.get("/health")

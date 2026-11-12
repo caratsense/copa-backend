@@ -356,6 +356,16 @@ class ProductRead(BaseModel):
     # is non-empty these are the ONLY sizes this product can be ordered in, and
     # the client must not offer the global size list for it.
     options: list[ProductOptionRead] = Field(default_factory=list)
+    # ── Stock ──
+    # `stock` is None for anything not counted, which is most of a made-to-order
+    # catalogue. `sold_out` is the switch for the things that have no count.
+    # `is_sold_out` is the one a client should render: it is true from either
+    # route, so a page that reads it cannot show a cake as orderable because it
+    # happened to check the wrong field. None of these is `is_available`, which
+    # means "not on the menu at all".
+    stock: Optional[int] = None
+    sold_out: bool = False
+    is_sold_out: bool = False
     created_at: datetime
 
     class Config:
@@ -488,6 +498,11 @@ class AddonRuleRead(BaseModel):
     name: str
     cost: float
     stock: Optional[int] = None
+    # Marked out by hand, and the answer a client should act on. Build a Cake
+    # reads this list and used to offer a topper whose count had reached zero,
+    # because /build-a-cake/options filters on is_active and nothing else.
+    sold_out: bool = False
+    is_sold_out: bool = False
     is_active: bool
     class Config:
         from_attributes = True
@@ -926,9 +941,19 @@ class DashboardStats(BaseModel):
     # Deliveries that were attempted and did not go through. Nobody is carrying
     # these and the customer has not been told anything, so they need a decision.
     delivery_failed_orders: int = 0
-    # Addons whose finite stock is nearly gone. When stock hits 0 the item
-    # silently vanishes from the customer builder with no warning to anyone.
+    # Addons whose finite stock is nearly gone. Kept as it was so nothing
+    # reading it has to change; the two fields below are the ones the tile
+    # uses now, because products and extras can run out too.
     low_stock_addons: int = 0
+    # Across products, extras and add-ons: how many are out, and how many are
+    # nearly out. Counted from the same snapshot /admin/inventory serves, so
+    # the tile cannot say three while the screen shows four.
+    out_of_stock_items: int = 0
+    low_stock_items: int = 0
+    # Units sitting in orders nobody has paid for. An abandoned checkout holds
+    # its stock until somebody cancels it, and this is what makes that
+    # visible rather than leaving a count that looks wrong for no reason.
+    held_by_unpaid_units: int = 0
     out_for_delivery_orders: int
     delivered_today: int
     cancelled_today: int
@@ -1070,7 +1095,101 @@ class ExtraRead(BaseModel):
     description: Optional[str]
     price: float
     image_url: Optional[str]
+    # Balloons, gift wrap and candles are physical things that run out. They
+    # had no count at all and could be sold forever.
+    stock: Optional[int] = None
+    sold_out: bool = False
+    is_sold_out: bool = False
     is_active: bool
     sort_order: int
     class Config:
         from_attributes = True
+
+
+# ─── INVENTORY ───────────────────────────────────────
+#
+# One shape for all three things that can run out. The inventory screen asks
+# "what am I out of", and that question does not care whether the answer is a
+# cake, a balloon or a topper — it cared only because the counts used to live
+# in three different places, one of them a tab of the product editor.
+
+class InventoryItem(BaseModel):
+    """One countable thing, as the inventory screen needs it."""
+    # "product" | "extra" | "addon", plus how to say it to a person. Both come
+    # from app/services/stock_service.py, which owns the mapping.
+    kind: str
+    kind_label: str
+    id: int
+    name: str
+    image_url: Optional[str] = None
+
+    # None = not counted. Most of a made-to-order catalogue is not.
+    stock: Optional[int] = None
+    is_counted: bool = False
+    # The switch, for the things that have no count.
+    sold_out: bool = False
+    # True from either route. This is the one a client renders.
+    is_sold_out: bool = False
+    # Running down, not yet out. An uncounted row is never low, and neither is
+    # one already at zero — that is "out", a different badge.
+    is_low: bool = False
+
+    is_active: bool = True
+    # Products only: the switch that takes something off the menu entirely,
+    # which is NOT the same as sold out. Sent so the screen can say which.
+    is_available: bool = True
+
+    # Units held by orders nobody has paid for, and where to find them. An
+    # abandoned checkout keeps its reservation until the order is cancelled.
+    held_by_unpaid: int = 0
+    held_by_orders: int = 0
+    held_first_order_id: Optional[int] = None
+
+
+class StockMovementRead(BaseModel):
+    """One line of the ledger."""
+    id: int
+    kind: str
+    item_id: int
+    item_name: str
+    delta: int
+    balance: Optional[int] = None
+    reason: str
+    order_id: Optional[int] = None
+    user_id: Optional[int] = None
+    note: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class StockLevelUpdate(BaseModel):
+    """
+    Set a count outright, or stop counting.
+
+    `stock: null` means "not counted" — the right answer for a cake, which is
+    made to order and has no number anybody can keep true.
+    """
+    stock: Optional[int] = Field(default=None, ge=0)
+
+
+class StockAdjust(BaseModel):
+    """
+    Move a count by a relative amount.
+
+    Relative because that is how the information arrives: a tray held twelve
+    and four burnt. She does not know what the system thought the total was.
+    """
+    delta: int
+    # RESTOCK | WASTE | CORRECTION. Validated against stock_service.MANUAL_REASONS
+    # rather than an enum here, so there is one list and the API message can
+    # name it.
+    reason: str
+    note: Optional[str] = Field(default=None, max_length=300)
+
+
+class SoldOutUpdate(BaseModel):
+    """The switch. Survives a restock; only a person clears it."""
+    sold_out: bool
+    note: Optional[str] = Field(default=None, max_length=300)

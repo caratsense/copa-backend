@@ -19,6 +19,8 @@ from app.core.auth import require_admin
 from app.schemas import DashboardStats, RevenueReport, OrderRead
 from app.services.order_service import _enrich_order
 
+from app.services import stock_service
+
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 
 
@@ -66,13 +68,21 @@ def get_stats(admin: User = Depends(require_admin), db: Session = Depends(get_db
         Order.status == OrderStatus.DELIVERY_FAILED
     ).scalar() or 0
 
-    # stock is nullable: NULL means "unlimited", so only finite rows count.
+    # stock is nullable: NULL means "not counted", so only finite rows count.
     from app.models.pricing import AddonRule
     low_stock = db.query(func.count(AddonRule.id)).filter(
         AddonRule.is_active == True,
         AddonRule.stock.isnot(None),
-        AddonRule.stock <= 3,
+        AddonRule.stock <= stock_service.LOW_STOCK_AT,
+        AddonRule.stock > 0,
     ).scalar() or 0
+
+    # The numbers the tile actually shows. Products and extras can run out too
+    # now, and a cake can be marked sold out with no count at all, so counting
+    # add-on rows answers a narrower question than the one being asked.
+    # Read from the same snapshot /admin/inventory serves, so the tile and the
+    # screen cannot disagree.
+    stock_counts = stock_service.counts(db)
 
     out_for_delivery = db.query(func.count(Order.id)).filter(
         Order.status == OrderStatus.OUT_FOR_DELIVERY
@@ -99,6 +109,9 @@ def get_stats(admin: User = Depends(require_admin), db: Session = Depends(get_db
         awaiting_approval_orders=awaiting_approval,
         delivery_failed_orders=delivery_failed,
         low_stock_addons=low_stock,
+        out_of_stock_items=stock_counts["out_of_stock_items"],
+        low_stock_items=stock_counts["low_stock_items"],
+        held_by_unpaid_units=stock_counts["held_by_unpaid_units"],
         out_for_delivery_orders=out_for_delivery,
         delivered_today=delivered_today,
         cancelled_today=cancelled_today,

@@ -2,6 +2,7 @@ from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, Text, 
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from app.db.base import Base
+from app.models.stock import StockTracked
 
 # Stamped on a product whose price is a stand-in for one the client has not
 # supplied. Lives here because both the model and the routes need it, and a
@@ -21,7 +22,7 @@ PLACEHOLDER_PRICE_TAG = "draft-no-price"
 PRICING_ROW_TAG = "pricing-row"
 
 
-class Product(Base):
+class Product(StockTracked, Base):
     __tablename__ = "products"
 
     id = Column(Integer, primary_key=True, index=True)

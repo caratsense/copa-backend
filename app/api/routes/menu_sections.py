@@ -93,6 +93,16 @@ def get_menu_sections(
                 # Always false here — pricing rows are filtered out above — but
                 # sent so one product shape comes back from every endpoint.
                 "is_pricing_row": p.is_pricing_row,
+                # Sold out, from either route: a count that has reached zero or
+                # the switch she throws for a cake she cannot do today. The
+                # product STAYS on the menu — that is the whole point — so the
+                # card needs this to grey itself and refuse the cart. Without
+                # it the only way to take something off sale was is_available,
+                # which removes it from this payload entirely and reads to a
+                # customer as a broken page.
+                "stock": p.stock,
+                "sold_out": bool(p.sold_out),
+                "is_sold_out": bool(p.is_sold_out),
                 # When non-empty these are the ONLY sizes this product sells in;
                 # the global size list must not be offered for it.
                 "options": [
@@ -139,6 +149,10 @@ def get_menu_sections(
                     "is_available": p.is_available, "tags": p.tags or [],
                     "pricing_unit": p.pricing_unit,
                     "is_placeholder": p.is_placeholder,
+                    # Same shape as the sectioned products above.
+                    "stock": p.stock,
+                    "sold_out": bool(p.sold_out),
+                    "is_sold_out": bool(p.is_sold_out),
                     "options": [
                         {"id": o.id, "label": o.label, "price": o.price,
                          "multiplier": o.multiplier, "sort_order": o.sort_order}

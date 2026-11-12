@@ -195,7 +195,20 @@ def toggle_availability(
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Toggle a product in/out of stock."""
+    """
+    Take a product off the menu, or put it back.
+
+    NOT the same as sold out, though this docstring said "in/out of stock" for
+    as long as that was the only switch there was. is_available=false removes
+    the product from the menu and from every list a customer sees, which is
+    right for something withdrawn or out of season and wrong for something
+    that will be back tomorrow — a customer who finds nothing cannot tell
+    which, and reads it as a broken page.
+
+    For "we have run out", use /admin/inventory/product/{id}/sold-out, or set
+    a count and let it reach zero. Either leaves the product on the menu,
+    marked.
+    """
     product = db.query(Product).filter(Product.id == product_id).first()
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")

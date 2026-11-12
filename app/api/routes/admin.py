@@ -147,14 +147,23 @@ def set_addon_stock(
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Admin sets exact stock count for an addon. Pass null for unlimited."""
-    addon = db.query(AddonRule).filter(AddonRule.id == item_id).first()
-    if not addon:
-        raise HTTPException(status_code=404, detail="Addon not found")
-    addon.stock = data.stock
-    db.commit()
-    db.refresh(addon)
-    return addon
+    """
+    Admin sets exact stock count for an addon. Pass null to stop counting.
+
+    Kept at its own URL because the products screen has been calling it since
+    before there was an inventory screen, but the write goes through
+    stock_service now so the change lands in the ledger. It used to assign
+    addon.stock directly, which left a count that had changed with nothing
+    anywhere saying who changed it or when.
+
+    /admin/inventory/{kind}/{id}/level is the same operation for all three
+    kinds of stock, and is what new code should call.
+    """
+    from app.services import stock_service
+
+    return stock_service.set_level(
+        db, stock_service.KIND_ADDON, item_id, data.stock, user_id=admin.id,
+    )
 
 
 # ─── MANUAL ASSIGNMENT ────────────────────────────────

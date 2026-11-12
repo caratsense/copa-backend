@@ -23,5 +23,6 @@ from app.models.trusted_device import TrustedDevice  # noqa
 from app.models.address import Address  # noqa
 from app.models.extra import Extra  # noqa
 from app.models.whatsapp_message import WhatsAppMessage  # noqa
+from app.models.stock_movement import StockMovement  # noqa
 
 __all__ = ["Base", "get_db", "engine", "SessionLocal"]

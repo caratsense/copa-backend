@@ -457,6 +457,15 @@ def _catalogue(db) -> list[dict]:
         # cake they could have bought for a rupee.
         if INTERNAL_TAG in (p.tags or []):
             continue
+        # Sold out, by count or by the switch. The website greys a sold-out
+        # cake and leaves it on the menu, which is the right answer for a page
+        # somebody is reading - it says the shop normally has this. A WhatsApp
+        # list row cannot be greyed: every row it shows is a row the customer
+        # can tap, and tapping this one would price a cake the shop has just
+        # said it cannot make, then fail at the end of the conversation. So
+        # here it comes off the list, the same way a hidden category does.
+        if p.is_sold_out:
+            continue
         section = p.section
         # A category hidden on the website is hidden here too. When Chocolate
         # Celebration Cakes was switched off in the admin, the site stopped

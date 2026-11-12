@@ -1,8 +1,9 @@
 from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, func
 from app.db.base import Base
+from app.models.stock import StockTracked
 
 
-class Extra(Base):
+class Extra(StockTracked, Base):
     __tablename__ = "extras"
 
     id = Column(Integer, primary_key=True, index=True)
