@@ -164,10 +164,37 @@ def test_a_baker_cannot_read_another_bakers_order(client, db, admin, baker, assi
 
 
 def test_the_customer_cannot_read_the_kitchens_brief(client, db, admin, customer, assigned):
+    """
+    The customer may now reach this route — it is how they send a picture of
+    what they want — and still must not read what the kitchen says about their
+    cake.
+
+    This used to be a flat 403, which was the same protection by a blunter
+    means: nobody but staff could call it at all. The rule it was really
+    guarding is the one asserted here, and it is now asserted directly:
+    whatever comes back, the office's note is not in it.
+    """
+    client.post(f"/orders/{assigned.id}/attachments/note",
+                json={"body": "Quote them 1500 if they ask"}, headers=auth(admin))
+    client.post(f"/orders/{assigned.id}/attachments/photo",
+                files=_photo(), data={"caption": "Shriya's own reference"},
+                headers=auth(admin))
+
+    res = client.get(f"/orders/{assigned.id}/attachments", headers=auth(customer))
+    assert res.status_code == 200, res.text
+    assert res.json() == [], res.text
+    assert "1500" not in res.text
+
+
+def test_another_customer_cannot_read_it_either(client, db, admin, other_customer, assigned):
+    """
+    The order belongs to `customer`. Being signed in is not being the person
+    whose cake it is.
+    """
     client.post(f"/orders/{assigned.id}/attachments/note",
                 json={"body": "Quote them 1500 if they ask"}, headers=auth(admin))
 
-    res = client.get(f"/orders/{assigned.id}/attachments", headers=auth(customer))
+    res = client.get(f"/orders/{assigned.id}/attachments", headers=auth(other_customer))
     assert res.status_code == 403, res.text
 
 

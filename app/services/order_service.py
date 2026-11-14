@@ -13,9 +13,12 @@ from sqlalchemy.orm import Session
 from fastapi import HTTPException
 
 from app.core.broadcast import broadcast_sync
+from app.core.uploads import staged_reference_file
 from app.models.product import Product
 from app.models.order import Order, OrderStatus, PaymentStatus, VALID_TRANSITIONS
+from app.models.order_attachment import AttachmentKind, OrderAttachment
 from app.models.order_item import OrderItem
+from app.models.user import User
 from app.models.delivery import DeliveryZone
 from app.models.coupon import Coupon
 from app.models.extra import Extra
@@ -81,6 +84,57 @@ def is_payable(order: Order) -> bool:
     if method == "COD":
         return True        # legacy rows only; COD orders can no longer be created
     return order.payment_status == PaymentStatus.PAID
+
+
+def _attach_design_reference(
+    db: Session, order: Order, product: Product, url: str, customer: User | None,
+) -> None:
+    """
+    Claim the picture the customer staged in Build a Cake onto their order.
+
+    This is the second half of a two-step upload, and the step that makes the
+    picture actually reach whoever bakes the cake. The first half is POST
+    /uploads/design-reference, which happens on the builder page before this
+    order exists; `url` is what it returned, carried through the cart. The
+    file is already on disk and already validated — there is nothing to move
+    here, only a row saying which order it belongs to.
+
+    It lands in the order's brief as a photo, beside the pictures and notes
+    staff add, because that is the one list the kitchen already reads. The
+    caption names the cake: an order of three cakes with two references is
+    otherwise two pictures with nothing saying which is which.
+
+    A reference whose file has gone leaves a note instead of a broken picture,
+    and NEVER refuses the order. That direction is deliberate and was learned
+    the hard way: the last thing to stand between a customer and a placed
+    order on account of a photograph cost a real sale. A note that says to ask
+    for the picture is recoverable; a refused order is not.
+    """
+    author = dict(
+        author_id=customer.id if customer else None,
+        # Copied rather than joined, like every other attachment: the brief has
+        # to keep saying who sent this after the account is gone.
+        author_name=customer.name if customer else None,
+        author_role=(
+            customer.role.value if customer and hasattr(customer.role, "value")
+            else (customer.role if customer else None)
+        ),
+    )
+    if staged_reference_file(url):
+        db.add(OrderAttachment(
+            order_id=order.id, kind=AttachmentKind.PHOTO, file_url=url,
+            body=f"Design reference from the customer — {product.name}",
+            **author,
+        ))
+        return
+    db.add(OrderAttachment(
+        order_id=order.id, kind=AttachmentKind.NOTE,
+        body=(
+            f"The customer chose a design reference for {product.name}, but the "
+            "picture did not reach us. Please ask them to send it on WhatsApp."
+        ),
+        **author,
+    ))
 
 
 def create_order(db: Session, data: OrderCreate) -> Order:
@@ -156,6 +210,14 @@ def create_order(db: Session, data: OrderCreate) -> Order:
     db.flush()
 
     # ── Price each item ──
+    #
+    # The customer is looked up once, and only when a picture is actually
+    # waiting to be claimed, because every attachment it creates has to carry
+    # the name of whoever sent it.
+    customer = None
+    if any(i.customization.reference_url for i in data.items):
+        customer = db.query(User).filter(User.id == data.user_id).first()
+
     subtotal = 0.0
     for item_data in data.items:
         product = db.query(Product).filter(Product.id == item_data.product_id).first()
@@ -191,6 +253,12 @@ def create_order(db: Session, data: OrderCreate) -> Order:
         )
         db.add(order_item)
         subtotal += breakdown.line_total
+
+        # The picture of what this cake has to look like, if they sent one.
+        if item_data.customization.reference_url:
+            _attach_design_reference(
+                db, order, product, item_data.customization.reference_url, customer,
+            )
 
         # The add-ons the customer ticked. Resolved by name because the order
         # line stores names, not ids, and AddonRule.name is unique.

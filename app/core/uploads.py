@@ -14,6 +14,8 @@ what the bytes are - never from the filename.
 """
 
 import os
+import re
+import secrets
 import uuid
 
 from fastapi import HTTPException, UploadFile
@@ -63,6 +65,56 @@ def save_image(file: UploadFile, prefix: str) -> str:
     with open(os.path.join(settings.UPLOAD_DIR, filename), "wb") as f:
         f.write(contents)
     return f"/media/{filename}"
+
+
+# ─── DESIGN REFERENCES ────────────────────────────────
+# A picture of the cake a customer wants, chosen in Build a Cake — which is
+# BEFORE the order it belongs to exists. There is nothing to hang it on yet, so
+# it is written to UPLOAD_DIR on its own and the URL travels in the cart; order
+# creation claims it onto the order as an attachment (see
+# order_service._attach_design_reference).
+#
+# Staging it on the server at the moment it is picked, rather than carrying the
+# file through the cart, is not a preference: a File cannot be put in
+# localStorage, and the cart survives page loads and a round trip to the
+# payment gateway. The alternative was what used to happen — the picture was
+# never sent at all and only its FILENAME travelled, written into the cake's
+# message field, where it was piped onto the cake in icing and pushed the field
+# past its 60-character limit. An order was lost that way.
+#
+# The name carries 32 hex characters of randomness, not the 8 a review photo
+# gets. These files are served by StaticFiles with no authentication — the
+# brief's pictures always have been — and a reference is a photograph from
+# somebody's phone, so the URL is the only thing protecting it and guessing has
+# to be hopeless rather than merely unlikely.
+
+_REFERENCE_URL = re.compile(r"^/media/ref_[0-9a-f]{24}_[0-9a-f]{8}\.(?:jpg|png|webp)$")
+
+
+def new_reference_prefix() -> str:
+    """A one-off name for a staged reference, before any order owns it."""
+    return f"ref_{secrets.token_hex(12)}"
+
+
+def staged_reference_file(url: str) -> str | None:
+    """
+    The file on disk a staged-reference URL names, or None.
+
+    None covers both "that is not a staged reference" and "it is not there any
+    more", because the caller does the same thing either way and neither is
+    worth telling apart. The regex pins the WHOLE string, so the basename taken
+    from it cannot climb out of UPLOAD_DIR.
+    """
+    if not url or not _REFERENCE_URL.match(url):
+        return None
+    path = os.path.join(settings.UPLOAD_DIR, url.rsplit("/", 1)[-1])
+    return path if os.path.isfile(path) else None
+
+
+# The same shape, for the schema that has to refuse a URL the customer's
+# browser did not get from us. Kept here so the rule that writes these names
+# and the rule that accepts them cannot drift apart.
+REFERENCE_URL_PATTERN = _REFERENCE_URL.pattern
 
 
 # ─── AUDIO ────────────────────────────────────────────

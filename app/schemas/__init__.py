@@ -11,6 +11,7 @@ from pydantic import BaseModel, BeforeValidator, Field, model_validator
 
 from app.core.email import normalize_email
 from app.core.phone import normalize_phone
+from app.core.uploads import REFERENCE_URL_PATTERN
 
 
 def _as_value_error(fn):
@@ -435,6 +436,14 @@ class EnquiryImageRead(BaseModel):
     """
     reference_image_url: str
 
+
+class DesignReferenceRead(BaseModel):
+    """
+    Where a staged design reference went. The URL is the whole answer — it is
+    what the cart carries and what order creation claims onto the order.
+    """
+    url: str
+
 class CakeEnquiryRead(BaseModel):
     id: int
     contact_name: str
@@ -627,6 +636,25 @@ class ItemCustomization(BaseModel):
     # customization snapshot on the order item, and costs nothing, so the
     # pricing engine ignores it.
     message: str = Field(default="", max_length=60)
+    # The picture of what the customer wants, staged by POST
+    # /uploads/design-reference before this order existed and claimed onto it
+    # at creation (see order_service._attach_design_reference).
+    #
+    # A URL and not a file because the two things happen minutes apart, on
+    # different pages, with a payment gateway in between. It is held to the
+    # exact shape this app writes — 32 hex characters, one of three extensions
+    # — so the only thing that can be claimed is a file we made ourselves:
+    # nothing else on disk, no path climbing out of UPLOAD_DIR, and no URL
+    # somewhere off the internet being passed off as a reference.
+    #
+    # Its ancestor was `message`, which is the text piped onto the cake. A
+    # reference called "cake.jpg" therefore asked the baker to write "Design
+    # reference supplied: cake.jpg" in icing, and one off a phone ran past the
+    # 60-character limit above and made the order unplaceable. Picture and
+    # icing are not the same field.
+    reference_url: Optional[str] = Field(
+        default=None, max_length=120, pattern=REFERENCE_URL_PATTERN,
+    )
 
 class PricingRequest(BaseModel):
     product_id: int

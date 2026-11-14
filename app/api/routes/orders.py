@@ -516,8 +516,40 @@ def cancel_own_order(
 # deliberately not here: this is about making the cake, not moving it.
 
 
+# How late a customer may still send a picture of what they want. After
+# ASSIGNED the cake is on a bench, and a reference arriving then is not a
+# reference — it is a change to something already being made, which is a
+# conversation and not an upload.
+REFERENCE_WINDOW = (OrderStatus.RECEIVED, OrderStatus.CONFIRMED, OrderStatus.ASSIGNED)
+
+# Per order, per customer. There is no limit for staff — four photos off a
+# customer's WhatsApp is the normal case and the point of the brief — but an
+# open-ended number of uploads against a row anybody can create is a way to
+# use the bakery's disk, so the customer's side is bounded.
+MAX_CUSTOMER_PHOTOS = 6
+
+
+def _is_staff(user: User) -> bool:
+    return user.role in (UserRole.ADMIN, UserRole.BAKER)
+
+
 def _brief_order(db: Session, order_id: int, user: User) -> Order:
-    """The order, if this person has any business reading its brief."""
+    """
+    The order, if this person has any business reading its brief.
+
+    The customer whose cake it is counts, which is new. It is what lets them
+    send a picture of what they want — the thing they could not do at all, so
+    the filename of their reference used to travel in the cake's icing text
+    instead and an order was lost to it.
+
+    They do not thereby get the brief. Two things keep that true, and both
+    matter: list_attachments hands a customer only the photos they sent
+    themselves, and add_note / add_voice_note keep their
+    require_role(ADMIN, BAKER) dependency, so a customer is turned away before
+    this function is ever reached through them. The kitchen's notes about a
+    cake, and Shriya's voice notes to a baker, are not written for the person
+    buying it.
+    """
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
@@ -525,7 +557,15 @@ def _brief_order(db: Session, order_id: int, user: User) -> Order:
         return order
     if user.role == UserRole.BAKER and order.assigned_baker_id == user.id:
         return order
-    raise HTTPException(status_code=403, detail="This order is not assigned to you")
+    if order.user_id == user.id:
+        return order
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            "This order is not assigned to you" if _is_staff(user)
+            else "This order is not yours."
+        ),
+    )
 
 
 def _add_attachment(db: Session, order: Order, user: User, **fields) -> OrderAttachment:
@@ -547,11 +587,27 @@ def _add_attachment(db: Session, order: Order, user: User, **fields) -> OrderAtt
 @router.get("/{order_id}/attachments", response_model=list[OrderAttachmentRead])
 def list_attachments(
     order_id: int,
-    user: User = Depends(require_role(UserRole.ADMIN, UserRole.BAKER)),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    """
+    The brief, as much of it as this person is owed.
+
+    Staff read all of it. The customer reads only the pictures they sent
+    themselves — so their own order page can show what they have attached and
+    let them remove one — and none of the rest: not the kitchen's notes about
+    their cake, not a voice note from the office to the baker. Filtered here
+    rather than by a second endpoint so there is one list and one permission
+    rule to keep right.
+    """
     order = _brief_order(db, order_id, user)
-    return sorted(order.attachments, key=lambda a: (a.created_at, a.id))
+    rows = sorted(order.attachments, key=lambda a: (a.created_at, a.id))
+    if _is_staff(user):
+        return rows
+    return [
+        a for a in rows
+        if a.kind == AttachmentKind.PHOTO and a.author_id == user.id
+    ]
 
 
 @router.post("/{order_id}/attachments/note", response_model=OrderAttachmentRead, status_code=201)
@@ -574,20 +630,64 @@ def add_photo(
     order_id: int,
     file: UploadFile = File(...),
     caption: Optional[str] = Form(None),
-    user: User = Depends(require_role(UserRole.ADMIN, UserRole.BAKER)),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
-    A reference picture. There is no limit on how many — that is the point of
-    "multi picture slots": a customer sends four photos of what they want and
-    all four belong on the order, not whichever one fitted in the single slot.
+    A reference picture. There is no limit on how many for staff — that is the
+    point of "multi picture slots": a customer sends four photos of what they
+    want and all four belong on the order, not whichever one fitted in the
+    single slot.
+
+    The customer can now send them here themselves, on their own order, which
+    is the other half of the Build a Cake upload: one for the picture they
+    chose while ordering, this one for "here, this is what I meant" after it.
+    Before both, there was no way for a customer to attach a picture to an
+    order at all — their reference reached the kitchen as a filename written
+    into the cake's icing text, or not at all.
+
+    Their side is bounded where staff's is not: their own order only (see
+    _brief_order), while it is still early enough to be a reference rather than
+    a change of mind, and MAX_CUSTOMER_PHOTOS of them.
     """
     order = _brief_order(db, order_id, user)
+    staff = _is_staff(user)
+
+    if not staff:
+        if order.status not in REFERENCE_WINDOW:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Your cake is already being made, so a new picture cannot "
+                    "change it here — please message us on WhatsApp."
+                ),
+            )
+        mine = sum(
+            1 for a in order.attachments
+            if a.kind == AttachmentKind.PHOTO and a.author_id == user.id
+        )
+        if mine >= MAX_CUSTOMER_PHOTOS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"You have sent {MAX_CUSTOMER_PHOTOS} pictures for this order, "
+                    "which is as many as we can attach. Send any more on WhatsApp "
+                    "and we will add them."
+                ),
+            )
+
     url = save_image(file, prefix=f"brief_{order_id}")
+    # Clamped because this is now a public write: a caption is a line beside a
+    # photograph, and anything past this is not a caption. Staff are held to
+    # the same length — nobody has ever typed near it.
+    words = (caption or "").strip()[:500]
     return _add_attachment(
         db, order, user,
         kind=AttachmentKind.PHOTO, file_url=url,
-        body=(caption or "").strip() or None,
+        # An uncaptioned staff photo needs no label; an uncaptioned customer
+        # one does, because the kitchen has to know it came from the person
+        # buying the cake rather than from the office.
+        body=words or (None if staff else "Sent by the customer"),
     )
 
 
@@ -623,22 +723,38 @@ def add_voice_note(
 def delete_attachment(
     order_id: int,
     attachment_id: int,
-    user: User = Depends(require_role(UserRole.ADMIN, UserRole.BAKER)),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
     Remove something left by mistake.
 
-    An admin can remove anything on an order they can see; a baker only what
-    they left themselves, so nobody can quietly delete the instructions they
-    were given and then say they never had them.
+    An admin can remove anything on an order they can see; everybody else only
+    what they left themselves, so nobody can quietly delete the instructions
+    they were given and then say they never had them. That one rule covers the
+    customer too: the wrong picture, sent by them, on their own order.
+
+    Theirs closes when the kitchen starts, like sending one does. After that
+    the brief is a record of what was asked for while the cake was being made,
+    and it is not the customer's to edit.
     """
-    _brief_order(db, order_id, user)
+    order = _brief_order(db, order_id, user)
+    if not _is_staff(user) and order.status not in REFERENCE_WINDOW:
+        raise HTTPException(
+            status_code=409,
+            detail="Your cake is already being made — please message us on WhatsApp.",
+        )
     item = db.query(OrderAttachment).filter(
         OrderAttachment.id == attachment_id,
         OrderAttachment.order_id == order_id,
     ).first()
     if not item:
+        raise HTTPException(status_code=404, detail="Not found on this order")
+    # Pictures only, for a customer. The order's brief can hold a note written
+    # in their name — the one _attach_design_reference leaves when a staged
+    # reference has gone missing — and that note exists to tell the kitchen
+    # something the customer might prefer it did not know.
+    if not _is_staff(user) and item.kind != AttachmentKind.PHOTO:
         raise HTTPException(status_code=404, detail="Not found on this order")
     if user.role != UserRole.ADMIN and item.author_id != user.id:
         raise HTTPException(
