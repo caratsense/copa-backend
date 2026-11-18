@@ -319,6 +319,45 @@ def send_list(to: str, body: str, menu_label: str,
     })
 
 
+# ─── TEMPLATE PARAMETERS ──────────────────────────────
+# Meta validates every body parameter and refuses the WHOLE message if one of
+# them is wrong. The recipient gets nothing, and the only trace is an error
+# code in a log nobody reads. Two of its rules have already cost real
+# messages here:
+#
+#   empty     "(#131008) Required parameter is missing". Twice in production,
+#             both times the maps link on a rider notification for an order
+#             that was Self Pickup and so had no address to build one from.
+#   newlines  a parameter may not carry a newline, a tab, or a long run of
+#             spaces. Order notes are multi-line now - a design reference is
+#             written on its own line - and the notes reach the baker as a
+#             parameter.
+#
+# So every parameter is flattened to one line, and an empty one becomes a
+# dash. A dash in a message is a worse message; an empty one is no message.
+#
+# Only the template path is touched. The plain-text fallback below is sent as
+# an ordinary message, where newlines are exactly what is wanted, so it keeps
+# the parameters as they came.
+EMPTY_PARAM = "-"
+
+
+def _param(value) -> str:
+    """One body parameter, in a shape Meta will accept."""
+    text = "" if value is None else str(value)
+    text = " ".join(text.split())
+    return text or EMPTY_PARAM
+
+
+def _body_component(params) -> list[dict]:
+    if not params:
+        return []
+    return [{
+        "type": "body",
+        "parameters": [{"type": "text", "text": _param(p)} for p in params],
+    }]
+
+
 def send_template(to: str, template_name: str, params: list[str]) -> dict | None:
     """
     Send a pre-approved template message (works anytime, no 24hr restriction).
@@ -335,12 +374,7 @@ def send_template(to: str, template_name: str, params: list[str]) -> dict | None
     hour ago - hears something rather than nothing.
     """
     to = _normalise(to)
-    components = []
-    if params:
-        components.append({
-            "type": "body",
-            "parameters": [{"type": "text", "text": str(p)} for p in params],
-        })
+    components = _body_component(params)
     result = _send({
         "messaging_product": "whatsapp",
         "to": to,
@@ -375,12 +409,7 @@ def send_template_raw(to: str, template_name: str, language: str, params: list) 
     than re-resolving the registry (which may have been reconfigured since).
     """
     to = _normalise(to)
-    components = []
-    if params:
-        components.append({
-            "type": "body",
-            "parameters": [{"type": "text", "text": str(p)} for p in params],
-        })
+    components = _body_component(params)
     return _send({
         "messaging_product": "whatsapp",
         "to": to,
