@@ -52,8 +52,24 @@ def get_stats(admin: User = Depends(require_admin), db: Session = Depends(get_db
         ~_collected,
     ).scalar()
 
+    # Work the shop actually has: placed, paid for, not started.
+    #
+    # This counted every RECEIVED or CONFIRMED row whatever its payment, so an
+    # abandoned checkout — RECEIVED, never paid, nothing owed, nobody baking —
+    # was counted as a job waiting. The dashboard said "3 orders" while the
+    # orders screen, which does exclude unpaid attempts, showed none: two
+    # screens disagreeing about the same orders, and the honest number was the
+    # other one.
+    #
+    # Same rule as is_payable() in order_service, which is what actually gates
+    # the kitchen: a legacy COD row is workable, an unpaid ONLINE one is not.
+    workable = or_(
+        func.upper(func.coalesce(Order.payment_method, "ONLINE")) == "COD",
+        Order.payment_status == PaymentStatus.PAID,
+    )
     pending = db.query(func.count(Order.id)).filter(
-        Order.status.in_([OrderStatus.RECEIVED, OrderStatus.CONFIRMED])
+        Order.status.in_([OrderStatus.RECEIVED, OrderStatus.CONFIRMED]),
+        workable,
     ).scalar() or 0
 
     in_production = db.query(func.count(Order.id)).filter(
