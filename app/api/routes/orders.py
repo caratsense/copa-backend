@@ -681,7 +681,7 @@ def add_photo(
     # photograph, and anything past this is not a caption. Staff are held to
     # the same length — nobody has ever typed near it.
     words = (caption or "").strip()[:500]
-    return _add_attachment(
+    item = _add_attachment(
         db, order, user,
         kind=AttachmentKind.PHOTO, file_url=url,
         # An uncaptioned staff photo needs no label; an uncaptioned customer
@@ -689,6 +689,26 @@ def add_photo(
         # buying the cake rather than from the office.
         body=words or (None if staff else "Sent by the customer"),
     )
+
+    # A picture from the customer is news; one from the office is not. Without
+    # this the picture sits in the brief and is seen only if somebody opens
+    # that order, which for a shop that works off WhatsApp can be after the
+    # cake is made. Best-effort: the picture is saved either way, and a
+    # notification failure must not turn a successful upload into an error.
+    if not staff:
+        try:
+            from app.services.wa_notifications import notify_customer_picture
+            mine = sum(
+                1 for a in order.attachments
+                if a.kind == AttachmentKind.PHOTO and a.author_id == user.id
+            )
+            notify_customer_picture(db, order, mine)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(
+                "[WA] Could not announce a customer picture on order %s", order_id)
+
+    return item
 
 
 @router.post("/{order_id}/attachments/voice", response_model=OrderAttachmentRead, status_code=201)

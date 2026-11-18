@@ -267,3 +267,83 @@ def test_handover_table_lists_every_template():
     assert len(rows) == len(wa_templates.TEMPLATES)
     for row in rows:
         assert row["body_placeholders"] == len(row["variables"])
+
+
+# ─── THE MOMENTS THAT WENT UNSAID ────────────────────
+# Both found by walking a real order against what actually left the building:
+# the customer heard nothing from "confirmed" until "ready", and a picture a
+# customer attached to their own order told nobody it had arrived.
+
+
+def test_the_customer_is_told_when_the_cake_is_started(client, db, wa_secret, staffed):
+    """
+    Confirmation to ready can be more than a day on a cake ordered ahead, and
+    the shop said nothing in between.
+    """
+    order = make_order(db, staffed["customer"], OrderStatus.ASSIGNED,
+                       baker=staffed["baker"])
+    res = client.patch(f"/orders/{order.id}/status",
+                       json={"status": "IN_PRODUCTION"},
+                       headers=auth(staffed["admin"]))
+    assert res.status_code == 200, res.text
+
+    assert "order_in_production" in keys_sent(db, order.id)
+
+
+def test_a_rework_does_not_tell_the_customer_it_is_being_made(client, db, wa_secret, staffed):
+    """
+    A rework reaches the same status by a different road: the cake failed its
+    check and is being done again. "Being made now" a second time reads as
+    either a mistake or a confession.
+    """
+    order = make_order(db, staffed["customer"], OrderStatus.AWAITING_APPROVAL,
+                       baker=staffed["baker"])
+    res = client.patch(f"/orders/{order.id}/status",
+                       json={"status": "IN_PRODUCTION", "reason": "piping is wrong"},
+                       headers=auth(staffed["admin"]))
+    assert res.status_code == 200, res.text
+
+    sent = keys_sent(db, order.id)
+    assert "order_rework" in sent
+    assert "order_in_production" not in sent
+
+
+def test_a_picture_from_the_customer_tells_the_shop(client, db, wa_secret, staffed):
+    """
+    Customers can attach pictures to their own order now. Nothing announced
+    it, so the picture was seen only if somebody opened that order — which for
+    a shop that works off WhatsApp can be after the cake is made.
+    """
+    import io
+
+    png = bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
+        "890000000a49444154789c6360000002000100ffff03000006000557bfabd400"
+        "00000049454e44ae426082"
+    )
+    order = make_order(db, staffed["customer"], OrderStatus.RECEIVED)
+
+    res = client.post(f"/orders/{order.id}/attachments/photo",
+                      files={"file": ("ref.png", io.BytesIO(png), "image/png")},
+                      headers=auth(staffed["customer"]))
+    assert res.status_code == 201, res.text
+
+    assert "admin_customer_sent_picture" in keys_sent(db, order.id)
+
+
+def test_a_picture_from_the_office_tells_nobody(client, db, wa_secret, staffed):
+    """The shop does not need telling about its own upload."""
+    import io
+
+    png = bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
+        "890000000a49444154789c6360000002000100ffff03000006000557bfabd400"
+        "00000049454e44ae426082"
+    )
+    order = make_order(db, staffed["customer"], OrderStatus.RECEIVED)
+
+    client.post(f"/orders/{order.id}/attachments/photo",
+                files={"file": ("ref.png", io.BytesIO(png), "image/png")},
+                headers=auth(staffed["admin"]))
+
+    assert "admin_customer_sent_picture" not in keys_sent(db, order.id)

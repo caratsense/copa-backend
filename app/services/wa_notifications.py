@@ -201,6 +201,30 @@ def notify_baker_assigned(db: Session, order: Order) -> None:
     )
 
 
+def notify_customer_picture(db: Session, order: Order, count: int) -> None:
+    """
+    Tell the shop a customer has sent a picture of the cake they want.
+
+    Customers can attach pictures to their own order now. Before that they
+    could not, and their reference reached the kitchen as a filename written
+    into the text piped onto the cake, or not at all.
+
+    What it did not come with was anybody being told. The picture lands in the
+    order's brief and is seen only if somebody opens that order — which, for a
+    shop that reads WhatsApp rather than a dashboard, means often not until
+    after the cake is made.
+
+    Admin only. The customer knows what they sent.
+    """
+    _enrich_order(order)
+    for admin in _consenting_admins(db):
+        _send(
+            db, order, "admin_customer_sent_picture", admin.phone,
+            [str(order.id), order.customer_name or "Customer", str(count)],
+            "customer_picture", "admin", True,
+        )
+
+
 def notify_admin_proof_ready(db: Session, order: Order) -> None:
     """
     Tell the shop a finished cake is waiting to be looked at.
@@ -247,7 +271,8 @@ def notify_rider_assigned(db: Session, order: Order) -> None:
     )
 
 
-def dispatch_notifications(db: Session, order: Order, new_status: str, rework: bool = False):
+def dispatch_notifications(db: Session, order: Order, new_status: str,
+                           rework: bool = False, previous: str | None = None):
     """
     Send WhatsApp notifications for a status change.
 
@@ -255,6 +280,14 @@ def dispatch_notifications(db: Session, order: Order, new_status: str, rework: b
     starting work, and an admin rejecting it at quality check. Both used to send
     the rework template, so a baker was told to redo a cake the instant they
     started it.
+
+    `previous` is the status it came from, and is what that distinction is
+    really made of. The flag has to be remembered by every caller — the reject
+    route sets it, the WhatsApp staff reply sets it, and the plain status
+    endpoint takes it from the request body, where it defaults to false. One
+    caller forgetting used to be harmless; now it would tell a customer their
+    cake is being made at the moment it was sent back to be remade. A cake
+    arriving here from AWAITING_APPROVAL is a redo whatever anybody passed.
     """
     _enrich_order(order)
     items = _items_str(order)
@@ -285,14 +318,26 @@ def dispatch_notifications(db: Session, order: Order, new_status: str, rework: b
         elif new_status == OrderStatus.ASSIGNED.value:
             notify_baker_assigned(db, order)
 
-        # ─── IN_PRODUCTION → baker, only on rework ───
+        # ─── IN_PRODUCTION → customer, and the baker only on rework ───
         elif new_status == OrderStatus.IN_PRODUCTION.value:
-            if rework:
+            redo = rework or previous == OrderStatus.AWAITING_APPROVAL.value
+            if redo:
                 _send(db, order, "order_rework",
                       baker.phone if baker else "", [str(order.id)],
                       new_status, "baker", baker_ok,
                       skip_reason=None if order.assigned_baker_id
                       else "no baker on this order — sent back to the shop itself")
+            else:
+                # The customer heard nothing between "confirmed" and "ready",
+                # which on a cake ordered a day or more ahead is a long silence
+                # about something they are anxious about. This is the middle.
+                #
+                # Not on a rework: that is the same cake being made again after
+                # it failed its check, and "being made now" a second time reads
+                # as either a mistake or a confession.
+                _send(db, order, "order_in_production", customer_phone,
+                      [order.customer_name or "Customer", str(order.id)],
+                      new_status, "customer", customer_ok)
             # A baker starting their own order needs no message; they just acted.
 
         # ─── AWAITING_APPROVAL → admin (quality check) ─

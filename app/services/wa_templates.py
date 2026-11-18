@@ -209,6 +209,70 @@ TEMPLATES: dict[str, Template] = {
             trigger="Order reaches CANCELLED",
             variables=("order_id",),
         ),
+
+        # ── Nobody was telling anybody ──
+        # Everything above fires on a status changing. These five are the
+        # events that were going unsaid, found by walking a real order
+        # against what actually left the building.
+        #
+        # The first two are the expensive ones. An order placed and not paid
+        # for was told nothing, ever, by anybody: three of the shop's first
+        # seven orders died exactly there, one of them booked for collection
+        # with the customer never told it was not confirmed.
+        Template(
+            key="order_payment_pending",
+            default_name="order_payment_pending",
+            recipient="customer",
+            trigger="Placed online, still unpaid an hour later, collection date not yet passed",
+            variables=("customer_name", "order_id", "amount_due", "pay_link"),
+            fallback=(
+                "Hi {1}, order #{2} is not confirmed yet - we have not received the payment.\n\n"
+                "Amount due: {3}\nPay here: {4}\n\n"
+                "We start baking once it is in. If you have changed your mind, reply here "
+                "and we will close it - Cake O' Clock"
+            ),
+        ),
+        Template(
+            key="admin_payment_pending",
+            default_name="admin_payment_pending",
+            recipient="admin",
+            trigger="Same moment as order_payment_pending — somebody has to know to chase it",
+            variables=("order_id", "customer_name", "customer_phone", "amount_due"),
+            fallback="Order #{1} is still unpaid.\n{2} ({3})\nAmount: {4}",
+        ),
+        Template(
+            key="order_pickup_reminder",
+            default_name="order_pickup_reminder",
+            recipient="customer",
+            trigger="A paid collection order whose slot is within the next 24 hours",
+            variables=("customer_name", "order_id", "slot", "pickup_details"),
+            fallback=(
+                "Hi {1}, a reminder that order #{2} is booked for collection.\n\n"
+                "When: {3}\n{4}\n\nSee you then - Cake O' Clock"
+            ),
+        ),
+        Template(
+            key="order_in_production",
+            default_name="order_in_production",
+            recipient="customer",
+            trigger="Work starts on the cake (-> IN_PRODUCTION), but not on a quality-check rework",
+            variables=("customer_name", "order_id"),
+            fallback=(
+                "Hi {1}, your order #{2} is being made now.\n\n"
+                "We will message you the moment it is ready - Cake O' Clock"
+            ),
+        ),
+        Template(
+            key="admin_customer_sent_picture",
+            default_name="admin_customer_sent_picture",
+            recipient="admin",
+            trigger="A customer attaches a picture to their own order",
+            variables=("order_id", "customer_name", "picture_count"),
+            fallback=(
+                "Order #{1} has a new picture from the customer.\n"
+                "From: {2}\nPictures on this order: {3}"
+            ),
+        ),
     ]
 }
 

@@ -596,7 +596,12 @@ def update_order_status(db: Session, order_id: int, data: StatusUpdate, rework: 
     # ── WhatsApp notifications ──
     try:
         from app.services.wa_notifications import dispatch_notifications
-        dispatch_notifications(db, order, new_status.value, rework=rework)
+        # Where it came from, not only where it went: the dispatcher needs it
+        # to tell a cake being started from one being sent back to be remade.
+        dispatch_notifications(
+            db, order, new_status.value, rework=rework,
+            previous=current.value if hasattr(current, "value") else str(current),
+        )
     except Exception as e:
         import logging
         logging.getLogger(__name__).error(f"[WA] Notification dispatch failed: {e}")

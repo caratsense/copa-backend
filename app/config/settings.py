@@ -57,6 +57,12 @@ class Settings(BaseSettings):
 
     # WhatsApp Business API
     WHATSAPP_ENABLED: bool = False
+    # The sweep that sends the two time-based messages — the chase for an
+    # unpaid order and the reminder before a collection slot. A switch of its
+    # own so it can be turned off without taking every other notification down
+    # with it, and so a second replica can be run without both sweeping.
+    WA_REMINDERS_ENABLED: bool = True
+    WA_REMINDER_INTERVAL_MINUTES: int = 15
     WHATSAPP_PHONE_ID: str = ""
     WHATSAPP_TOKEN: str = ""
     WHATSAPP_TRACKING_BASE_URL: str = "http://localhost:3000/track"

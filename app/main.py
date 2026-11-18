@@ -123,8 +123,69 @@ async def lifespan(app: FastAPI):
 
     print(f"{settings.APP_NAME} v2 is starting...")
     print(f"   CORS allow-list: {settings.cors_origins_list}")
+
+    # ── The clock ────────────────────────────────────
+    # Two messages fire because time passed rather than because somebody
+    # acted: the chase for an order that was never paid for, and the reminder
+    # before a collection slot. Nothing in this deployment ran on a schedule —
+    # there is a worker in the tree with a daily hook, but the container runs
+    # the web server and nothing else and no job is scheduled on the service —
+    # so both were impossible however many templates existed.
+    #
+    # In the web process rather than a second service because it is a query
+    # every few minutes against a handful of rows, and because a service that
+    # exists only to wake up is a service that can be down without anybody
+    # noticing. What makes that safe is that the work is idempotent: whether a
+    # reminder has gone is read from the outbox, under a lock on the order, so
+    # neither a restart nor a second replica can send anything twice.
+    #
+    # Off when WhatsApp is off, which is not only tidiness: a send recorded as
+    # skipped counts as done, so running this with the switch off would mark
+    # every waiting order as chased and they would never be chased for real.
+    reminders = None
+    if settings.WHATSAPP_ENABLED and settings.WA_REMINDERS_ENABLED:
+        reminders = asyncio.create_task(_reminder_loop())
+        print(f"   Reminder sweep: every {settings.WA_REMINDER_INTERVAL_MINUTES} min")
+    else:
+        print("   Reminder sweep: off")
+
     yield
+
+    if reminders:
+        reminders.cancel()
     print("👋 Shutting down...")
+
+
+async def _reminder_loop() -> None:
+    """
+    Sweep for reminders that have come due, for as long as the app is up.
+
+    Sleeps first: a restart loop would otherwise sweep on every boot, and the
+    first sweep has nothing to do that the previous one did not already do.
+
+    Each pass runs in a worker thread because the work underneath is blocking
+    database and HTTP calls, and the event loop is also serving requests.
+    """
+    from app.db import SessionLocal
+    from app.services.wa_reminders import run_due_reminders
+
+    interval = max(60, settings.WA_REMINDER_INTERVAL_MINUTES * 60)
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            await asyncio.to_thread(_sweep_once, SessionLocal, run_due_reminders)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # the sweep must never end the loop
+            print(f"[Reminders] Sweep failed: {exc}")
+
+
+def _sweep_once(session_factory, run) -> None:
+    db = session_factory()
+    try:
+        run(db)
+    finally:
+        db.close()
 
 
 app = FastAPI(
