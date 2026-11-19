@@ -75,12 +75,28 @@ class Template:
 
 TEMPLATES: dict[str, Template] = {
     t.key: t for t in [
+        # Every template below carries a fallback. Ten of them did not, and
+        # the day that mattered was the day somebody edited two in the Meta
+        # console: an edit sends a template back for review, it stops being
+        # sendable while it is there, and both of those went silent — the
+        # customer's own order confirmation among them. Nothing went out at
+        # all, because there was nothing to send instead.
+        #
+        # It is a floor and not a fix: a plain message only reaches somebody
+        # who has written to the business in the last 24 hours, which a
+        # website customer usually has not. Staff almost always have. A shop
+        # that hears about its own orders in plain text beats a shop that
+        # hears nothing.
         Template(
             key="order_confirmation",
             default_name="order_confirmation",
             recipient="customer",
             trigger="Order reaches CONFIRMED (placed on the website or WhatsApp)",
             variables=("customer_name", "order_id", "items", "total_amount", "delivery_time"),
+            fallback=(
+                "Hi {1}, your order #{2} is confirmed.\n\n{3}\nTotal: Rs {4}\n{5}\n\n"
+                "Thank you - Cake O' Clock"
+            ),
         ),
         Template(
             key="admin_new_order",
@@ -88,6 +104,7 @@ TEMPLATES: dict[str, Template] = {
             recipient="admin",
             trigger="Order reaches CONFIRMED",
             variables=("order_id", "customer_name_and_phone", "items", "total_amount", "delivery_time"),
+            fallback="New order #{1}\n{2}\n{3}\nTotal: Rs {4}\n{5}",
         ),
         Template(
             key="baker_new_order",
@@ -95,6 +112,7 @@ TEMPLATES: dict[str, Template] = {
             recipient="baker",
             trigger="Order assigned to a baker (CONFIRMED -> ASSIGNED)",
             variables=("order_id", "items", "special_instructions", "delivery_time"),
+            fallback="Order #{1} is yours.\n{2}\nNotes: {3}\n{4}",
         ),
         Template(
             key="admin_approval_needed",
@@ -102,6 +120,7 @@ TEMPLATES: dict[str, Template] = {
             recipient="admin",
             trigger="Baker finishes; order reaches AWAITING_APPROVAL (quality check)",
             variables=("order_id", "items", "total_amount"),
+            fallback="Order #{1} is baked and waiting for your approval.\n{2}\nRs {3}",
         ),
         # ── Self pickup ──
         # The collection half of the lifecycle. None of these existed, which is
@@ -163,6 +182,7 @@ TEMPLATES: dict[str, Template] = {
             recipient="baker",
             trigger="Admin rejects at quality check (AWAITING_APPROVAL -> IN_PRODUCTION)",
             variables=("order_id",),
+            fallback="Order #{1} needs doing again - it did not pass the check.",
         ),
         Template(
             key="rider_new_delivery",
@@ -180,6 +200,10 @@ TEMPLATES: dict[str, Template] = {
             recipient="customer",
             trigger="Rider collects the order (PACKAGED -> OUT_FOR_DELIVERY)",
             variables=("customer_name", "order_id", "rider_name", "tracking_link"),
+            fallback=(
+                "Hi {1}, order #{2} is on its way with {3}.\nFollow it here: {4}\n\n"
+                "Cake O' Clock"
+            ),
         ),
         Template(
             key="order_delivered",
@@ -187,6 +211,10 @@ TEMPLATES: dict[str, Template] = {
             recipient="customer",
             trigger="Order reaches DELIVERED",
             variables=("customer_name", "order_id"),
+            fallback=(
+                "Hi {1}, order #{2} has been delivered. We hope you enjoy it.\n\n"
+                "Cake O' Clock"
+            ),
         ),
         Template(
             key="order_delivered_admin",
@@ -194,6 +222,7 @@ TEMPLATES: dict[str, Template] = {
             recipient="admin",
             trigger="Order reaches DELIVERED",
             variables=("order_id", "customer_name"),
+            fallback="Order #{1} has been delivered to {2}.",
         ),
         Template(
             key="order_cancelled",
@@ -201,6 +230,10 @@ TEMPLATES: dict[str, Template] = {
             recipient="customer",
             trigger="Order reaches CANCELLED",
             variables=("customer_name", "order_id"),
+            fallback=(
+                "Hi {1}, order #{2} has been cancelled. Reply here if you have any "
+                "questions - Cake O' Clock"
+            ),
         ),
         Template(
             key="order_cancelled_staff",
@@ -208,6 +241,7 @@ TEMPLATES: dict[str, Template] = {
             recipient="baker and/or rider assigned to it",
             trigger="Order reaches CANCELLED",
             variables=("order_id",),
+            fallback="Order #{1} has been cancelled. Nothing more is needed on it.",
         ),
 
         # ── Nobody was telling anybody ──
@@ -260,6 +294,18 @@ TEMPLATES: dict[str, Template] = {
             fallback=(
                 "Hi {1}, your order #{2} is being made now.\n\n"
                 "We will message you the moment it is ready - Cake O' Clock"
+            ),
+        ),
+        Template(
+            key="admin_new_enquiry",
+            default_name="admin_new_enquiry",
+            recipient="admin",
+            trigger="A cake the builder cannot price — over 3.5kg, or a customisation with no rule",
+            variables=("enquiry_id", "contact_name_and_phone", "what_they_asked_for",
+                       "reference_picture"),
+            fallback=(
+                "Enquiry #{1} needs a quote.\n\nFrom: {2}\nAsked for: {3}\n"
+                "Reference picture: {4}\n\nReply to them to quote it."
             ),
         ),
         Template(

@@ -554,3 +554,82 @@ def test_500g_is_still_an_active_size_rule(client, db, builder):
     row = db.query(SizeRule).filter(SizeRule.name == "500g").first()
 
     assert row is not None and row.is_active is True
+
+
+# ─── TELLING THE SHOP AN ENQUIRY ARRIVED ─────────────
+
+
+def test_an_enquiry_is_announced_as_an_enquiry(client, db, builder):
+    """
+    It used to borrow admin_new_order, so the shop was told "New order
+    received - #ENQ-12", priced at "Quote required", signing off "No action is
+    required at this stage" - about the one thing in the shop that is nothing
+    but action. Somebody has to read it and quote a price.
+    """
+    from app.models.user import User, UserRole
+    from app.models.whatsapp_message import WhatsAppMessage
+
+    admin = db.query(User).filter(User.role == UserRole.ADMIN).first()
+    if admin is None:
+        from tests.conftest import make_user
+        admin = make_user(db, "Shriya", UserRole.ADMIN)
+    admin.whatsapp_opt_in = True
+    db.commit()
+
+    res = client.post("/build-a-cake/enquiries", json={
+        "contact_name": "Ira", "contact_phone": "+919876500011",
+        "sponge": "chocolate", "requested_size": "6kg",
+        "details": "Two tiers for an engagement",
+    })
+    assert res.status_code in (200, 201), res.text
+
+    msgs = db.query(WhatsAppMessage).filter(
+        WhatsAppMessage.event_type == "cake_enquiry").all()
+    assert msgs, "nobody was told about the enquiry"
+    assert all(m.template_key == "admin_new_enquiry" for m in msgs)
+
+    params = msgs[0].payload
+    assert params[0] == str(res.json()["id"])
+    assert "Ira" in params[1] and "+919876500011" in params[1]
+    assert "6kg" in params[2] and "engagement" in params[2]
+    assert params[3] == "No"          # no picture with it
+
+
+def test_the_enquiry_says_whether_a_picture_came_with_it(client, db, builder):
+    """
+    Whether there is a reference changes how the quote gets answered. It used
+    to be a clause at the end of a run of pipe-separated fields.
+    """
+    import io
+
+    from app.models.user import User, UserRole
+    from app.models.whatsapp_message import WhatsAppMessage
+
+    admin = db.query(User).filter(User.role == UserRole.ADMIN).first()
+    if admin is None:
+        from tests.conftest import make_user
+        admin = make_user(db, "Shriya", UserRole.ADMIN)
+    admin.whatsapp_opt_in = True
+    db.commit()
+
+    png = bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
+        "890000000a49444154789c6360000002000100ffff03000006000557bfabd400"
+        "00000049454e44ae426082"
+    )
+    created = client.post("/build-a-cake/enquiries", json={
+        "contact_name": "Ira", "contact_phone": "+919876500011",
+        "details": "Like the picture",
+    }).json()
+    db.query(WhatsAppMessage).delete()
+    db.commit()
+
+    client.post(f"/build-a-cake/enquiries/{created['id']}/image",
+                files={"file": ("ref.png", io.BytesIO(png), "image/png")})
+
+    # The upload does not re-announce the enquiry; the flag is for the next
+    # one. What this pins is that the enquiry row now carries a picture, so
+    # the parameter would say so.
+    from app.models.cake_enquiry import CakeEnquiry
+    enquiry = db.query(CakeEnquiry).filter(CakeEnquiry.id == created["id"]).first()
+    assert enquiry.reference_image_url

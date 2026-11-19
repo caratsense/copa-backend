@@ -301,26 +301,33 @@ def _notify_admins(db: Session, enquiry: CakeEnquiry) -> None:
         from app.services import wa_outbox
         from app.services.wa_consent import may_message
 
+        # Its own template, because an enquiry is not an order and was being
+        # announced as one: admin_new_order reads "New order received -
+        # #ENQ-12", prices it at "Quote required", and signs off "No action is
+        # required at this stage" — for the one thing in the shop that is
+        # nothing but action. Somebody has to read it and quote a price.
         summary = " | ".join(part for part in (
             f"Sponge: {enquiry.sponge}" if enquiry.sponge else "",
             f"Flavour: {enquiry.flavor}" if enquiry.flavor else "",
             f"Size: {enquiry.requested_size}" if enquiry.requested_size else "",
             f"Details: {enquiry.details}" if enquiry.details else "",
-            "Reference image attached" if enquiry.reference_image_url else "",
         ) if part) or "No details given"
 
         for admin in db.query(User).filter(User.role == UserRole.ADMIN).all():
             allowed = may_message(admin) and bool(admin.phone)
             wa_outbox.queue_and_send(
                 db,
-                template_key="admin_new_order",
+                template_key="admin_new_enquiry",
                 recipient=admin.phone or "",
                 params=[
-                    f"ENQ-{enquiry.id}",
+                    str(enquiry.id),
                     f"{enquiry.contact_name} ({enquiry.contact_phone})",
                     summary,
-                    "Quote required",
-                    "Contact Us request",
+                    # Said as a plain yes or no rather than folded into the
+                    # details: whether there is a picture changes how the
+                    # quote gets answered, and it was a clause at the end of a
+                    # run of pipe-separated fields.
+                    "Yes" if enquiry.reference_image_url else "No",
                 ],
                 recipient_role="admin",
                 event_type="cake_enquiry",
