@@ -347,3 +347,78 @@ def test_a_picture_from_the_office_tells_nobody(client, db, wa_secret, staffed):
                 headers=auth(staffed["admin"]))
 
     assert "admin_customer_sent_picture" not in keys_sent(db, order.id)
+
+
+# ─── SAYING WHICH KIND OF ORDER IT IS ────────────────
+# Every order the shop has taken has been a collection, and the three
+# templates that cover both ways of getting a cake labelled their timestamp
+# "Delivery:". The customer's confirmation was telling people their cake
+# would be delivered to them.
+
+
+def _payload(db, order_id, key):
+    row = [m for m in templates_sent(db, order_id) if m.template_key == key]
+    assert row, f"{key} was never sent for order {order_id}"
+    return row[0].payload
+
+
+def test_a_collection_is_not_called_a_delivery(client, db, wa_secret, staffed):
+    order = make_order(db, staffed["customer"], OrderStatus.RECEIVED,
+                       fulfilment="PICKUP")
+    client.patch(f"/orders/{order.id}/status", json={"status": "CONFIRMED"},
+                 headers=auth(staffed["admin"]))
+
+    for key in ("order_confirmation", "admin_new_order"):
+        when = _payload(db, order.id, key)[4]
+        assert when.startswith("Collection"), f"{key} said {when!r}"
+        assert "Delivery" not in when
+
+
+def test_a_delivery_still_says_delivery(client, db, wa_secret, staffed):
+    """The fix is not "never say delivery" — it is "say which one"."""
+    order = make_order(db, staffed["customer"], OrderStatus.RECEIVED,
+                       fulfilment="DELIVERY")
+    client.patch(f"/orders/{order.id}/status", json={"status": "CONFIRMED"},
+                 headers=auth(staffed["admin"]))
+
+    assert _payload(db, order.id, "order_confirmation")[4].startswith("Delivery")
+
+
+def test_the_baker_is_told_which_kind_too(client, db, wa_secret, staffed):
+    """
+    A cake collected at 8:30 and one driven across Lucknow for 8:30 are
+    different deadlines in the kitchen.
+    """
+    order = make_order(db, staffed["customer"], OrderStatus.CONFIRMED,
+                       fulfilment="PICKUP")
+    client.post(f"/admin/orders/{order.id}/assign-baker",
+                headers=auth(staffed["admin"]),
+                json={"staff_id": staffed["baker"].id})
+
+    assert _payload(db, order.id, "baker_new_order")[3].startswith("Collection")
+
+
+def test_the_time_itself_is_unchanged(client, db, wa_secret, staffed):
+    """Still IST, still the slot the customer booked."""
+    order = make_order(db, staffed["customer"], OrderStatus.RECEIVED,
+                       fulfilment="PICKUP")
+    client.patch(f"/orders/{order.id}/status", json={"status": "CONFIRMED"},
+                 headers=auth(staffed["admin"]))
+
+    from app.services.wa_notifications import scheduled_for
+    db.refresh(order)
+    assert _payload(db, order.id, "order_confirmation")[4].endswith(scheduled_for(order))
+
+
+def test_the_pickup_templates_keep_the_bare_time(client, db, wa_secret, staffed):
+    """
+    "Ready to collect" has already said which kind it is in its first line.
+    Repeating it in the slot would read as a stutter.
+    """
+    order = make_order(db, staffed["customer"], OrderStatus.PACKAGED,
+                       fulfilment="PICKUP")
+    client.patch(f"/orders/{order.id}/status", json={"status": "READY_FOR_PICKUP"},
+                 headers=auth(staffed["admin"]))
+
+    slot = _payload(db, order.id, "order_ready_for_pickup")[3]
+    assert "Collection" not in slot and "Delivery" not in slot

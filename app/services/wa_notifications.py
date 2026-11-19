@@ -117,6 +117,27 @@ def scheduled_for(order: Order) -> str:
 _delivery_str = scheduled_for
 
 
+def when_str(order: Order) -> str:
+    """
+    When the order is due, and which kind of due it is.
+
+    The three messages that cover both ways of getting a cake — the customer's
+    confirmation, the shop's copy of it, and the baker's — were handed a bare
+    timestamp, and their Meta templates label it "Delivery:". Every order this
+    shop has taken has been a collection, so every one of those messages has
+    told somebody their cake would be delivered. The customer's copy is the
+    one that matters: they were being told the wrong thing about the thing
+    they had just paid for.
+
+    The word belongs with the time, not in the template, because only the
+    order knows which it is. Templates that are already about one or the other
+    — ready to collect, out for delivery — keep the bare time: they have said
+    which it is in their own first line.
+    """
+    kind = "Collection" if order.is_pickup else "Delivery"
+    return f"{kind} — {scheduled_for(order)}"
+
+
 def _maps_link(address: str) -> str:
     """Google Maps link. URL-encoded — a raw space swap breaks on & and #."""
     if not address or address == "Self Pickup":
@@ -190,7 +211,10 @@ def notify_baker_assigned(db: Session, order: Order) -> None:
     _send(
         db, order, "baker_new_order",
         baker.phone if baker else "",
-        [str(order.id), _items_str(order), order.notes or "None", _delivery_str(order)],
+        # The baker is told which kind it is too: a cake being collected at
+        # 8:30 and one being driven across Lucknow for 8:30 are different
+        # deadlines.
+        [str(order.id), _items_str(order), order.notes or "None", when_str(order)],
         OrderStatus.ASSIGNED.value, "baker",
         may_message(baker) and bool(baker and baker.phone),
         # Nothing has gone wrong when there is nobody to tell: the shop is
@@ -291,7 +315,9 @@ def dispatch_notifications(db: Session, order: Order, new_status: str,
     """
     _enrich_order(order)
     items = _items_str(order)
-    delivery = _delivery_str(order)
+    # Says "Collection — …" or "Delivery — …". The template around it must not
+    # name one of the two; see when_str.
+    delivery = when_str(order)
 
     customer = order.user
     baker = order.baker
