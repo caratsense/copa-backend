@@ -100,6 +100,39 @@ def items_summary(order: Order) -> str:
 _items_str = items_summary
 
 
+def cake_messages(order: Order) -> str:
+    """
+    What has to be written on the cakes, and anything else the kitchen was
+    told — which is what the baker's template asks for and never got.
+
+    Slot 3 of baker_new_order is labelled "Cake message" in the console and
+    was handed `order.notes`: the box the customer fills in at checkout about
+    the order as a whole. So a cake with "Happy Birthday Aarav" to pipe on it
+    reached the kitchen as "Cake message: None", while a note about keeping it
+    chilled arrived labelled as the words to write in icing. Both halves
+    wrong, in the one field where being wrong gets baked into the cake.
+
+    The message comes first because it is the part that goes on with a piping
+    bag. The note keeps its own word in front of it, so it reads as a note
+    whatever the template calls this line.
+    """
+    items = order.items or []
+    said = []
+    for item in items:
+        message = ((item.customization or {}).get("message") or "").strip()
+        if not message:
+            continue
+        if len(items) > 1:
+            name = item.product.name if item.product else "Cake"
+            said.append(f'{name}: "{message}"')
+        else:
+            said.append(f'"{message}"')
+    note = (order.notes or "").strip()
+    if note:
+        said.append(f"Note: {note}")
+    return " | ".join(said) or "None"
+
+
 def scheduled_for(order: Order) -> str:
     """
     Delivery time, rendered in IST.
@@ -211,10 +244,11 @@ def notify_baker_assigned(db: Session, order: Order) -> None:
     _send(
         db, order, "baker_new_order",
         baker.phone if baker else "",
-        # The baker is told which kind it is too: a cake being collected at
-        # 8:30 and one being driven across Lucknow for 8:30 are different
-        # deadlines.
-        [str(order.id), _items_str(order), order.notes or "None", when_str(order)],
+        # Slot 3 is labelled "Cake message" in the console; see cake_messages
+        # for what it used to be handed. Slot 4 says which kind it is too: a
+        # cake being collected at 8:30 and one being driven across Lucknow for
+        # 8:30 are different deadlines.
+        [str(order.id), _items_str(order), cake_messages(order), when_str(order)],
         OrderStatus.ASSIGNED.value, "baker",
         may_message(baker) and bool(baker and baker.phone),
         # Nothing has gone wrong when there is nobody to tell: the shop is

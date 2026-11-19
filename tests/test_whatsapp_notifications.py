@@ -422,3 +422,93 @@ def test_the_pickup_templates_keep_the_bare_time(client, db, wa_secret, staffed)
 
     slot = _payload(db, order.id, "order_ready_for_pickup")[3]
     assert "Collection" not in slot and "Delivery" not in slot
+
+
+# ─── WHAT THE BAKER IS TOLD TO WRITE ─────────────────
+# Slot 3 of baker_new_order is labelled "Cake message" in the Meta console and
+# was handed order.notes — the checkout box about the order as a whole. So the
+# words to pipe on in icing never reached the kitchen, and a note about
+# keeping it chilled arrived labelled as those words.
+
+
+def test_the_baker_is_told_what_to_write_on_the_cake(client, db, wa_secret, staffed):
+    from app.models.order_item import OrderItem
+    from app.models.product import Product
+
+    product = Product(name="Chocolate Truffle", category="chocolate-celebration",
+                      base_price=2000.0, is_available=True)
+    db.add(product)
+    db.commit()
+
+    order = make_order(db, staffed["customer"], OrderStatus.CONFIRMED)
+    db.add(OrderItem(order_id=order.id, product_id=product.id, quantity=1,
+                     price=2000.0,
+                     customization={"size": "1kg", "message": "Happy Birthday Aarav"}))
+    order.notes = ""
+    db.commit()
+
+    client.post(f"/admin/orders/{order.id}/assign-baker",
+                headers=auth(staffed["admin"]),
+                json={"staff_id": staffed["baker"].id})
+
+    said = _payload(db, order.id, "baker_new_order")[2]
+    assert "Happy Birthday Aarav" in said, said
+
+
+def test_a_checkout_note_is_not_passed_off_as_the_icing(client, db, wa_secret, staffed):
+    """
+    It keeps its own word in front of it, so it reads as a note whatever the
+    template calls that line.
+    """
+    order = make_order(db, staffed["customer"], OrderStatus.CONFIRMED)
+    order.notes = "Please keep it chilled"
+    db.commit()
+
+    client.post(f"/admin/orders/{order.id}/assign-baker",
+                headers=auth(staffed["admin"]),
+                json={"staff_id": staffed["baker"].id})
+
+    said = _payload(db, order.id, "baker_new_order")[2]
+    assert said.startswith("Note:"), said
+    assert "chilled" in said
+
+
+def test_nothing_to_say_still_says_none(client, db, wa_secret, staffed):
+    """The slot cannot go empty — Meta refuses the whole message for that."""
+    order = make_order(db, staffed["customer"], OrderStatus.CONFIRMED)
+    order.notes = None
+    db.commit()
+
+    client.post(f"/admin/orders/{order.id}/assign-baker",
+                headers=auth(staffed["admin"]),
+                json={"staff_id": staffed["baker"].id})
+
+    assert _payload(db, order.id, "baker_new_order")[2] == "None"
+
+
+def test_two_cakes_with_two_messages_say_which_is_which(client, db, wa_secret, staffed):
+    from app.models.order_item import OrderItem
+    from app.models.product import Product
+
+    a = Product(name="Chocolate Truffle", category="c", base_price=2000.0, is_available=True)
+    b = Product(name="Vanilla Sponge", category="v", base_price=1800.0, is_available=True)
+    db.add_all([a, b])
+    db.commit()
+
+    order = make_order(db, staffed["customer"], OrderStatus.CONFIRMED)
+    db.add_all([
+        OrderItem(order_id=order.id, product_id=a.id, quantity=1, price=2000.0,
+                  customization={"message": "For Aarav"}),
+        OrderItem(order_id=order.id, product_id=b.id, quantity=1, price=1800.0,
+                  customization={"message": "For Meera"}),
+    ])
+    order.notes = ""
+    db.commit()
+
+    client.post(f"/admin/orders/{order.id}/assign-baker",
+                headers=auth(staffed["admin"]),
+                json={"staff_id": staffed["baker"].id})
+
+    said = _payload(db, order.id, "baker_new_order")[2]
+    assert "Chocolate Truffle" in said and "For Aarav" in said
+    assert "Vanilla Sponge" in said and "For Meera" in said
