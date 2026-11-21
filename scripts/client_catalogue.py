@@ -257,8 +257,13 @@ UNREPRESENTABLE_PRICING: dict[str, str] = {
 
 # Fixed-price products whose single price corresponds to a specific weight the
 # client quoted. base_price IS correct for these - the weight is what the
-# product is, not a size the customer picks - but the weight is recorded so it
-# is not lost from the menu copy.
+# product is, not a size the customer picks.
+#
+# This is the source of that weight, and scripts/show_fixed_weights.py is what
+# puts it in front of a customer: it writes each one onto its product as a
+# "weight-800g" tag, which the menu card and the product page already render as
+# a badge. Correct a weight here, re-run that script. Nothing else should
+# hand-write a weight tag.
 FIXED_WEIGHTS: dict[str, str] = {
     "Whole Wheat Dates & Walnut Tea Cake": "800 g",
     "Dog Cake - 500gm": "500 g",
