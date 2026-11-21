@@ -17,7 +17,7 @@ from app.models.order_attachment import AttachmentKind, OrderAttachment
 from app.models.event import OrderEvent
 from app.core.auth import get_current_user, require_admin, require_role
 from app.schemas import (
-    OrderCreate, OrderRead, StatusUpdate, PaymentUpdate,
+    OrderCreate, OrderRead, StatusUpdate, PaymentUpdate, PriorityUpdate,
     EventRead, OrderTrackingRead, OrderAttachmentRead, OrderNoteCreate,
 )
 from app.services.order_service import (
@@ -113,6 +113,47 @@ def update_status(order_id: int, data: StatusUpdate, admin: User = Depends(requi
 @router.patch("/{order_id}/payment", response_model=OrderRead)
 def update_payment(order_id: int, data: PaymentUpdate, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     return update_payment_status(db, order_id, data)
+
+
+# How urgent this order is. Not a status: it does not gate anything and no
+# transition reads it — it is the shop saying "this one first" to itself, and
+# it is on the event timeline so the saying is recorded.
+PRIORITIES = {"RUSH"}
+
+
+@router.patch("/{order_id}/priority", response_model=OrderRead)
+def update_priority(
+    order_id: int,
+    data: PriorityUpdate,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Flag an order as urgent, or clear the flag."""
+    value = (data.priority or "").strip().upper() or None
+    if value is not None and value not in PRIORITIES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown priority {value!r}. Use one of {sorted(PRIORITIES)}, or null to clear it.",
+        )
+
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if order.priority == value:
+        _enrich_order(order)
+        return order
+
+    was = order.priority
+    order.priority = value
+    emit_event(
+        db, order.id, "ORDER_PRIORITY_SET",
+        {"from": was, "to": value, "by": admin.name or admin.phone},
+    )
+    db.commit()
+    db.refresh(order)
+    _enrich_order(order)
+    return order
 
 
 @router.post("/{order_id}/assign-rider", response_model=OrderRead)

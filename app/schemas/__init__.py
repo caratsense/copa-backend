@@ -806,6 +806,10 @@ class OrderRead(BaseModel):
     baker_name: Optional[str] = None
     rider_name: Optional[str] = None
     notes: Optional[str]
+    # Deliberately NOT on OrderTrackingRead: how the shop ranks its own work
+    # is not something to show the customer, and "RUSH" on their order page
+    # would read as a promise nobody made.
+    priority: Optional[str] = None
     items: list[OrderItemRead] = []
     # Reference pictures, written instructions and voice notes left for whoever
     # is making this cake. Oldest first.
@@ -848,6 +852,10 @@ class StatusUpdate(BaseModel):
 
 class PaymentUpdate(BaseModel):
     payment_status: str   # "PAID" | "REFUNDED"
+
+class PriorityUpdate(BaseModel):
+    """How urgent this order is. None clears it back to ordinary."""
+    priority: Optional[str] = None
 
 
 # ─── ORDER TRACKING (CUSTOMER VIEW) ──────────────────

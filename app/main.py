@@ -78,6 +78,16 @@ async def lifespan(app: FastAPI):
             "ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_charge DOUBLE PRECISION DEFAULT 0",
             "ALTER TABLE orders ADD COLUMN IF NOT EXISTS extras_total DOUBLE PRECISION DEFAULT 0",
             "ALTER TABLE orders ADD COLUMN IF NOT EXISTS extras JSONB DEFAULT '[]'::jsonb",
+            # How urgent an order is, set by hand on the order page.
+            # Nullable with no default, so adding it is inert: an order
+            # with nothing set is the order it was before the column
+            # existed. It belongs here and not only in
+            # scripts/add_order_priority.py because Order.priority is a
+            # mapped column, so every SELECT against orders names it --
+            # the kitchen queue, the order page, the order read. Shipping
+            # the code before anyone ran the script would leave all of
+            # them answering 500.
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS priority VARCHAR(16)",
             # WhatsApp consent. Defaults to FALSE so existing rows are treated as
             # "no recorded opt-in" — we must not message them until they opt in.
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp_opt_in BOOLEAN NOT NULL DEFAULT FALSE",
