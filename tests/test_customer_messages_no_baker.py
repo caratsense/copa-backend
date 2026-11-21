@@ -214,9 +214,17 @@ def test_an_in_house_order_does_not_log_a_broken_baker_account(client, db, admin
 
 def test_the_customer_hears_nothing_about_the_kitchen_arrangements(client, db, admin):
     """
-    Moving an order into the kitchen is the shop's business, not the
-    customer's. They are told when it is confirmed and when it is ready —
-    nothing in between — so there is no message that could name a baker.
+    Who is making the cake is the shop's business, not the customer's.
+
+    This used to assert that the customer hears *nothing at all* between
+    "confirmed" and "ready". That stopped being true on purpose: the silence
+    on a cake ordered days ahead was long enough to worry people, so
+    order_in_production now tells them it is being made. What must still hold
+    — and what this file exists for — is that nothing the customer is sent
+    names a baker or implies there is one, because at this shop there isn't.
+
+    ASSIGNED itself stays silent. "A baker has it" is a fact about the
+    kitchen rota and means nothing to the person waiting.
     """
     buyer = make_user(db, "Quiet Customer", UserRole.CUSTOMER)
     order = make_order(db, buyer, status=OrderStatus.CONFIRMED,
@@ -233,7 +241,16 @@ def test_the_customer_hears_nothing_about_the_kitchen_arrangements(client, db, a
                      .filter(WhatsAppMessage.order_id == order.id,
                              WhatsAppMessage.recipient_role == "customer")
                      .all())
-    assert to_customer == [], [r.template_key for r in to_customer]
+
+    # Being handed to the kitchen is not news anybody is waiting for.
+    assert not [r for r in to_customer if r.event_type == OrderStatus.ASSIGNED.value], \
+        [r.template_key for r in to_customer]
+
+    # Whatever they are told, no part of it is about a baker.
+    for row in to_customer:
+        words = " ".join(str(p) for p in (row.payload or [])).lower()
+        assert "baker" not in words, (row.template_key, row.payload)
+        assert "assigned" not in words, (row.template_key, row.payload)
 
 
 # ── A collection is not a delivery, in the words of the bot ──────────────
